@@ -3,10 +3,12 @@
 Self-hosted backend for Spasta: a FastAPI modular monolith on PostgreSQL 17, Redis and a local
 Ollama. It is offline-first, has no external AI APIs and does no live trading.
 
-**Status: Phases 1, 2 (auth) and 3 are done; finance is blocked on the live schema.** Phase 1 provides
+**Status: Phases 1, 2 (auth), 3 and 4 are done; finance is blocked on the live schema, and the
+image pipeline hookup is pending the /opt/image-agent inspection.** Phase 1 provides
 health, config, logging, async DB and Alembic. Phase 2 adds cookie-session auth with CSRF,
 rate limiting and an audit log ([docs/02-auth-and-finance.md](docs/02-auth-and-finance.md)).
 Phase 3 adds local-Ollama chat over SSE with stored conversations ([docs/03-ollama.md](docs/03-ollama.md)).
+Phase 4 adds queued Stable Diffusion jobs run by a separate worker ([docs/04-imaging.md](docs/04-imaging.md)).
 
 ## Layout
 
@@ -14,13 +16,15 @@ Phase 3 adds local-Ollama chat over SSE with stored conversations ([docs/03-olla
 app/
   main.py            app factory + lifespan
   core/              settings, JSON logging, request-ID middleware
-  api/v1/            routers (health, auth, models/chat/conversations)
+  api/v1/            routers (health, auth, models/chat/conversations, images)
   auth/              password hashing, sessions, CSRF, rate limit, admin bootstrap
   db/                async engine/session, declarative base
   agents/ollama/     Ollama HTTP client + generation limiter
   services/          health checks, audit log, chat streaming + conversation storage
   models/ schemas/   SQLAlchemy models (core, audit, ai) and Pydantic schemas
-  agents/{imaging,coding,trading}/ workers/   (later phases)
+  agents/imaging/    image generators (subprocess wrapper, stub)
+  workers/imaging.py image worker process (one job at a time)
+  agents/{coding,trading}/   (later phases)
 alembic/             async migrations (version table: public.aureon_alembic_version)
 tests/  scripts/  deploy/  docs/
 ```
@@ -40,6 +44,11 @@ tests/  scripts/  deploy/  docs/
 | POST | `/api/chat` | Streaming chat (SSE); stores both turns. |
 | GET | `/api/conversations` | Your conversations, paginated. |
 | GET / DELETE | `/api/conversations/{id}` | One conversation with messages / delete it. |
+| POST | `/api/images/generate` | Queue an image job (202). |
+| GET | `/api/images/jobs/{id}` | Job status, progress, queue position. |
+| POST | `/api/images/jobs/{id}/cancel` | Cancel a queued or running job. |
+| GET | `/api/images` | Your image gallery, paginated. |
+| GET / DELETE | `/api/images/{id}/file`, `/api/images/{id}` | Download / delete an image. |
 | GET | `/api/docs` | Swagger UI (disabled when `ENV=prod`). |
 
 ## Configuration
@@ -72,6 +81,17 @@ Every variable is listed in [.env.example](.env.example).
 | `CHAT_TIMEOUT_SECONDS` | `900` | Whole chat request, including queue time. |
 | `CHAT_HEARTBEAT_SECONDS` | `15` | SSE keep-alive interval. |
 | `CHAT_DEFAULT_NUM_CTX` / `CHAT_MAX_NUM_CTX` | `4096` / `8192` | Context window default / cap. |
+| `IMAGE_GENERATOR` | `subprocess` | `subprocess` (wrap /opt/image-agent) or `stub` (dev). |
+| `IMAGE_AGENT_COMMAND` | empty | JSON argv template for the entrypoint (no shell). |
+| `IMAGE_AGENT_REQUIREMENTS` | `requirements.txt` | Requirements file used to build the worker image. |
+| `IMAGE_AGENT_ENV_PASSTHROUGH` | empty | Env var names copied into the entrypoint. |
+| `IMAGE_THREADS` | `3` | CPU threads for the pipeline. |
+| `IMAGE_ALLOWED_SIZES` | `512x512,512x768,768x512` | Allowed output sizes. |
+| `IMAGE_DEFAULT_STEPS` / `IMAGE_MAX_STEPS` | `25` / `50` | Steps default / cap. |
+| `IMAGE_QUEUE_MAX` / `IMAGE_RETRY_AFTER` | `5` / `600` | Waiting-job cap; `Retry-After` on 429. |
+| `IMAGE_JOB_TIMEOUT_SECONDS` | `1800` | Per-job limit. |
+| `IMAGE_MAX_ATTEMPTS` | `2` | Times a job may start before an interruption marks it failed. |
+| `IMAGE_POLL_SECONDS` | `2` | Cancel / progress check interval. |
 | `PRIVATE_AI_NETWORK` | required (compose) | Existing Docker network shared with Postgres/Ollama. |
 
 ## Development
