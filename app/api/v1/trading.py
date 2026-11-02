@@ -14,10 +14,12 @@ from datetime import UTC, date, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Path, Query, Request, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 
 from app.agents.registry import effective_state
+from app.agents.research import ai as research_ai
+from app.agents.research import strategies as strategy_impls
 from app.agents.trading.base import BrokerAdapter
 from app.agents.trading.mt5.adapter import MT5Adapter
 from app.agents.trading.types import Broker, SignalSide, Timeframe
@@ -25,10 +27,15 @@ from app.auth.deps import AdminRequired, Current, DbSession, SettingsDep
 from app.models.agents import Agent, AgentLog
 from app.models.brokers import Mt5Symbol
 from app.models.trading import (
+    AiAnalysis,
+    BacktestRun,
+    BacktestTrade,
     BrokerAccount,
     Execution,
+    IndicatorValue,
     Instrument,
     MarketCandle,
+    RiskDecision,
     RiskPolicy,
     Strategy,
     StrategyVersion,
@@ -39,11 +46,19 @@ from app.schemas.common import Page
 from app.schemas.trading import (
     AccountCreate,
     AccountOut,
+    AiAnalysisOut,
+    BacktestDetail,
+    BacktestQueued,
+    BacktestRequest,
+    BacktestRunOut,
+    BacktestTradeOut,
     CandleOut,
     ExecutionOut,
+    ExplainQueued,
     FundsOut,
     HealthOut,
     HoldingOut,
+    IndicatorOut,
     InstrumentOut,
     LiveToken,
     ModeChange,
@@ -53,15 +68,17 @@ from app.schemas.trading import (
     OrderOut,
     PositionOut,
     QuoteOut,
+    RiskDecisionOut,
     RiskPolicyIn,
     RiskPolicyOut,
     SignalOut,
+    StrategyCreate,
     StrategyOut,
     StrategyVersionOut,
     TradeOut,
     TradingAgentStatus,
 )
-from app.services import audit, mt5_sync
+from app.services import audit, mt5_sync, research
 from app.services.audit import ClientInfo
 from app.services.trading import (
     ModeChangeDenied,
@@ -750,3 +767,259 @@ async def put_mt5_instrument(
     assert row is not None
     await db.refresh(row)
     return InstrumentOut.model_validate(row)
+
+
+# --- research agents (Trading Phase D) ----------------------------------------------------
+
+
+@router.post("/strategies", response_model=StrategyVersionOut, status_code=status.HTTP_201_CREATED)
+async def create_strategy_version(
+    body: StrategyCreate, request: Request, db: DbSession, admin: AdminRequired
+) -> StrategyVersionOut:
+    """Create a strategy (v1) or add the next version. Versions are immutable."""
+    fn = strategy_impls.get(body.code_ref)
+    if fn is None:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "unknown_strategy",
+                "detail": f"code_ref must be one of {sorted(strategy_impls.REGISTRY)}",
+            },
+        )
+    try:  # validate the params against the implementation on a tiny frame
+        import pandas as pd
+
+        idx = pd.date_range("2026-01-01", periods=3, freq="min", tz="UTC")
+        fn(
+            pd.DataFrame(
+                {c: [1.0, 2.0, 3.0] for c in ("open", "high", "low", "close", "volume")}, index=idx
+            ),
+            dict(body.params),
+        )
+        strategy_impls.watch_list(dict(body.params))
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(422, detail={"code": "bad_params", "detail": str(exc)}) from exc
+    strat = await db.scalar(select(Strategy).where(Strategy.name == body.name))
+    if strat is None:
+        strat = Strategy(name=body.name, description=body.description, owner_user_id=admin.user.id)
+        db.add(strat)
+        await db.flush()
+    last = await db.scalar(
+        select(func.max(StrategyVersion.version)).where(StrategyVersion.strategy_id == strat.id)
+    )
+    version = StrategyVersion(
+        strategy_id=strat.id,
+        version=(last or 0) + 1,
+        code_ref=body.code_ref,
+        params=dict(body.params),
+        created_by=admin.user.id,
+    )
+    db.add(version)
+    await db.flush()
+    audit.record(
+        db,
+        "trading_strategy_version_created",
+        ClientInfo.from_request(request),
+        actor_user_id=admin.user.id,
+        details={"strategy": body.name, "version": version.version, "code_ref": body.code_ref},
+    )
+    await db.commit()
+    await db.refresh(version)
+    return StrategyVersionOut.model_validate(version)
+
+
+@router.post(
+    "/strategies/backtest", response_model=BacktestQueued, status_code=status.HTTP_202_ACCEPTED
+)
+async def queue_backtest(
+    body: BacktestRequest, db: DbSession, current: Current, settings: SettingsDep
+) -> BacktestQueued:
+    """Queue one backtest per parameter combination; the research worker runs them."""
+    if body.start.tzinfo is None or body.end <= body.start:
+        raise HTTPException(422, detail={"code": "bad_period", "detail": "end must follow start"})
+    version = await db.get(StrategyVersion, body.strategy_version_id)
+    if version is None or strategy_impls.get(version.code_ref) is None:
+        raise HTTPException(404, "strategy version not found or has no implementation")
+    inst = await db.get(Instrument, body.instrument_id)
+    if inst is None:
+        raise HTTPException(404, "instrument not found")
+    try:
+        combos = research.grid_params(
+            {**(version.params or {}), **body.params},
+            {k: list(v) for k, v in body.grid.items()},
+            settings.BACKTEST_MAX_GRID,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "grid_too_large", "detail": str(exc)}) from exc
+    costs = {k: str(v) for k, v in body.costs.model_dump().items()}
+    ids = []
+    for params in combos:
+        if body.quantity is not None:
+            params["quantity"] = str(body.quantity)
+        run = BacktestRun(
+            strategy_version_id=version.id,
+            instrument_id=inst.id,
+            timeframe=body.timeframe,
+            period_start=body.start,
+            period_end=body.end,
+            params=params,
+            costs=costs,
+            created_by=current.user.id,
+        )
+        db.add(run)
+        await db.flush()
+        ids.append(run.id)
+    await db.commit()
+    return BacktestQueued(run_ids=ids)
+
+
+@router.get("/backtests", response_model=Page[BacktestRunOut])
+async def list_backtests(
+    db: DbSession, _: Current, limit: Limit = 50, offset: Offset = 0
+) -> Page[BacktestRunOut]:
+    stmt = select(BacktestRun)
+    rows = (
+        await db.scalars(stmt.order_by(BacktestRun.created_at.desc()).limit(limit).offset(offset))
+    ).all()
+    return Page[BacktestRunOut](
+        items=[BacktestRunOut.model_validate(r) for r in rows],
+        total=await count(db, stmt),
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/backtests/{run_id}", response_model=BacktestDetail)
+async def get_backtest(
+    run_id: uuid.UUID, db: DbSession, _: Current, limit: Limit = 500, offset: Offset = 0
+) -> BacktestDetail:
+    run = await db.get(BacktestRun, run_id)
+    if run is None:
+        raise HTTPException(404, "backtest not found")
+    stmt = select(BacktestTrade).where(BacktestTrade.backtest_run_id == run_id)
+    trades = (
+        await db.scalars(stmt.order_by(BacktestTrade.entry_time).limit(limit).offset(offset))
+    ).all()
+    return BacktestDetail(
+        run=BacktestRunOut.model_validate(run),
+        trades=[BacktestTradeOut.model_validate(t) for t in trades],
+        trades_total=await count(db, stmt),
+    )
+
+
+@router.get("/indicators", response_model=list[IndicatorOut])
+async def indicators(
+    db: DbSession,
+    _: Current,
+    instrument_id: int,
+    timeframe: Timeframe,
+    name: str | None = None,
+    since: datetime | None = None,
+    limit: Limit = 200,
+) -> list[IndicatorOut]:
+    stmt = select(IndicatorValue).where(
+        IndicatorValue.instrument_id == instrument_id,
+        IndicatorValue.timeframe == timeframe.value,
+    )
+    if name:
+        stmt = stmt.where(IndicatorValue.name == name)
+    if since:
+        stmt = stmt.where(IndicatorValue.ts >= since)
+    rows = (await db.scalars(stmt.order_by(IndicatorValue.ts.desc()).limit(limit))).all()
+    return [IndicatorOut.model_validate(r) for r in rows]
+
+
+@router.get("/risk-decisions", response_model=Page[RiskDecisionOut])
+async def risk_decisions(
+    db: DbSession,
+    current: Current,
+    account_id: uuid.UUID | None = None,
+    signal_id: uuid.UUID | None = None,
+    limit: Limit = 50,
+    offset: Offset = 0,
+) -> Page[RiskDecisionOut]:
+    allowed = await visible_account_ids(db, current)
+    if account_id is not None:
+        if account_id not in allowed:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "account not found")
+        allowed = [account_id]
+    stmt = select(RiskDecision).where(RiskDecision.broker_account_id.in_(allowed))
+    if signal_id:
+        stmt = stmt.where(RiskDecision.signal_id == signal_id)
+    rows = (
+        await db.scalars(stmt.order_by(RiskDecision.created_at.desc()).limit(limit).offset(offset))
+    ).all()
+    return Page[RiskDecisionOut](
+        items=[RiskDecisionOut.model_validate(r) for r in rows],
+        total=await count(db, stmt),
+        limit=limit,
+        offset=offset,
+    )
+
+
+async def _explain(
+    request: Request, settings: SettingsDep, kind: research_ai.Kind, subject: uuid.UUID
+) -> ExplainQueued:
+    if not settings.RESEARCH_AI_MODEL:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "ai_not_configured", "detail": "RESEARCH_AI_MODEL is not set"},
+        )
+    try:
+        pos = await research_ai.enqueue(
+            request.app.state.redis, kind, subject, settings.RESEARCH_AI_QUEUE_MAX
+        )
+    except research_ai.QueueFull as exc:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"code": "queue_full"},
+            headers={"Retry-After": "60"},
+        ) from exc
+    return ExplainQueued(position=pos)
+
+
+@router.post(
+    "/signals/{signal_id}/explain",
+    response_model=ExplainQueued,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def explain_signal(
+    signal_id: uuid.UUID, request: Request, db: DbSession, _: Current, settings: SettingsDep
+) -> ExplainQueued:
+    """Ask the AI research agent (local Ollama) to explain a signal. Explanation only."""
+    if await db.get(TradingSignal, signal_id) is None:
+        raise HTTPException(404, "signal not found")
+    return await _explain(request, settings, "signal", signal_id)
+
+
+@router.post(
+    "/backtests/{run_id}/explain",
+    response_model=ExplainQueued,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def explain_backtest(
+    run_id: uuid.UUID, request: Request, db: DbSession, _: Current, settings: SettingsDep
+) -> ExplainQueued:
+    run = await db.get(BacktestRun, run_id)
+    if run is None:
+        raise HTTPException(404, "backtest not found")
+    if run.status != "done":
+        raise HTTPException(409, detail={"code": "not_done", "detail": f"status {run.status}"})
+    return await _explain(request, settings, "backtest", run_id)
+
+
+@router.get("/ai-analyses", response_model=list[AiAnalysisOut])
+async def ai_analyses(
+    db: DbSession,
+    _: Current,
+    signal_id: uuid.UUID | None = None,
+    backtest_run_id: uuid.UUID | None = None,
+    limit: Limit = 20,
+) -> list[AiAnalysisOut]:
+    stmt = select(AiAnalysis)
+    if signal_id:
+        stmt = stmt.where(AiAnalysis.signal_id == signal_id)
+    if backtest_run_id:
+        stmt = stmt.where(AiAnalysis.backtest_run_id == backtest_run_id)
+    rows = (await db.scalars(stmt.order_by(AiAnalysis.created_at.desc()).limit(limit))).all()
+    return [AiAnalysisOut.model_validate(r) for r in rows]

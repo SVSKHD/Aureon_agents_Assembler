@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
@@ -168,6 +169,32 @@ class Settings(BaseSettings):
     def mt5_configured(self) -> bool:
         return bool(self.MT5_STATUS_FILE or self.MT5_STATUS_URL)
 
+    # --- research agents (Trading Phase D, docs/13-research-agents.md) ---
+    RESEARCH_TICK_SECONDS: float = Field(default=60.0, ge=5)
+    RESEARCH_QUEUE_MAX: int = Field(default=200, ge=1, le=10_000)
+    # Candles read per (instrument, timeframe) for indicators and signals.
+    RESEARCH_LOOKBACK_BARS: int = Field(default=500, ge=50, le=20_000)
+    # Extra EMA periods always computed (strategies add their own).
+    RESEARCH_EMA_PERIODS: Annotated[list[int], NoDecode] = Field(default_factory=lambda: [9, 21])
+    # Days of history the market-data agent asks the adapter for on an empty series.
+    RESEARCH_BACKFILL_DAYS: int = Field(default=10, ge=1, le=365)
+    # Data is stale when the newest candle is older than this many bars (in market hours).
+    RESEARCH_STALE_BARS: float = Field(default=3.0, gt=0)
+    # Risk assumptions (basis points per side) and freshness limits.
+    RISK_SPREAD_BPS: Decimal = Field(default=Decimal("2"), ge=0)
+    RISK_SLIPPAGE_BPS: Decimal = Field(default=Decimal("2"), ge=0)
+    RISK_FEE_BPS: Decimal = Field(default=Decimal("3"), ge=0)
+    RISK_MAX_COST_BPS: Decimal = Field(default=Decimal("25"), ge=0)
+    RISK_ACCOUNT_STALE_SECONDS: float = Field(default=900.0, gt=0)
+    RISK_SIGNAL_MAX_AGE_BARS: float = Field(default=2.0, gt=0)
+    # Backtests
+    BACKTEST_MAX_GRID: int = Field(default=50, ge=1, le=500)
+    BACKTEST_MAX_BARS: int = Field(default=200_000, ge=100)
+    # AI research agent: Ollama only, explanation only.
+    RESEARCH_AI_MODEL: str | None = None
+    RESEARCH_AI_QUEUE_MAX: int = Field(default=20, ge=1, le=1000)
+    RESEARCH_AI_TIMEOUT_SECONDS: float = Field(default=600.0, gt=0)
+
     @field_validator("IMAGE_AGENT_COMMAND", mode="before")
     @classmethod
     def _parse_command(cls, v: object) -> object:
@@ -182,6 +209,7 @@ class Settings(BaseSettings):
         "DHAN_FEED_INSTRUMENTS",
         "DHAN_BACKFILL_INSTRUMENTS",
         "DHAN_BACKFILL_TIMEFRAMES",
+        "RESEARCH_EMA_PERIODS",
         mode="before",
     )
     @classmethod

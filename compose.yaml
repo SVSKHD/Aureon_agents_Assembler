@@ -153,6 +153,30 @@ services:
     profiles: [dhan]
     restart: unless-stopped
 
+  # Research agents (Trading Phase D): market data, indicators, signals, risk, backtests and
+  # Ollama explanations, in their own process. Opt-in: `docker compose --profile research up -d`.
+  # Never places orders. One CPU-heavy backtest at a time; Ollama calls are serialized.
+  research-worker:
+    image: aureon-agentic:${IMAGE_TAG:-dev}
+    container_name: aureon-research
+    env_file: .env
+    environment:
+      ENV: ${ENV:-prod}
+    command: ["python", "-m", "app.workers.research"]
+    networks: [aureon, private-ai]   # Redis + Postgres + Ollama (+ outbound to the broker APIs)
+    # NO ports.
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    cpus: "1.5"
+    mem_limit: 1g
+    stop_grace_period: 20s
+    depends_on:
+      redis: { condition: service_healthy }
+    profiles: [research]
+    restart: unless-stopped
+
   # Read-only Docker API for GET /api/system/status. The API never mounts docker.sock
   # (any socket mount, even :ro, is root-equivalent). This proxy allows only GET
   # /containers/*; every write (POST/DELETE) and every other endpoint is refused.
