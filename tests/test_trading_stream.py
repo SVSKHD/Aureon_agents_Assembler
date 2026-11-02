@@ -197,6 +197,10 @@ async def test_stream_delivers_new_rows_and_resumes(env: Env) -> None:
         r2 = await c.get("/api/trading/stream", headers={"Last-Event-ID": last_id})
         sigs2 = [e for e in parse(r2.text) if e["event"] == "signal"]
         assert [s["data"]["candle_time"][11:16] for s in sigs2] == ["09:10"]
+        # The same resume through the query parameter (EventSource cannot set headers).
+        r3 = await c.get("/api/trading/stream", params={"last_event_id": last_id})
+        sigs3 = [e for e in parse(r3.text) if e["event"] == "signal"]
+        assert [s["data"]["candle_time"][11:16] for s in sigs3] == ["09:10"]
     finally:
         await redis.delete("dhan:tick:NSE_EQ:1333")
         await redis.aclose()

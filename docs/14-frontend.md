@@ -47,7 +47,8 @@ read-only and opens no DB connection between polls.
 | `quote` | the Dhan feed hash changed for a requested instrument | ltp, ltt, volume, stale, `source: broker` |
 | `bye` | max duration reached or the session ended | reason; the client reconnects (or re-logs in) |
 
-- **Reconnect:** every event has an `id:` cursor, and `EventSource` sends it back as `Last-Event-ID`. Signals and risk
+- **Reconnect:** every event has an `id:` cursor. `EventSource` sends it back as `Last-Event-ID` on its own retries; a
+  client reconnecting after a hard failure passes it as `?last_event_id=` instead, since EventSource cannot set headers. Signals and risk
   decisions resume exactly after the cursor, with no repeats and no gaps; they are emitted about 2 s after insert, so a
   late-committing row is not skipped. Backtest, agent and quote events describe current state and may repeat; apply
   them by id.

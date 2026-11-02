@@ -1041,14 +1041,17 @@ async def stream(
     settings: SettingsDep,
     instrument_id: Annotated[list[int] | None, Query(max_length=50)] = None,
     last_event_id: Annotated[str | None, Header(max_length=512)] = None,
+    cursor: Annotated[str | None, Query(alias="last_event_id", max_length=512)] = None,
 ) -> StreamingResponse:
     """Server-Sent Events: new signals, risk decisions, backtest status, agent state and Dhan
-    quotes. Read-only. Resumes after `Last-Event-ID`; see app/services/trading_stream.py."""
+    quotes. Read-only. Resumes after the `Last-Event-ID` header (the browser's own retry) or
+    the `last_event_id` query parameter (a client reconnecting after a hard failure, where
+    EventSource cannot set headers). See app/services/trading_stream.py."""
     gen = trading_stream.events(
         request.app.state.sessionmaker,
         request.app.state.redis,
         current,
-        last_event_id=last_event_id,
+        last_event_id=last_event_id or cursor,
         instrument_ids=list(instrument_id or []),
         poll_seconds=settings.TRADING_STREAM_POLL_SECONDS,
         heartbeat_seconds=settings.TRADING_STREAM_HEARTBEAT_SECONDS,
