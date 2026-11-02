@@ -50,6 +50,23 @@ class Settings(BaseSettings):
     LOGIN_MAX_FAILURES_PER_IP: int = Field(default=20, ge=1)
     LOGIN_WINDOW_SECONDS: int = Field(default=900, ge=1)
 
+    # --- ollama / chat ---
+    # Simultaneous generations this API sends to Ollama (CPU-only box: keep at 1).
+    OLLAMA_MAX_CONCURRENT: int = Field(default=1, ge=1)
+    # Requests allowed to wait for a slot; beyond this, POST /api/chat returns 429.
+    OLLAMA_MAX_QUEUE: int = Field(default=3, ge=0)
+    OLLAMA_QUEUE_RETRY_AFTER: int = Field(default=15, ge=1)
+    OLLAMA_CONNECT_TIMEOUT: float = Field(default=5.0, gt=0)
+    # Max silence between streamed chunks; covers a cold model load on CPU.
+    OLLAMA_READ_TIMEOUT: float = Field(default=300.0, gt=0)
+    OLLAMA_MODEL_CACHE_SECONDS: float = Field(default=60.0, ge=0)
+    # Whole chat request budget, including time spent queued.
+    CHAT_TIMEOUT_SECONDS: float = Field(default=900.0, gt=0)
+    # SSE keep-alive comment interval (Cloudflare drops idle streams after ~100 s).
+    CHAT_HEARTBEAT_SECONDS: float = Field(default=15.0, gt=0)
+    CHAT_DEFAULT_NUM_CTX: int = Field(default=4096, ge=256)
+    CHAT_MAX_NUM_CTX: int = Field(default=8192, ge=256)
+
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def _split_origins(cls, v: object) -> object:
