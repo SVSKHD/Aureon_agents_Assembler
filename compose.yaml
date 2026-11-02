@@ -131,6 +131,28 @@ services:
       api: { condition: service_started }
     restart: unless-stopped
 
+  # Dhan live market feed (Trading Phase B). Opt-in: `docker compose --profile dhan up -d`.
+  # Its own process, never sharing one with the API, Ollama or imaging workers.
+  dhan-feed:
+    image: aureon-agentic:${IMAGE_TAG:-dev}
+    container_name: aureon-dhan-feed
+    env_file: .env
+    environment:
+      ENV: ${ENV:-prod}
+    command: ["python", "-m", "app.workers.dhan_feed"]
+    networks: [aureon, private-ai]   # Redis + Postgres; outbound to api-feed.dhan.co
+    # NO ports.
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 512m
+    stop_grace_period: 15s
+    depends_on:
+      redis: { condition: service_healthy }
+    profiles: [dhan]
+    restart: unless-stopped
+
   # Read-only Docker API for GET /api/system/status. The API never mounts docker.sock
   # (any socket mount, even :ro, is root-equivalent). This proxy allows only GET
   # /containers/*; every write (POST/DELETE) and every other endpoint is refused.

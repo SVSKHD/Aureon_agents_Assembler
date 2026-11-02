@@ -3,8 +3,8 @@
 Self-hosted backend for Spasta: a FastAPI modular monolith on PostgreSQL 17, Redis and a local
 Ollama. It is offline-first, has no external AI APIs and does no live trading.
 
-**Status: Phases 1, 2 (auth), 3, 4, 5 (registry, scheduler, monitoring) and Trading Phase A are
-done; finance is blocked on the live schema, the image pipeline hookup is pending the
+**Status: Phases 1, 2 (auth), 3, 4, 5 (registry, scheduler, monitoring) and Trading Phases A and B
+(Dhan, read-only) are done; finance is blocked on the live schema, the image pipeline hookup is pending the
 /opt/image-agent inspection, and the Phase 5 coding agent comes in its own PR.** Phase 1 provides
 health, config, logging, async DB and Alembic. Phase 2 adds cookie-session auth with CSRF,
 rate limiting and an audit log ([docs/02-auth-and-finance.md](docs/02-auth-and-finance.md)).
@@ -13,6 +13,7 @@ Phase 4 adds queued Stable Diffusion jobs run by a separate worker ([docs/04-ima
 Phase 5 adds the agent registry, a cron scheduler and system status ([docs/05-agents.md](docs/05-agents.md)).
 Trading Phase A adds the read-only, broker-agnostic trading core: schemas, BrokerAdapter,
 execution modes (LIVE unreachable) and risk types ([docs/10-trading-foundation.md](docs/10-trading-foundation.md)).
+Trading Phase B adds the read-only DhanHQ v2 adapter, live-feed worker and sync jobs ([docs/11-dhan.md](docs/11-dhan.md)).
 
 ## Layout
 
@@ -30,7 +31,9 @@ app/
   workers/imaging.py image worker process (one job at a time)
   agents/registry.py agent registration, heartbeats, runs, logs
   workers/scheduler.py cron scheduler (code-registered tasks, retries + backoff)
-  agents/trading/    BrokerAdapter interface, Decimal DTOs, sessions, fake adapter
+  agents/trading/    BrokerAdapter interface, Decimal DTOs, sessions, fake adapter, rate limiter
+  agents/trading/dhan/ DhanHQ v2 client, parsers, adapter, binary feed parser
+  workers/dhan_feed.py Dhan live feed → Redis (own process)
   agents/coding/     (later phase)
 alembic/             async migrations (version table: public.aureon_alembic_version)
 tests/  scripts/  deploy/  docs/
@@ -64,6 +67,7 @@ tests/  scripts/  deploy/  docs/
 | GET | `/api/trading/accounts`, `/api/trading/accounts/{id}[/health\|funds\|positions\|orders\|risk-policy]` | Trading accounts and read-only broker data. |
 | POST / PUT | `/api/trading/accounts`, `…/{id}/mode`, `…/{id}/risk-policy` | Admin: create account, change mode (LIVE gated), risk policy. |
 | GET | `/api/trading/instruments`, `/candles`, `/quotes`, `/strategies`, `/signals`, `/executions`, `/agents` | Trading data (read-only). |
+| GET | `/api/trading/accounts/{id}/holdings`, `/trades`, `/api/trading/option-chain[/expiries]` | Holdings, trade book, option chain (Dhan). |
 | GET | `/api/docs` | Swagger UI (disabled when `ENV=prod`). |
 
 ## Configuration
@@ -115,6 +119,13 @@ Every variable is listed in [.env.example](.env.example).
 | `TRADING_LIVE_ENABLED` | `false` | LIVE feature flag; LIVE also needs Phase G preconditions. |
 | `TRADING_LIVE_TOKEN_TTL_SECONDS` | `300` | LIVE confirmation token lifetime. |
 | `TRADING_ADAPTER_TIMEOUT` | `10` | Per-call broker adapter timeout. |
+| `DHAN_CLIENT_ID` / `DHAN_ACCESS_TOKEN` | unset | Dhan credentials (env only); unset = no Dhan adapter or jobs. |
+| `DHAN_TOKEN_WARN_HOURS` | `4` | Warn when the 24 h token has less left. |
+| `DHAN_FEED_INSTRUMENTS` / `DHAN_FEED_MODE` | `IDX_I:13` / `quote` | Live feed subscription (`SEGMENT:SECURITY_ID`). |
+| `DHAN_FEED_QUEUE_MAX` / `DHAN_FEED_STALE_SECONDS` | `10000` / `60` | Feed queue bound; stale threshold. |
+| `DHAN_RECONCILE_CRON` / `DHAN_INSTRUMENTS_CRON` / `DHAN_BACKFILL_CRON` | see .env.example | Dhan scheduled jobs (IST). |
+| `DHAN_BACKFILL_INSTRUMENTS` / `_TIMEFRAMES` / `_DAYS` | empty / `1d,15m` / `30` | Candle backfill. |
+| `DHAN_STATIC_IP` | unset | Whitelisted IP for scripts/dhan_preflight.py. |
 | `PRIVATE_AI_NETWORK` | required (compose) | Existing Docker network shared with Postgres/Ollama. |
 
 ## Development
