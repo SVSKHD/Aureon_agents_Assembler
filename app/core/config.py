@@ -333,6 +333,40 @@ class Settings(BaseSettings):
     # After this many wrong re-auth passwords on one request it is denied automatically.
     APPROVALS_MAX_REAUTH_FAILURES: int = Field(default=5, ge=1, le=50)
 
+    # --- Incidents + self-repair (docs/21-self-repair.md) ---
+    # Local Ollama model for repair patches. Unset / empty = repairs disabled (tasks stay
+    # queued with the reason). .env.example suggests a Qwen coder model.
+    REPAIR_MODEL: str | None = None
+    # The CODE_REPOS entry repairs work in, and its GitHub "owner/repo" (must also be in the
+    # GitHub allowlist). Either unset = repairs disabled.
+    REPAIR_REPO: str | None = None
+    REPAIR_GITHUB_REPO: str | None = None
+    REPAIR_MODEL_TIMEOUT_SECONDS: float = Field(default=900.0, gt=0)
+    REPAIR_POLL_SECONDS: float = Field(default=10.0, gt=0)
+    # Queued + running repairs at most; more are refused.
+    REPAIR_QUEUE_MAX: int = Field(default=5, ge=1, le=100)
+    # Repairs created per incident fingerprint per rolling day.
+    REPAIR_MAX_PER_FINGERPRINT_PER_DAY: int = Field(default=2, ge=1, le=50)
+    # Circuit breaker: more than this many failed repairs in an hour pauses the repair agent.
+    REPAIR_BREAKER_MAX_FAILURES_PER_HOUR: int = Field(default=3, ge=1, le=100)
+    REPAIR_TEST_OUTPUT_MAX_CHARS: int = Field(default=32_000, ge=1000, le=500_000)
+    # Automatic recovery attempts per incident before it escalates, and the gap between them.
+    INCIDENT_MAX_RECOVERY_ATTEMPTS: int = Field(default=2, ge=1, le=10)
+    INCIDENT_RECOVERY_COOLDOWN_SECONDS: float = Field(default=120.0, ge=0)
+    # An unhandled exception with the same fingerprint is written at most this often.
+    INCIDENT_EXCEPTION_RATE_SECONDS: float = Field(default=60.0, ge=0)
+    INCIDENT_SCAN_CRON: str = "* * * * *"
+    # SELECT 1 slower than this is an incident.
+    INCIDENT_DB_SLOW_MS: float = Field(default=1000.0, gt=0)
+    # The API's readiness URL as the scheduler reaches it. Empty = not probed.
+    INCIDENT_API_READY_URL: str = "http://aureon-api:8000/api/health/ready"
+    # The API probes Docker (via the read-only proxy) this often; 0 = off.
+    INCIDENT_DOCKER_PROBE_SECONDS: float = Field(default=60.0, ge=0)
+    # Containers the repair system may restart, ONLY if the docker-proxy allows
+    # POST /containers/{name}/restart (the shipped proxy does not: restarts are "manual").
+    INCIDENT_DOCKER_PROXY_ALLOWS_RESTART: bool = False
+    INCIDENT_RESTART_CONTAINERS: Annotated[list[str], NoDecode] = Field(default_factory=list)
+
     @property
     def github_configured(self) -> bool:
         return bool(self.GITHUB_TOKEN and self.GITHUB_TOKEN.get_secret_value().strip())
@@ -388,6 +422,7 @@ class Settings(BaseSettings):
         "DHAN_BACKFILL_TIMEFRAMES",
         "RESEARCH_EMA_PERIODS",
         "CODE_PROTECTED_BRANCHES",
+        "INCIDENT_RESTART_CONTAINERS",
         mode="before",
     )
     @classmethod

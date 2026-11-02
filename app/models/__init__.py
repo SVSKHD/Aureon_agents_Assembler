@@ -17,6 +17,7 @@ from app.models.github import (
     GitHubWorkflowRun,
 )
 from app.models.imaging import GeneratedAsset, ImageJob
+from app.models.repairs import Incident, RepairTask
 
 __all__ = [
     "Agent",
@@ -39,8 +40,10 @@ __all__ = [
     "GitHubWorkflowJob",
     "GitHubWorkflowRun",
     "ImageJob",
+    "Incident",
     "Message",
     "ModelInventory",
+    "RepairTask",
     "Role",
     "ScheduledJob",
     "User",
