@@ -1,4 +1,4 @@
-# Deploy — Phases 1–3 (Ubuntu 24.04, user svskhd8)
+# Deploy — Phases 1–4 (Ubuntu 24.04, user svskhd8)
 
 The API joins the existing Postgres/Ollama network. Redis is added. Only `127.0.0.1:8000`
 is published. Nothing existing is stopped or modified.
@@ -43,7 +43,7 @@ docker network inspect aureon -f '{{(index .IPAM.Config 0).Gateway}}'
 
 ```bash
 docker compose build
-docker compose run --rm migrate        # 0001 version table; 0002 core.*/audit.*; 0003 ai.* (new tables only)
+docker compose run --rm migrate        # 0001 version table; 0002 core.*/audit.*; 0003 ai.*; 0004 agents.image_* (new tables only)
 docker compose up -d
 docker compose run --rm -it migrate python -m app.auth.bootstrap --email you@example.com
 ```
@@ -76,6 +76,9 @@ curl -sS -o /dev/null -w '%{http_code}\n' -b $J -H "x-csrf-token: $CSRF" -X POST
 
 Ollama chat smoke test: see [docs/03-ollama.md](../docs/03-ollama.md#deploy-and-validate).
 
+Image worker (opt-in, after the /opt/image-agent inspection): build, start and validate it as in
+[docs/04-imaging.md](../docs/04-imaging.md#deploy-and-validate).
+
 Nginx must not buffer the chat stream. The API sends `X-Accel-Buffering: no`, which Nginx
 honours by default; also set `proxy_read_timeout 900s;` on `/api/`.
 
@@ -88,7 +91,8 @@ confirm `mount-check` fails and `api` does not start, then restore the marker.
 docker compose down            # stops api + redis only; volumes and existing services untouched
 ```
 
-No migration touches existing tables. To undo chat, run `alembic downgrade 0002`, which drops
-only `ai.*`. To also undo auth, run `alembic downgrade 0001`, which drops `core.*` and `audit.*`.
+No migration touches existing tables. To undo imaging, run `alembic downgrade 0003`, which drops
+only `agents.image_jobs` and `agents.generated_assets`. To undo chat, run `alembic downgrade 0002`,
+which drops only `ai.*`. To also undo auth, run `alembic downgrade 0001`, which drops `core.*` and `audit.*`.
 Run both with `docker compose run --rm migrate …`. Schemas are dropped without CASCADE, so a
 downgrade fails safely if anything else was created in them.

@@ -29,3 +29,19 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=4).status==200 else 1)"
 CMD ["uvicorn", "--factory", "app.main:app_factory", "--host", "0.0.0.0", "--port", "8000", \
      "--proxy-headers", "--timeout-graceful-shutdown", "20"]
+
+# --- imaging worker (opt-in) -------------------------------------------------------------
+# docker compose --profile imaging build imaging-worker
+# Installs the existing /opt/image-agent's Python dependencies (CPU wheels) so its
+# entrypoint can run inside this container. Code and models stay in /opt/image-agent,
+# bind-mounted read-only at runtime; nothing is downloaded at runtime.
+FROM runtime AS imaging
+ARG IMAGE_AGENT_REQUIREMENTS=requirements.txt
+ARG PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu
+USER root
+COPY --from=imageagent ${IMAGE_AGENT_REQUIREMENTS} /tmp/image-agent-requirements.txt
+RUN pip install --no-cache-dir --extra-index-url ${PIP_EXTRA_INDEX_URL} \
+      -r /tmp/image-agent-requirements.txt \
+ && rm /tmp/image-agent-requirements.txt
+USER aureon
+CMD ["python", "-m", "app.workers.imaging"]

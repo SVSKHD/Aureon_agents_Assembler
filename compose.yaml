@@ -50,7 +50,9 @@ services:
     restart: unless-stopped
 
   api:
-    build: .
+    build:
+      context: .
+      target: runtime   # the last stage is the opt-in imaging worker
     image: aureon-agentic:${IMAGE_TAG:-dev}
     container_name: aureon-api
     env_file: .env
@@ -68,6 +70,46 @@ services:
     depends_on:
       mount-check: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
+    restart: unless-stopped
+
+  # Image worker (Phase 4). Opt-in profile: start it only after IMAGE_AGENT_COMMAND is set
+  # from the /opt/image-agent inspection. `docker compose --profile imaging up -d --build`.
+  # Built from the `imaging` Dockerfile target, which pip-installs the image-agent's OWN
+  # requirements file (torch CPU etc.) from /opt/image-agent; no model is downloaded.
+  imaging-worker:
+    build:
+      context: .
+      target: imaging
+      additional_contexts:
+        imageagent: ${IMAGE_AGENT_PATH:-/opt/image-agent}
+      args:
+        IMAGE_AGENT_REQUIREMENTS: ${IMAGE_AGENT_REQUIREMENTS:-requirements.txt}
+    image: aureon-imaging:${IMAGE_TAG:-dev}
+    container_name: aureon-imaging
+    env_file: .env
+    environment:
+      ENV: ${ENV:-prod}
+    command: ["python", "-m", "app.workers.imaging"]
+    volumes:
+      - *data-root
+      - type: bind
+        source: ${IMAGE_AGENT_PATH:-/opt/image-agent}
+        target: ${IMAGE_AGENT_PATH:-/opt/image-agent}
+        read_only: true
+        bind: { create_host_path: false }
+    networks: [aureon, private-ai]
+    # NO ports. One generation at a time; leave a core for Postgres/API/Ollama.
+    cpus: "3.0"
+    mem_limit: 10g
+    read_only: true
+    tmpfs: ["/tmp:size=2g"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    stop_grace_period: 30s   # SIGTERM → running job is stopped and re-queued
+    depends_on:
+      mount-check: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    profiles: [imaging]
     restart: unless-stopped
 
   # One-shot: `docker compose run --rm migrate`
