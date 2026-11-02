@@ -18,6 +18,7 @@ from app.api.v1 import (
     images,
     paper,
     public,
+    reviews,
     trading,
 )
 
@@ -38,3 +39,4 @@ api_router.include_router(github_pulls.router)  # /api/v1/github pulls + gated o
 api_router.include_router(github_actions.router)  # /api/v1/github …/actions (Phase 17)
 api_router.include_router(github_webhooks.router)  # POST /api/v1/github/webhooks (public, HMAC)
 api_router.include_router(approvals.router)  # /api/v1/approvals
+api_router.include_router(reviews.router)  # /api/v1/reviews + …/pulls/{n}/claude-review

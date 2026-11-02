@@ -21,7 +21,9 @@ from app.core.logging import configure_logging, get_logger
 from app.core.middleware import RequestIdMiddleware, SecurityHeadersMiddleware
 from app.core.prod_checks import assert_production_ready
 from app.db.session import build_engine, build_sessionmaker
+from app.integrations.claude_cli import ClaudeCLI
 from app.integrations.github import build_github_client
+from app.services.claude_review import ReviewRunner
 from app.services.health import HealthService
 
 log = get_logger(__name__)
@@ -69,6 +71,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # GitHub REST client (docs/18-github-foundation.md); None without GITHUB_TOKEN.
         github = build_github_client(settings)
         app.state.github = github
+        # Claude PR reviews (docs/22-claude-review.md): off unless CLAUDE_REVIEW_ENABLED.
+        app.state.claude_cli = ClaudeCLI(settings)
+        app.state.review_runner = ReviewRunner(settings.CLAUDE_REVIEW_MAX_QUEUE)
         registry = AgentRegistry(app.state.sessionmaker)
         app.state.registry = registry
         app.state.agent_paused = {}
@@ -95,6 +100,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             log.info("shutdown")
             await heartbeat.stop()
+            await app.state.review_runner.aclose()
             if dhan is not None:
                 await dhan.aclose()
             if mt5 is not None:
