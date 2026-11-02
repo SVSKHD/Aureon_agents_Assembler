@@ -484,3 +484,54 @@ See [23-approval-engine.md](23-approval-engine.md).
 - **D-20-18: `GET /api/v1/audit/events` (for the Phase 21 audit module)** is admin-only and
   read-only; `event_type` is a literal prefix (LIKE metacharacters escaped); details are
   returned as stored because every writer already redacts.
+
+## 22 — Production integration
+
+- **D-22-1: roles in SQL, not a migration.** Creating roles and changing owners needs a
+  superuser; the migrate service must not have one. `deploy/sql/roles.sql` is idempotent,
+  never drops, takes passwords only as psql variables (the wrapper sends them as `\set`
+  lines on stdin), and is re-run after migrations. No alembic revision in this phase.
+- **D-22-2: schema `spasta` is created empty.** The owner listed spasta/agents/github/
+  trading/audit; `core`, `ai`, `dhan`, `mt5` and `public` also exist and are kept. `spasta`
+  is reserved for future Spasta-owned app tables, so it gets ownership, grants and default
+  privileges now and a COMMENT saying why it is empty.
+- **D-22-3: audit is append-only by default.** `audit_events`, `approval_events` and
+  `approval_artifacts` get INSERT + SELECT only (explicit REVOKE, tested). The audit schema's
+  default privileges are SELECT + INSERT, so a new audit table fails closed until it is
+  classified in roles.sql (a test enforces the classification). `approval_requests` and
+  `approval_policies` stay mutable (the engine updates them).
+- **D-22-4: BYPASSRLS on `aureon_app` and `aureon_readonly`.** Keeps D-A7: the legacy
+  Supabase RLS stays, Aureon no longer connects as the table owner, and ownership is enforced
+  in `app/services/finance.py`. Legacy table ownership is not changed.
+- **D-22-5: `MIGRATIONS_DATABASE_URL` lives in `.env.migrate`**, read only by the migrate
+  one-shot (`env_file … required: false`), so no long-running container holds the schema
+  owner's password. Unset = `DATABASE_URL`, as before.
+- **D-22-6: the 16-step acceptance list is defined here** (none existed): the owner's list
+  of roadmap capabilities, in docs/24. SKIP is reserved for a missing external piece and
+  always says which; FAIL is never downgraded to SKIP, except the paper step's "no fresh
+  price" (the risk check failing closed is correct behaviour, not a defect).
+- **D-22-7: the acceptance run talks HTTP only**, sends cookies by hand (stdlib cookie jars
+  drop `__Host-`/Secure cookies over http://127.0.0.1), and takes credentials from env/stdin.
+  It writes only tagged rows (a reused `ACCEPTANCE-PAPER` PAPER account, a far-from-market
+  LIMIT intent, a deleted expense, a denied merge approval).
+- **D-22-8: alert dedup in Redis** (`SET NX EX`), not a table: alerts are notifications, the
+  incidents/approvals tables are the record. A failed send releases the key. Heartbeat
+  incidents are not alerted twice (the heartbeat check covers them). Approval expiry itself
+  is already announced by the engine, so alerts cover "expiring soon" only.
+- **D-22-9: backup freshness via a status file** (`$DATA_ROOT/ops-status/backup.json`,
+  0644) that backup.sh writes on success and failure; the scheduler mounts the HDD
+  read-only. Unreadable = no alert (the card says `unknown`). The backup now includes the
+  `github` and `spasta` schemas (Phase 15's tables were missing from the dump).
+- **D-22-10: Access verification in three layers.** Cloudflare edge policies;
+  `access.required` in cloudflared (signature + AUD) and nginx requiring a JWT-shaped
+  `Cf-Access-Jwt-Assertion` (stock nginx cannot verify RS256); the optional app middleware
+  (RS256 only, JWKS cache with rate-limited refetch on unknown `kid`, cached keys survive a
+  JWKS outage, fail closed without any). Bypass paths are segment-aware prefixes.
+- **D-22-11: the rollback drill runs in one process** (alembic command API) so a full cycle
+  over every revision takes seconds, compares a schema snapshot before/after, and refuses the
+  configured database. The pytest covers 0010..head; the ops script defaults to 3 steps.
+- **D-22-12: two existing bugs fixed because the acceptance run found them.** redis-py ≥ 8
+  raises `redis.exceptions.TimeoutError` on an empty blocking pop of ≥ 5 s; the image worker's
+  serve loop died on it (no more jobs processed), the research AI lane would too, and the
+  webhook worker logged it as an outage. `ReviewRunner.drain()` yields after each gather so a
+  finished task's done-callback can run (it could spin forever).

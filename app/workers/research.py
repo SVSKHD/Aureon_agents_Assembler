@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from redis.asyncio import Redis
+from redis.exceptions import TimeoutError as RedisTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.ollama.client import OllamaClient
@@ -245,7 +246,10 @@ class ResearchWorker:
             if lane.paused or lane.queue.full():
                 await asyncio.sleep(2)
                 continue
-            got = await self.redis.brpop([ai.QUEUE_KEY], timeout=5)
+            try:
+                got = await self.redis.brpop([ai.QUEUE_KEY], timeout=5)
+            except RedisTimeoutError:  # redis-py >= 8: an empty blocking pop (idle)
+                continue
             if got:
                 lane.offer(json.loads(got[1]))
 

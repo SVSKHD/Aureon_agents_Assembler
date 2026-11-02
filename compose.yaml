@@ -41,6 +41,15 @@ x-data-root: &data-root
   bind:
     create_host_path: false   # fail instead of silently creating an empty dir on the SSD
 
+# Read-only view of the HDD (Phase 22): the scheduler reads the backup status file for alerts.
+x-data-root-ro: &data-root-ro
+  type: bind
+  source: ${DATA_ROOT:-/mnt/spasta-data}
+  target: /mnt/spasta-data
+  read_only: true
+  bind:
+    create_host_path: false
+
 services:
   # Gate: exits non-zero unless the HDD is really mounted (marker file present).
   # api depends on it completing successfully, so compose refuses to start the API.
@@ -163,6 +172,7 @@ services:
     environment:
       ENV: ${ENV:-prod}
     command: ["python", "-m", "app.workers.scheduler"]
+    volumes: [*data-root-ro]   # backup status for alerts_dispatch (docs/24); read-only
     networks: [aureon, private-ai]
     # NO ports.
     <<: *hardened
@@ -312,7 +322,12 @@ services:
   # Ad-hoc: `docker compose run --rm migrate` (same) or `... migrate <other command>`.
   migrate:
     image: aureon-agentic:${IMAGE_TAG:-dev}
-    env_file: .env
+    # Phase 22: MIGRATIONS_DATABASE_URL (the aureon_migrator role) lives in .env.migrate, so
+    # only this one-shot ever sees the schema owner's password. Missing file = DATABASE_URL.
+    env_file:
+      - path: .env
+      - path: .env.migrate
+        required: false
     environment:
       ENV: ${ENV:-prod}
     command: ["python", "-m", "app.workers.migrate"]

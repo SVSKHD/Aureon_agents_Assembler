@@ -18,6 +18,7 @@ from app.agents.registry import OLLAMA, AgentRegistry, Heartbeat
 from app.agents.trading.dhan import build_dhan_adapter
 from app.agents.trading.mt5 import build_mt5_adapter
 from app.api.router import api_router
+from app.core.cf_access import CloudflareAccessMiddleware
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import RequestIdMiddleware, SecurityHeadersMiddleware
@@ -151,6 +152,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
             allow_headers=["content-type", "x-csrf-token", "x-request-id"],
         )
+    if settings.cf_access_enabled:
+        # Phase 22 (docs/24): verify the Cloudflare Access JWT, except on the bypass paths.
+        app.add_middleware(CloudflareAccessMiddleware, settings=settings)
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(RequestIdMiddleware)
     app.include_router(api_router)

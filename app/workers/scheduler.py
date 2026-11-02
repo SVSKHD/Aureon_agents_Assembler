@@ -49,6 +49,7 @@ from app.models.auth import UserSession
 from app.models.finance import FinanceTombstone
 from app.models.trading import BrokerAccount
 from app.services import (
+    alerts,
     dhan_sync,
     github,
     github_actions,
@@ -324,6 +325,13 @@ async def approval_expire(ctx: TaskContext) -> dict[str, Any]:
             return {"expired": total}
 
 
+async def alerts_dispatch(ctx: TaskContext) -> dict[str, Any]:
+    """Open incidents, stale heartbeats, backup problems and expiring approvals → Discord,
+    deduplicated per fingerprint (docs/24-production-integration.md). No-op without
+    DISCORD_WEBHOOK_URL."""
+    return await alerts.dispatch(ctx.maker, ctx.settings, ctx.redis)
+
+
 TASKS: dict[str, TaskFn] = {
     "purge_agent_history": purge_agent_history,
     "purge_expired_sessions": purge_expired_sessions,
@@ -339,6 +347,7 @@ TASKS: dict[str, TaskFn] = {
     "github_actions_sync": github_actions_sync,
     "incident_scan": incident_scan,
     "approval_expire": approval_expire,
+    "alerts_dispatch": alerts_dispatch,
 }
 
 # (id, task, cron) — created if missing; an admin's later edits (pause etc.) are kept.
@@ -357,6 +366,8 @@ def default_jobs(settings: Settings) -> list[tuple[str, str, str]]:
     jobs.append(("approval-expire", "approval_expire", settings.APPROVALS_EXPIRE_CRON))
     if settings.INCIDENT_SCAN_CRON:
         jobs.append(("incident-scan", "incident_scan", settings.INCIDENT_SCAN_CRON))
+    if settings.ALERTS_CRON and settings.discord_webhook_url:
+        jobs.append(("alerts-dispatch", "alerts_dispatch", settings.ALERTS_CRON))
     if settings.dhan_configured:
         jobs += [
             (

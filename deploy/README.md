@@ -135,6 +135,13 @@ every minute; the Discord webhook, `PUBLIC_APP_URL` and policy tuning are in
 [docs/manual-setup.md](../docs/manual-setup.md#20--approval-engine)): see
 [docs/23-approval-engine.md](../docs/23-approval-engine.md#deploy-and-validate).
 
+Production integration (no migration; scoped DB roles, `.env.migrate`, the rollback drill,
+Cloudflare Tunnel + Access with `deploy/cloudflare/` and `deploy/nginx/api-spasta-online.conf`,
+alerts and the acceptance run; the server steps are in
+[docs/manual-setup.md](../docs/manual-setup.md#22--production-integration)): see
+[docs/24-production-integration.md](../docs/24-production-integration.md#deploy-and-validate)
+and [cloudflare/README.md](cloudflare/README.md).
+
 Agents, scheduler, system status and the host-status helper: see
 [docs/05-agents.md](../docs/05-agents.md#deploy-and-validate).
 
