@@ -86,6 +86,7 @@ tests/  scripts/  deploy/  docs/
 | GET | `/api/trading/stream` | SSE: signals, risk decisions, backtests, agent state, Dhan quotes ([docs/14-frontend.md](docs/14-frontend.md)). |
 | GET | `/api/repos`, `/api/repos/{name}/tree\|file\|commits\|branches` | Allowlisted local repos, read from git (admin). |
 | POST / GET | `/api/code/analyze`, `/api/code/tasks[/{id}[/diff\|approve\|reject]]` | Coding agent: explain code; patch in an isolated worktree, test, approve (admin, audited; never pushes). |
+| CRUD | `/api/finance/{trades,expenses,secured,documents,portfolio-profiles}`, `/api/finance/totals`, `/api/finance/claim` | Spasta finance tables, scoped to the signed-in user ([docs/02-auth-and-finance.md](docs/02-auth-and-finance.md#finance)). |
 | GET | `/api/docs` | Swagger UI (disabled when `ENV=prod`). |
 
 ## Configuration
