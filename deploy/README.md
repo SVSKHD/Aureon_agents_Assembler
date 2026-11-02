@@ -95,6 +95,10 @@ Research agents (migration 0007, opt-in worker): see [docs/13-research-agents.md
 Paper trading (migration 0009, scheduler jobs `paper-process` / `paper-reconcile`): see
 [docs/15-paper-trading.md](../docs/15-paper-trading.md#deploy-and-validate).
 
+GitHub foundation (migration 0012, `github-sync` job only with `GITHUB_TOKEN`; PAT steps in
+[docs/manual-setup.md](../docs/manual-setup.md#15--github-foundation)): see
+[docs/18-github-foundation.md](../docs/18-github-foundation.md#deploy-and-validate).
+
 Agents, scheduler, system status and the host-status helper: see
 [docs/05-agents.md](../docs/05-agents.md#deploy-and-validate).
 

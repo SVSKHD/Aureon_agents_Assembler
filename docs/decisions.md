@@ -72,3 +72,50 @@ what would change it. Newest phase last.
   `DELETE /api/auth/sessions/{id}` also clears its cookies. An already revoked or expired own
   session is 404, like an unknown one.
 - **D-Dbe-11: new dependency `python-multipart`.** FastAPI needs it for the multipart upload.
+
+## 15 — GitHub foundation
+
+- **D-15-1: the token comes from env only, and only its fingerprint is stored.**
+  `GITHUB_TOKEN` is read by Settings and held only by the client. `github.connections` is
+  keyed by sha256(token)[:16], so a rotated token simply gets a new row.
+- **D-15-2: redaction lives in the client.** Every message the client builds or logs goes
+  through `redact()`, which covers the configured token plus any GitHub-shaped credential.
+  Routers return only `GitHubError.message`, never `str()` of a cause. This does not rely
+  on a global log processor (another phase adds one; both can coexist).
+- **D-15-3: the allowlist semantics.** `GITHUB_ALLOWED_REPOS`, when set, is the exact list
+  (narrowed by owners if both are set). Otherwise `GITHUB_ALLOWED_OWNERS`. With neither,
+  only the token user's own repos. Everything outside is 404, indistinguishable from
+  missing, and checked before any GitHub call. The repo listing re-applies the allowlist at
+  read time, so a config change takes effect without a sync.
+- **D-15-4: the retry budget.** 3 attempts at most. A 429 or secondary limit is waited out
+  inside the request only up to `GITHUB_MAX_RETRY_WAIT_SECONDS` (20 s). Longer waits
+  become a 429 with `Retry-After` rather than a hung admin request. The primary limit at 0
+  is a rate-limit error, not a 403.
+- **D-15-5: the rate-limit floor is local and per process.** Below `GITHUB_RATE_LIMIT_FLOOR`
+  remaining requests (default 50), the client refuses until the reset time, leaving headroom
+  for the scheduler and later phases. The snapshot is stored on `github.connections` after
+  checks and syncs.
+- **D-15-6: redirects are followed by hand, same host only.** httpx's automatic redirects
+  would forward the Authorization header across hosts. A same-host 301 (a renamed repo) is
+  followed, and the new full name is re-checked against the allowlist.
+- **D-15-7: repositories are never deleted.** A complete sync sets `removed_at` on unseen
+  repos and clears it when they reappear. A capped listing (over `GITHUB_MAX_PAGES`) marks
+  nothing.
+- **D-15-8: the routes live under `/api/v1/github`.** A `/v1/github` router is mounted under
+  the existing `/api` router, as the orchestrator asked. Existing `/api/*` routes are
+  unchanged.
+- **D-15-9: path safety.** Paths are validated as given and once more URL-decoded: `.`, `..`
+  and empty segments, leading `/` or `~`, backslashes and control characters are 400
+  `invalid_path`. Each segment is then percent-encoded into the GitHub URL. Refs and shas
+  follow git ref rules (no `..`, no `@{`, no leading `-` or `/`).
+- **D-15-10: text vs binary.** A file is text when it is valid UTF-8 without NUL bytes and
+  no larger than `GITHUB_MAX_FILE_BYTES`. Everything else returns metadata only.
+- **D-15-11: the agent heartbeat comes from the sync task.** The `github` agent
+  (kind `integration`) is registered by the scheduler's `github_sync` task. Its
+  `stale_after_s` is `GITHUB_AGENT_STALE_SECONDS` (1 h, three missed 20-minute runs).
+  Pausing the agent makes the task skip.
+- **D-15-12: tests never use the host's token.** The shared test settings pin
+  `GITHUB_TOKEN=None`, so a token in the developer's environment cannot reach GitHub from a
+  test.
+- **D-15-13: no ETag requests in this phase.** They are optional in the spec. The in-memory
+  TTL cache already absorbs repeated browsing, and syncs run every 20 minutes.
