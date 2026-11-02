@@ -647,3 +647,32 @@ async def test_incident_api_and_admin_only(rp_env: RpEnv) -> None:
         assert (await e.get("admin", f"{R}/incidents/{uuid.uuid4()}")).status_code == 404
         assert (await e.get("admin", f"{R}/{uuid.uuid4()}")).status_code == 404
         assert await audits(e, "incident_ignored") == 1
+
+
+class CancellingOllama(FakeOllama):
+    """Cancels the task through the API while the model is 'thinking'."""
+
+    def __init__(self, e: Env, answer: str) -> None:
+        super().__init__(answer)
+        self.e = e
+
+    async def chat_stream(
+        self, model: str, messages: list[dict[str, str]], options: dict[str, Any]
+    ) -> AsyncIterator[dict[str, Any]]:
+        [(rid,)] = await self.e.sql("SELECT id FROM agents.repair_tasks WHERE status = 'running'")
+        r = await self.e.send("admin", "POST", f"{R}/{rid}/cancel")
+        assert r.status_code == 200 and r.json()["status"] == "cancelled"
+        async for chunk in super().chat_stream(model, messages, options):
+            yield chunk
+
+
+async def test_cancel_mid_flight_stops_before_push(rp_env: RpEnv, code_repo: Path) -> None:
+    async with rp_env() as e:
+        iid = await code_incident(e)
+        await e.send("admin", "POST", R, json={"incident_id": str(iid)})
+        with respx.mock(base_url=API, assert_all_called=False) as router:
+            task = await run_next(e, "", CancellingOllama(e, PATCH_WIDGET))
+            assert router.calls.call_count == 0
+        assert task.status == "cancelled" and task.worktree is None
+        assert "repair/" not in git(code_repo, "branch", "--list")
+        assert (await incident(e, iid)).status == "open"

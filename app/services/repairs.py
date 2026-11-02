@@ -443,15 +443,17 @@ def _incident_brief(inc: Incident) -> str:
     return "\n".join(lines)
 
 
-async def _set(maker: async_sessionmaker[AsyncSession], rid: uuid.UUID, **values: Any) -> None:
+async def _set(
+    maker: async_sessionmaker[AsyncSession], rid: uuid.UUID, *, force: bool = False, **values: Any
+) -> bool:
+    """Update the task unless an admin cancelled it meanwhile (then nothing changes and False
+    is returned). `force` is only for facts that already happened (an opened PR)."""
+    q = update(RepairTask).where(RepairTask.id == rid)
+    if not force:
+        q = q.where(RepairTask.status != "cancelled")
     async with maker() as db, db.begin():
-        await db.execute(update(RepairTask).where(RepairTask.id == rid).values(**values))
-
-
-async def _status(maker: async_sessionmaker[AsyncSession], rid: uuid.UUID) -> str | None:
-    async with maker() as db:
-        status: str | None = await db.scalar(select(RepairTask.status).where(RepairTask.id == rid))
-        return status
+        res = await db.execute(q.values(**values))
+    return bool(res.rowcount)  # type: ignore[attr-defined]
 
 
 async def _finish_incident(
@@ -531,10 +533,11 @@ async def run_repair(
         worktree = cfg.coding.worktree_root / f"repair-{rid.hex}"
         await asyncio.to_thread(cfg.coding.worktree_root.mkdir, parents=True, exist_ok=True)
         await git.worktree_add(worktree, branch, base_sha)
-        await _set(
+        if not await _set(
             maker, rid, base_sha=base_sha, model=cfg.model, prompt_digest=digest,
             branch=branch, worktree=str(worktree),
-        )  # fmt: skip
+        ):  # fmt: skip
+            raise Cancelled
         for d in repo.link:  # reuse installed deps so tests run offline; never committed
             src, dst = repo.path / d, worktree / d
             if await asyncio.to_thread(src.is_dir) and not await asyncio.to_thread(dst.exists):
@@ -571,11 +574,11 @@ async def run_repair(
         commit = await git.commit_all_staged(
             worktree, f"repair: {incident.title[:120]}\n\nIncident {incident.id}"
         )
-        await _set(maker, rid, status="patch_ready", patch=patch.text, files=list(patch.files))
-        extra["commit"] = commit
-
-        if await _status(maker, rid) == "cancelled":
+        if not await _set(
+            maker, rid, status="patch_ready", patch=patch.text, files=list(patch.files)
+        ):
             raise Cancelled
+        extra["commit"] = commit
         if not repo.tests:
             raise _TestsFailed("no allowlisted test commands are configured for this repo", "")
         outputs: list[str] = []
@@ -598,9 +601,7 @@ async def run_repair(
         output = _cap(scrub("\n\n".join(outputs)), cfg.output_max)
         if not ok:
             raise _TestsFailed("allowlisted tests failed", output)
-        await _set(maker, rid, status="tests_passed", test_output=output)
-
-        if await _status(maker, rid) == "cancelled":
+        if not await _set(maker, rid, status="tests_passed", test_output=output):
             raise Cancelled
         if github is None:
             raise RepairError("GitHub is not configured; nothing was pushed")
@@ -612,7 +613,7 @@ async def run_repair(
         worktree = None
         await _set(
             maker, rid, status="pr_opened", pr_url=url, pr_number=number, worktree=None,
-            finished_at=func.now(),
+            finished_at=func.now(), force=True,
         )  # fmt: skip
         status = "pr_opened"
         extra |= {"status": status, "pr_url": url}
@@ -628,7 +629,7 @@ async def run_repair(
     except Cancelled:
         if git is not None:
             await _cleanup(git, worktree, branch)
-        await _set(maker, rid, worktree=None, finished_at=func.now())
+        await _set(maker, rid, worktree=None, branch=None, finished_at=func.now(), force=True)
         status = "cancelled"
         extra |= {"status": status}
         return status
@@ -661,6 +662,8 @@ async def run_repair(
         extra |= {"status": status, "error": msg[:300]}
         return status
     finally:
+        if status != "pr_opened":  # the sandbox is gone whatever happened (even if cancelled)
+            await _set(maker, rid, worktree=None, force=True)
         await _finish_incident(maker, incident.id, status, extra)
         if status in FAILED:
             await check_breaker(maker, settings)
