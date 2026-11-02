@@ -34,13 +34,15 @@ from app.agents.ollama.client import OllamaClient
 from app.agents.registry import SCHEDULER, AgentRegistry, Heartbeat
 from app.agents.trading.dhan import build_dhan_adapter
 from app.agents.trading.dhan.adapter import DhanAdapter
+from app.agents.trading.mt5 import build_mt5_adapter
+from app.agents.trading.mt5.adapter import MT5Adapter
 from app.agents.trading.types import Timeframe
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging, get_logger
 from app.db.session import build_engine, build_sessionmaker
 from app.models.agents import Agent, AgentLog, AgentRun, ScheduledJob
 from app.models.auth import UserSession
-from app.services import dhan_sync
+from app.services import dhan_sync, mt5_sync
 
 log = get_logger("worker.scheduler")
 MAX_BACKOFF_SECONDS = 3600
@@ -52,6 +54,7 @@ class TaskContext:
     maker: async_sessionmaker[AsyncSession]
     ollama: OllamaClient | None
     dhan: DhanAdapter | None = None
+    mt5: MT5Adapter | None = None
 
 
 TaskFn = Callable[[TaskContext], Awaitable[dict[str, Any]]]
@@ -131,6 +134,13 @@ async def dhan_backfill_candles(ctx: TaskContext) -> dict[str, Any]:
     )
 
 
+async def mt5_sync_status(ctx: TaskContext) -> dict[str, Any]:
+    """Read the MT5 bot's status export once and store heartbeat, logs, signals, positions."""
+    if ctx.mt5 is None:
+        raise RuntimeError("MT5 bot export is not configured (MT5_STATUS_FILE / MT5_STATUS_URL)")
+    return await mt5_sync.sync_status(ctx.maker, ctx.mt5, ctx.settings)
+
+
 TASKS: dict[str, TaskFn] = {
     "purge_agent_history": purge_agent_history,
     "purge_expired_sessions": purge_expired_sessions,
@@ -138,6 +148,7 @@ TASKS: dict[str, TaskFn] = {
     "dhan_refresh_instruments": dhan_refresh_instruments,
     "dhan_reconcile": dhan_reconcile,
     "dhan_backfill_candles": dhan_backfill_candles,
+    "mt5_sync_status": mt5_sync_status,
 }
 
 # (id, task, cron) — created if missing; an admin's later edits (pause etc.) are kept.
@@ -149,7 +160,7 @@ DEFAULT_JOBS: list[tuple[str, str, str]] = [
 
 
 def default_jobs(settings: Settings) -> list[tuple[str, str, str]]:
-    """Built-in jobs, plus the Dhan jobs when Dhan credentials are configured."""
+    """Built-in jobs, plus the Dhan / MT5 jobs when those are configured."""
     jobs = list(DEFAULT_JOBS)
     if settings.dhan_configured:
         jobs += [
@@ -164,6 +175,8 @@ def default_jobs(settings: Settings) -> list[tuple[str, str, str]]:
             jobs.append(
                 ("dhan-backfill-candles", "dhan_backfill_candles", settings.DHAN_BACKFILL_CRON)
             )
+    if settings.mt5_configured:
+        jobs.append(("mt5-sync-status", "mt5_sync_status", settings.MT5_SYNC_CRON))
     return jobs
 
 
@@ -188,12 +201,13 @@ class Scheduler:
         tasks: dict[str, TaskFn] | None = None,
         ollama: OllamaClient | None = None,
         dhan: DhanAdapter | None = None,
+        mt5: MT5Adapter | None = None,
     ) -> None:
         self.settings = settings
         self.maker = maker
         self.tasks = TASKS if tasks is None else tasks
         self.registry = AgentRegistry(maker)
-        self.ctx = TaskContext(settings, maker, ollama, dhan)
+        self.ctx = TaskContext(settings, maker, ollama, dhan, mt5)
         self.paused = False
         self.running_job: str | None = None
 
@@ -334,7 +348,8 @@ async def main() -> int:
     )
     redis = Redis.from_url(settings.REDIS_URL)
     dhan = build_dhan_adapter(settings, redis, maker)
-    scheduler = Scheduler(settings, maker, ollama=ollama, dhan=dhan)
+    mt5 = build_mt5_adapter(settings)
+    scheduler = Scheduler(settings, maker, ollama=ollama, dhan=dhan, mt5=mt5)
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -363,6 +378,8 @@ async def main() -> int:
         await ollama.aclose()
         if dhan is not None:
             await dhan.aclose()
+        if mt5 is not None:
+            await mt5.aclose()
         await redis.aclose()
         await engine.dispose()
         log.info("scheduler_stopped")

@@ -39,9 +39,13 @@ SCHEDULER = AgentSpec("scheduler", "Scheduler", "scheduler")
 
 
 def effective_state(agent: Agent, stale_after: float, now: datetime | None = None) -> str:
-    """paused > stale > reported state."""
+    """paused > stale > reported state. An agent may carry its own window in
+    `details.stale_after_s` (e.g. the MT5 bot, whose heartbeat is its export time)."""
     if agent.paused:
         return "paused"
+    own = (agent.details or {}).get("stale_after_s")
+    if isinstance(own, int | float) and not isinstance(own, bool) and own > 0:
+        stale_after = float(own)
     now = now or datetime.now(UTC)
     if agent.last_heartbeat_at is None or (
         now - agent.last_heartbeat_at > timedelta(seconds=stale_after)
