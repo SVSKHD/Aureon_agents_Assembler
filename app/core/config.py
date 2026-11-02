@@ -149,6 +149,25 @@ class Settings(BaseSettings):
     def dhan_configured(self) -> bool:
         return bool(self.DHAN_CLIENT_ID and self.DHAN_ACCESS_TOKEN)
 
+    # --- MT5 bot (Trading Phase C, docs/12-mt5-adapter.md). Read-only status export only. ---
+    # Either the bot's logs/status.json (bind-mounted read-only) or its GET /status endpoint.
+    MT5_STATUS_FILE: str | None = None
+    MT5_STATUS_URL: str | None = None
+    MT5_STATUS_TOKEN: SecretStr | None = None
+    MT5_HTTP_TIMEOUT: float = Field(default=5.0, gt=0)
+    # The bot is marked stale when its export is older than this.
+    MT5_STALE_SECONDS: float = Field(default=90.0, gt=0)
+    # MT5 login + server of the account the bot trades (needed for positions + mt5.terminals).
+    MT5_ACCOUNT_ID: str | None = None
+    MT5_SERVER: str | None = None
+    # Deposit currency of that account (the bot does not export it).
+    MT5_ACCOUNT_CURRENCY: str = Field(default="USD", min_length=3, max_length=3)
+    MT5_SYNC_CRON: str = "* * * * *"
+
+    @property
+    def mt5_configured(self) -> bool:
+        return bool(self.MT5_STATUS_FILE or self.MT5_STATUS_URL)
+
     @field_validator("IMAGE_AGENT_COMMAND", mode="before")
     @classmethod
     def _parse_command(cls, v: object) -> object:
