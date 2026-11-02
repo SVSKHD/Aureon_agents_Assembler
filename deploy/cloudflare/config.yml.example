@@ -1,0 +1,68 @@
+# cloudflared tunnel config for spasta.online + api.spasta.online (docs/24, Phase 22).
+#
+# Copy to /etc/cloudflared/config.yml (root-owned, 0644; the credentials file 0600), replace
+# the <placeholders>, then:  sudo cloudflared tunnel ingress validate
+#                            sudo cloudflared tunnel ingress rule https://api.spasta.online/api/auth/me
+#                            sudo systemctl restart cloudflared
+#
+# Every hostname goes to NGINX on loopback (127.0.0.1:8088), never to the API port 8000:
+# nginx adds the security headers, body limits and the Access header check, and is the only
+# thing that proxies to 127.0.0.1:8000. Nothing listens on a public interface.
+#
+# Cloudflare Access is enforced at the edge (deploy/cloudflare/README.md). In addition,
+# `access.required` makes cloudflared itself verify the Access JWT (signature, audience)
+# before forwarding, so a request that somehow bypassed the edge still cannot reach nginx.
+# The two bypass paths (GitHub webhooks: HMAC-verified; /api/public/*: rate-limited,
+# read-only) are matched FIRST and forwarded without that check. Order matters: first match
+# wins.
+
+tunnel: <TUNNEL-UUID>
+credentials-file: /etc/cloudflared/<TUNNEL-UUID>.json
+# No metrics listener on a public address.
+metrics: 127.0.0.1:20241
+no-autoupdate: false
+
+originRequest:
+  connectTimeout: 10s
+  # SSE (chat tokens, trading/approval streams): keep idle connections open.
+  keepAliveTimeout: 120s
+  noTLSVerify: false
+
+ingress:
+  # --- Access bypass paths (no JWT is ever sent on these) --------------------------------
+  - hostname: api.spasta.online
+    path: ^/api/v1/github/webhooks$
+    service: http://127.0.0.1:8088
+    originRequest:
+      httpHostHeader: api.spasta.online
+  - hostname: api.spasta.online
+    path: ^/api/public/
+    service: http://127.0.0.1:8088
+    originRequest:
+      httpHostHeader: api.spasta.online
+  - hostname: spasta.online
+    path: ^/api/public/
+    service: http://127.0.0.1:8088
+    originRequest:
+      httpHostHeader: spasta.online
+
+  # --- Access-protected: cloudflared verifies the token too ---------------------------
+  - hostname: api.spasta.online
+    service: http://127.0.0.1:8088
+    originRequest:
+      httpHostHeader: api.spasta.online
+      access:
+        required: true
+        teamName: <TEAM>                 # <TEAM>.cloudflareaccess.com
+        audTag: [<AUD-TAG-API>]          # the api.spasta.online Access application
+  - hostname: spasta.online
+    service: http://127.0.0.1:8088
+    originRequest:
+      httpHostHeader: spasta.online
+      access:
+        required: true
+        teamName: <TEAM>
+        audTag: [<AUD-TAG-WEB>]          # the spasta.online Access application
+
+  # Anything else: 404 (never a default origin).
+  - service: http_status:404

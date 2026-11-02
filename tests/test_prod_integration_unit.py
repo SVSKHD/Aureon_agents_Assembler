@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 import re
 import uuid
 from pathlib import Path
@@ -233,3 +234,53 @@ def test_image_worker_is_single_instance_single_job() -> None:
 def test_chat_generations_are_serialised_by_default(settings: Settings) -> None:
     assert Settings.model_fields["OLLAMA_MAX_CONCURRENT"].default == 1
     assert settings.OLLAMA_MAX_CONCURRENT == 1
+
+
+# --- Cloudflare tunnel + nginx config -----------------------------------------------------
+
+
+def test_cloudflared_ingress_routes_only_to_nginx_on_loopback() -> None:
+    import yaml
+
+    cfg = yaml.safe_load((ROOT / "deploy" / "cloudflare" / "config.yml.example").read_text())
+    rules = cfg["ingress"]
+    assert rules[-1] == {"service": "http_status:404"}
+    hosts = {r.get("hostname") for r in rules[:-1]}
+    assert hosts == {"spasta.online", "api.spasta.online"}
+    for r in rules[:-1]:
+        assert r["service"] == "http://127.0.0.1:8088", r  # nginx, never :8000 directly
+    assert "8000" not in json.dumps(cfg)  # no rule targets the API port
+    bypass = [r for r in rules[:-1] if "path" in r]
+    assert {r["path"] for r in bypass} == {"^/api/v1/github/webhooks$", "^/api/public/"}
+    for r in bypass:
+        assert "access" not in r.get("originRequest", {})
+    protected = [r for r in rules[:-1] if "path" not in r]
+    assert {r["hostname"] for r in protected} == hosts
+    for r in protected:
+        acc = r["originRequest"]["access"]
+        assert acc["required"] is True and acc["teamName"] and acc["audTag"]
+    # Bypass rules come before the hostname-wide rules (first match wins).
+    assert max(rules.index(r) for r in bypass) < min(rules.index(r) for r in protected)
+    assert cfg["metrics"].startswith("127.0.0.1:")
+
+
+def test_nginx_api_host_requires_the_access_header_except_bypass_paths() -> None:
+    conf = (ROOT / "deploy" / "nginx" / "api-spasta-online.conf").read_text()
+    body = "\n".join(line.split("#", 1)[0] for line in conf.splitlines())
+    assert "listen 127.0.0.1:8088;" in body and "server_name api.spasta.online;" in body
+    assert "$http_cf_access_jwt_assertion" in body
+    blocks = re.findall(r"location\s+([^{]+)\{(.*?)\n    \}", body, re.S)
+    by = {loc.strip(): blk for loc, blk in blocks}
+    for loc in ("/api/", "= /api/finance/attachments"):
+        assert "if ($aureon_cf_jwt_ok = 0) { return 403; }" in by[loc], loc
+    for loc in ("= /api/v1/github/webhooks", "^~ /api/public/"):
+        assert "aureon_cf_jwt_ok" not in by[loc], loc
+        assert "limit_except" in by[loc], loc
+    assert "return 404" in by["= /api/health/ready"] and "return 404" in by["/"]
+    for blk in by.values():
+        for target in re.findall(r"proxy_pass\s+(\S+);", blk):
+            assert target == "http://127.0.0.1:8000", target
+    tf = (ROOT / "deploy" / "cloudflare" / "access.tf.example").read_text()
+    assert tf.count('decision       = "bypass"') == 2
+    assert "api.spasta.online/api/v1/github/webhooks" in tf
+    assert "session_duration" in tf and "var.owner_email" in tf
