@@ -137,7 +137,14 @@ class Env:
         return await self.send(who, "POST", "/api/trading/order-intents", json=body)
 
     async def approve(self, intent_id: str, who: str = "admin") -> Any:
-        return await self.send(who, "POST", f"/api/trading/order-intents/{intent_id}/approve")
+        # Phase 20: the endpoint files a trading.paper_intent approval and, with the
+        # password, approves it in the same call (single-approval policy).
+        return await self.send(
+            who,
+            "POST",
+            f"/api/trading/order-intents/{intent_id}/approve",
+            json={"password": PASSWORD},
+        )
 
     async def count(self, model: Any, *where: Any) -> int:
         async with self.maker() as db:
@@ -665,3 +672,107 @@ async def test_reconciliation_flags_drift(make_env: EnvFactory) -> None:
             await env.clients["user"].get(f"/api/trading/accounts/{env.account_id}/paper")
         ).json()
         assert summary["reconciliation"]["ok"] is False
+
+
+# --- Phase 20: approval through the engine (docs/23-approval-engine.md) ----------------------
+
+
+async def test_approve_without_password_files_an_engine_request(make_env: EnvFactory) -> None:
+    async with make_env() as env:
+        await env.policy()
+        await env.tick("1000")
+        made = (await env.intent()).json()
+        url = f"/api/trading/order-intents/{made['id']}/approve"
+        r = await env.send("admin", "POST", url)
+        assert r.status_code == 202, r.text
+        filed = r.json()
+        assert filed["kind"] == "trading.paper_intent" and filed["status"] == "pending"
+        assert filed["required_approvals"] == 1
+        aid = filed["approval_id"]
+        # a second call reuses the pending request
+        assert (await env.send("admin", "POST", url)).json()["approval_id"] == aid
+        assert await env.count(Execution) == 0
+        d = (await env.clients["admin"].get(f"/api/v1/approvals/{aid}")).json()
+        assert d["requested_by"] == str(env.ids["user"])
+        assert {a["name"] for a in d["artifacts"]} == {"intent", "risk_decision"}
+        assert d["policy"]["kind_pattern"] == "trading.paper_intent"
+        inbox = (await env.clients["admin"].get("/api/v1/approvals/inbox")).json()
+        assert [i["id"] for i in inbox["items"]] == [aid]
+        # approve from the inbox: runs the unchanged approve_and_execute
+        r = await env.send(
+            "admin", "POST", f"/api/v1/approvals/{aid}/approve", json={"password": PASSWORD}
+        )
+        assert r.status_code == 200 and r.json()["status"] == "executed", r.text
+        assert r.json()["result"]["intent_status"] == "FILLED"
+        assert await env.count(Execution) == 1
+        assert "order_intent_approved" in [e async for e in _audit(env)]
+        # single use: the request and the intent are both consumed
+        r = await env.send(
+            "admin", "POST", f"/api/v1/approvals/{aid}/approve", json={"password": PASSWORD}
+        )
+        assert r.status_code == 409 and r.json()["detail"]["code"] == "approval_already_used"
+        r = await env.approve(made["id"])
+        assert r.status_code == 409 and r.json()["detail"]["code"] == "not_pending"
+        assert await env.count(Execution) == 1
+
+
+async def test_wrong_password_on_the_wrapper_is_403(make_env: EnvFactory) -> None:
+    async with make_env() as env:
+        await env.policy()
+        await env.tick("1000")
+        made = (await env.intent()).json()
+        r = await env.send(
+            "admin",
+            "POST",
+            f"/api/trading/order-intents/{made['id']}/approve",
+            json={"password": "not-the-password"},
+        )
+        assert r.status_code == 403 and r.json()["detail"]["code"] == "reauth_failed"
+        assert r.json()["detail"]["approval_id"]
+        assert await env.count(Execution) == 0
+
+
+async def test_risk_decision_change_invalidates_the_approval(make_env: EnvFactory) -> None:
+    async with make_env() as env:
+        await env.policy()
+        await env.tick("1000")
+        made = (await env.intent()).json()
+        url = f"/api/trading/order-intents/{made['id']}/approve"
+        aid = (await env.send("admin", "POST", url)).json()["approval_id"]
+        # a newer risk decision appears after the request was filed
+        async with env.maker() as db, db.begin():
+            latest = await db.scalar(
+                select(RiskDecision)
+                .where(RiskDecision.order_intent_id == made["id"])
+                .order_by(RiskDecision.id.desc())
+                .limit(1)
+            )
+            assert latest is not None
+            db.add(
+                RiskDecision(
+                    broker_account_id=latest.broker_account_id,
+                    order_intent_id=latest.order_intent_id,
+                    approved=True,
+                    reason="re-check",
+                )
+            )
+        d = (
+            await env.clients["admin"].get(f"/api/v1/approvals/{aid}", params={"check_drift": True})
+        ).json()
+        assert d["drift"]["status"] == "drifted" and d["drift"]["drifted"] == ["risk_decision"]
+        r = await env.send(
+            "admin", "POST", f"/api/v1/approvals/{aid}/approve", json={"password": PASSWORD}
+        )
+        assert r.status_code == 409 and r.json()["detail"]["code"] == "approval_invalidated"
+        assert await env.count(Execution) == 0
+        intent = (await env.clients["admin"].get(f"/api/trading/order-intents/{made['id']}")).json()
+        assert intent["status"] == "PENDING_RISK"
+        # a fresh request binds the new decision and goes through
+        r = await env.approve(made["id"])
+        assert r.status_code == 200 and r.json()["status"] == "FILLED"
+
+
+async def test_no_live_approval_kind_exists() -> None:
+    from app.services.approvals import REGISTRY
+
+    assert not [k for k in REGISTRY.kinds() if "live" in k.lower()]

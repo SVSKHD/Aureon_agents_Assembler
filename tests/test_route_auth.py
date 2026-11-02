@@ -115,6 +115,16 @@ ADMIN = {
     ("GET", "/api/v1/approvals/{approval_id}"),
     ("POST", "/api/v1/approvals/{approval_id}/approve"),
     ("POST", "/api/v1/approvals/{approval_id}/deny"),
+    # Phase 20 approval engine, audit log and voice navigation (docs/23-approval-engine.md).
+    ("GET", "/api/v1/approvals/inbox"),
+    ("GET", "/api/v1/approvals/stream"),
+    ("GET", "/api/v1/approvals/policies"),
+    ("PUT", "/api/v1/approvals/policies"),
+    ("POST", "/api/v1/approvals/reauth"),
+    ("DELETE", "/api/v1/approvals/reauth"),
+    ("GET", "/api/v1/approvals/{approval_id}/events"),
+    ("GET", "/api/v1/audit/events"),
+    ("POST", "/api/v1/voice/intent"),
     # Phase 18 incidents + self-repair: admin only (docs/21-self-repair.md).
     ("GET", "/api/v1/repairs/status"),
     ("GET", "/api/v1/repairs/incidents"),
