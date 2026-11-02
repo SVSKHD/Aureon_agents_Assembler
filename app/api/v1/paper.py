@@ -38,6 +38,7 @@ from app.schemas.paper import (
     OrderIntentDetail,
     OrderIntentIn,
     OrderIntentOut,
+    PaperSummaryOut,
     ReconciliationOut,
 )
 from app.schemas.trading import ExecutionOut, RiskDecisionOut
@@ -280,12 +281,12 @@ async def cancel_order_intent(
     return await _detail(db, intent)
 
 
-@router.get("/accounts/{account_id}/paper")
+@router.get("/accounts/{account_id}/paper", response_model=PaperSummaryOut)
 async def paper_summary(
     account_id: uuid.UUID, db: DbSession, current: Current, settings: SettingsDep
-) -> dict[str, Any]:
+) -> PaperSummaryOut:
     account = await get_visible_account(db, current, account_id)
-    return await paper.summary(db, settings, account)
+    return PaperSummaryOut.model_validate(await paper.summary(db, settings, account))
 
 
 @router.post("/accounts/{account_id}/paper/reconcile", response_model=ReconciliationOut)
