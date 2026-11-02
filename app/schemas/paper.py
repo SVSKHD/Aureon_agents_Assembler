@@ -75,3 +75,37 @@ class ReconciliationOut(BaseModel):
     drift: list[dict[str, Any]]
     summary: dict[str, Any]
     created_at: datetime
+
+
+class PaperPositionOut(BaseModel):
+    instrument_id: int | None
+    symbol: str
+    quantity: str
+    avg_price: str
+    last_price: str | None
+    unrealized_pnl: str | None
+    realized_pnl: str | None
+
+
+class PaperReconciliationState(BaseModel):
+    ok: bool
+    drift: list[dict[str, Any]]
+    at: datetime
+
+
+class PaperSummaryOut(BaseModel):
+    """The paper book. Money and quantities are exact decimal strings."""
+
+    account_id: uuid.UUID
+    mode: str
+    currency: str
+    starting_capital: str
+    realized_pnl: str
+    fees: str
+    unrealized_pnl: str
+    equity: str
+    max_drawdown_pct: str
+    positions: list[PaperPositionOut]
+    positions_as_of: datetime | None
+    reconciliation: PaperReconciliationState | None
+    source: Literal["simulated"] = "simulated"
