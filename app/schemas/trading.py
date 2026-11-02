@@ -414,6 +414,7 @@ class RiskDecisionOut(_FromAttrs):
     id: int
     broker_account_id: uuid.UUID
     signal_id: uuid.UUID | None
+    order_intent_id: uuid.UUID | None = None
     approved: bool
     reason: str
     checks: list[dict[str, object]]

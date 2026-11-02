@@ -571,3 +571,62 @@ class IndicatorValue(Base):
     ts: Mapped[datetime] = mapped_column(TS)  # candle open time the value is for
     values: Mapped[dict[str, Any]] = mapped_column(JSONB)
     computed_at: Mapped[datetime] = _created()
+
+
+class PaperLedger(Base):
+    """Money movements of a PAPER account: realized P&L and charges per simulated fill.
+    Equity = PAPER_STARTING_CAPITAL + sum(amount) + unrealized P&L."""
+
+    __tablename__ = "paper_ledger"
+    __table_args__ = (
+        CheckConstraint("kind IN ('realized','fees')", name="kind"),
+        Index(
+            "ix_trading_paper_ledger_broker_account_id_created_at",
+            "broker_account_id",
+            "created_at",
+        ),
+        S,
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    broker_account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("trading.broker_accounts.id", ondelete="CASCADE")
+    )
+    execution_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("trading.executions.id", ondelete="SET NULL")
+    )
+    order_intent_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("trading.order_intents.id", ondelete="SET NULL")
+    )
+    instrument_id: Mapped[int] = mapped_column(
+        ForeignKey("trading.instruments.id", ondelete="RESTRICT")
+    )
+    kind: Mapped[str] = mapped_column(String(10))
+    amount: Mapped[Decimal] = mapped_column(MONEY)  # signed, account currency
+    currency: Mapped[str] = mapped_column(String(3))
+    details: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
+    created_at: Mapped[datetime] = _created()
+
+
+class Reconciliation(Base):
+    """A paper-account check: positions_snapshots vs the replayed simulated executions, and
+    the ledger vs the replayed P&L and charges. `drift` lists every difference found."""
+
+    __tablename__ = "reconciliations"
+    __table_args__ = (
+        Index(
+            "ix_trading_reconciliations_broker_account_id_created_at",
+            "broker_account_id",
+            "created_at",
+        ),
+        S,
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    broker_account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("trading.broker_accounts.id", ondelete="CASCADE")
+    )
+    ok: Mapped[bool] = mapped_column(Boolean)
+    drift: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, server_default=text("'[]'::jsonb"))
+    summary: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
+    created_at: Mapped[datetime] = _created()

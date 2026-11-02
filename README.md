@@ -16,6 +16,7 @@ execution modes (LIVE unreachable) and risk types ([docs/10-trading-foundation.m
 Trading Phase B adds the read-only DhanHQ v2 adapter, live-feed worker and sync jobs ([docs/11-dhan.md](docs/11-dhan.md)).
 Trading Phase C watches the separate Aureon MT5 bot through its read-only status export ([docs/12-mt5-adapter.md](docs/12-mt5-adapter.md)).
 Trading Phase D adds the research agents: market data, indicators, signals, risk decisions, backtests and Ollama explanations ([docs/13-research-agents.md](docs/13-research-agents.md)).
+Trading Phase F enables PAPER mode end to end: intents, risk, admin approval, simulated fills, P&L and reconciliation; no broker orders ([docs/15-paper-trading.md](docs/15-paper-trading.md)).
 
 ## Layout
 
@@ -80,6 +81,8 @@ tests/  scripts/  deploy/  docs/
 | POST / GET | `/api/trading/strategies/backtest`, `/api/trading/backtests[/{id}]` | Queue backtests (param grid); results + trades. |
 | GET | `/api/trading/indicators`, `/api/trading/risk-decisions`, `/api/trading/ai-analyses` | Stored analysis output. |
 | POST | `/api/trading/signals/{id}/explain`, `/api/trading/backtests/{id}/explain` | Queue an Ollama explanation (explanation only). |
+| POST / GET | `/api/trading/order-intents[/{id}[/approve\|cancel]]` | Paper intents: risk-checked, admin approval, simulated fill ([docs/15-paper-trading.md](docs/15-paper-trading.md)). |
+| GET / POST | `/api/trading/accounts/{id}/paper[/reconcile\|reconciliations]` | Paper book: equity, P&L, positions; reconciliation. |
 | GET | `/api/trading/stream` | SSE: signals, risk decisions, backtests, agent state, Dhan quotes ([docs/14-frontend.md](docs/14-frontend.md)). |
 | GET | `/api/repos`, `/api/repos/{name}/tree\|file\|commits\|branches` | Allowlisted local repos, read from git (admin). |
 | POST / GET | `/api/code/analyze`, `/api/code/tasks[/{id}[/diff\|approve\|reject]]` | Coding agent: explain code; patch in an isolated worktree, test, approve (admin, audited; never pushes). |
