@@ -30,6 +30,18 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 CMD ["uvicorn", "--factory", "app.main:app_factory", "--host", "0.0.0.0", "--port", "8000", \
      "--proxy-headers", "--timeout-graceful-shutdown", "20"]
 
+# --- coding worker (opt-in) --------------------------------------------------------------
+# docker compose --profile coding build coding-worker
+# git for worktrees, Node for the frontend's test commands. Tests run with the repo's own
+# node_modules / .venv linked in from the checkout, so nothing is installed at task time.
+FROM runtime AS coding
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git nodejs npm ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+USER aureon
+CMD ["python", "-m", "app.workers.coding"]
+
 # --- imaging worker (opt-in) -------------------------------------------------------------
 # docker compose --profile imaging build imaging-worker
 # Installs the existing /opt/image-agent's Python dependencies (CPU wheels) so its
