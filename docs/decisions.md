@@ -167,3 +167,9 @@ what would change it. Newest phase last.
   test.
 - **D-15-13: no ETag requests in this phase.** They are optional in the spec. The in-memory
   TTL cache already absorbs repeated browsing, and syncs run every 20 minutes.
+- **D-15-14: the global log processor also masks GitHub token shapes.** After merging Phase E,
+  `app/core/logging.py`'s `redact_secrets` also masks bare `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/
+  `github_pat_` strings in free text. This is a second layer under the client's own
+  redaction (D-15-2), for tokens a third-party library might log.
+- **D-15-15: a prod guard for the API URL.** With `GITHUB_TOKEN` set, `ENV=prod` refuses to start
+  unless `GITHUB_API_URL` is https, so the token is never sent in clear text.
