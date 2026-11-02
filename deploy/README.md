@@ -1,4 +1,4 @@
-# Deploy — Phases 1–5 + Trading A–B (Ubuntu 24.04, user svskhd8)
+# Deploy — Phases 1–5 + Trading A–C (Ubuntu 24.04, user svskhd8)
 
 The API joins the existing Postgres/Ollama network. Redis is added. Only `127.0.0.1:8000`
 is published. Nothing existing is stopped or modified.
@@ -77,6 +77,8 @@ curl -sS -o /dev/null -w '%{http_code}\n' -b $J -H "x-csrf-token: $CSRF" -X POST
 Ollama chat smoke test: see [docs/03-ollama.md](../docs/03-ollama.md#deploy-and-validate).
 
 Dhan (read-only adapter, feed worker, jobs): see [docs/11-dhan.md](../docs/11-dhan.md#deploy-and-validate).
+
+MT5 bot (read-only status export, sync job): see [docs/12-mt5-adapter.md](../docs/12-mt5-adapter.md#deploy-and-validate).
 
 Agents, scheduler, system status and the host-status helper: see
 [docs/05-agents.md](../docs/05-agents.md#deploy-and-validate).
