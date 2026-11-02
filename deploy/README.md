@@ -80,6 +80,9 @@ Dhan (read-only adapter, feed worker, jobs): see [docs/11-dhan.md](../docs/11-dh
 
 MT5 bot (read-only status export, sync job): see [docs/12-mt5-adapter.md](../docs/12-mt5-adapter.md#deploy-and-validate).
 
+Frontend routing (nginx `/api/*` → 127.0.0.1:8000) and the trading stream: see
+[docs/14-frontend.md](../docs/14-frontend.md).
+
 Research agents (migration 0007, opt-in worker): see [docs/13-research-agents.md](../docs/13-research-agents.md#deploy-and-validate).
 
 Agents, scheduler, system status and the host-status helper: see

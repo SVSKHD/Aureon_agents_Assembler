@@ -195,6 +195,12 @@ class Settings(BaseSettings):
     RESEARCH_AI_QUEUE_MAX: int = Field(default=20, ge=1, le=1000)
     RESEARCH_AI_TIMEOUT_SECONDS: float = Field(default=600.0, gt=0)
 
+    # --- real-time trading stream for the frontend (GET /api/trading/stream) ---
+    TRADING_STREAM_POLL_SECONDS: float = Field(default=2.0, gt=0)
+    TRADING_STREAM_HEARTBEAT_SECONDS: float = Field(default=15.0, gt=0)
+    # The stream ends after this long; the browser's EventSource reconnects with its cursor.
+    TRADING_STREAM_MAX_SECONDS: float = Field(default=1800.0, gt=0)
+
     @field_validator("IMAGE_AGENT_COMMAND", mode="before")
     @classmethod
     def _parse_command(cls, v: object) -> object:

@@ -100,6 +100,7 @@ async def models_status(request: Request, db: DbSession, _: Current) -> ModelSta
 @router.post(
     "/chat",
     response_class=ChatStreamingResponse,
+    status_code=200,  # explicit: the streaming class has no status_code default to inspect
     responses={200: {"content": {"text/event-stream": {}}}, 404: {}, 429: {}, 503: {}},
 )
 async def chat(
