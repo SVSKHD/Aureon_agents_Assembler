@@ -54,6 +54,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             settings.OLLAMA_MAX_QUEUE,
             settings.OLLAMA_QUEUE_RETRY_AFTER,
         )
+        # Read-only broker adapters by broker name. Empty until Trading Phase B (Dhan) / C (MT5).
+        app.state.trading_adapters = {}
         registry = AgentRegistry(app.state.sessionmaker)
         app.state.registry = registry
         app.state.agent_paused = {}

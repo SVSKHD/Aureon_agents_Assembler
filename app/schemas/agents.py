@@ -5,6 +5,10 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from app.schemas.common import Page
+
+__all__ = ["Page"]
+
 
 class AgentOut(BaseModel):
     id: str
@@ -48,13 +52,6 @@ class LogOut(BaseModel):
     message: str
     context: dict[str, Any]
     created_at: datetime
-
-
-class Page[T](BaseModel):
-    items: list[T]
-    total: int
-    limit: int
-    offset: int
 
 
 class ScheduledJobOut(BaseModel):

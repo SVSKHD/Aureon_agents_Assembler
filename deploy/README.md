@@ -1,4 +1,4 @@
-# Deploy — Phases 1–5 (Ubuntu 24.04, user svskhd8)
+# Deploy — Phases 1–5 + Trading A (Ubuntu 24.04, user svskhd8)
 
 The API joins the existing Postgres/Ollama network. Redis is added. Only `127.0.0.1:8000`
 is published. Nothing existing is stopped or modified.
@@ -43,7 +43,7 @@ docker network inspect aureon -f '{{(index .IPAM.Config 0).Gateway}}'
 
 ```bash
 docker compose build
-docker compose run --rm migrate        # 0001 version table; 0002 core.*/audit.*; 0003 ai.*; 0004 agents.image_*; 0005 agents registry/scheduler (new tables only)
+docker compose run --rm migrate        # 0001 version table; 0002 core.*/audit.*; 0003 ai.*; 0004 agents.image_*; 0005 agents registry/scheduler; 0006 trading.*/dhan.*/mt5.* (new tables only)
 docker compose up -d                   # api, redis, scheduler, docker-proxy
 docker compose run --rm -it migrate python -m app.auth.bootstrap --email you@example.com
 ```
@@ -94,7 +94,8 @@ confirm `mount-check` fails and `api` does not start, then restore the marker.
 docker compose down            # stops api + redis only; volumes and existing services untouched
 ```
 
-No migration touches existing tables. To undo the agent registry, run `alembic downgrade 0004`,
+No migration touches existing tables. To undo the trading foundation, run
+`alembic downgrade 0005` (drops only trading.*, dhan.*, mt5.*). To undo the agent registry, run `alembic downgrade 0004`,
 which drops only the four Phase 5 tables. To undo imaging, run `alembic downgrade 0003`, which drops
 only `agents.image_jobs` and `agents.generated_assets`. To undo chat, run `alembic downgrade 0002`,
 which drops only `ai.*`. To also undo auth, run `alembic downgrade 0001`, which drops `core.*` and `audit.*`.

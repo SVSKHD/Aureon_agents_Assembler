@@ -1,0 +1,235 @@
+"""Trading API schemas. Decimals serialize as JSON strings ("2890.10"), never floats."""
+
+from __future__ import annotations
+
+import uuid
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.agents.trading.types import Broker, ExecutionMode, Session
+
+NonNegDecimal = Annotated[Decimal, Field(ge=0, max_digits=24, decimal_places=8)]
+# Every broker-facing value says where it came from; the UI shows this label.
+ValueSource = Literal["broker", "simulated", "calculated"]
+
+
+class _FromAttrs(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+
+# --- accounts -----------------------------------------------------------------------------
+
+
+class AccountCreate(BaseModel):
+    broker: Broker
+    account_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$")
+    label: str | None = Field(default=None, max_length=100)
+    base_currency: str = Field(pattern=r"^[A-Z]{3}$")
+    owner_user_id: uuid.UUID | None = None  # default: the admin creating it
+
+
+class AccountOut(_FromAttrs):
+    id: uuid.UUID
+    broker: str
+    account_id: str
+    label: str | None
+    owner_user_id: uuid.UUID
+    mode: ExecutionMode
+    mode_changed_at: datetime | None
+    base_currency: str
+    is_active: bool
+    created_at: datetime
+
+
+class ModeChange(BaseModel):
+    mode: ExecutionMode
+    confirmation_token: str | None = Field(default=None, max_length=128)
+
+
+class LiveToken(BaseModel):
+    token: str
+    expires_in: int
+
+
+class RiskPolicyIn(BaseModel):
+    max_daily_loss: NonNegDecimal
+    max_exposure: NonNegDecimal
+    max_position_size: NonNegDecimal
+    max_drawdown_pct: Annotated[Decimal, Field(ge=0, le=100, decimal_places=3)]
+    allowed_sessions: list[Session] = Field(min_length=1, max_length=3)
+    kill_switch: bool = False
+
+    @field_validator("allowed_sessions")
+    @classmethod
+    def _unique(cls, v: list[Session]) -> list[Session]:
+        if len(set(v)) != len(v):
+            raise ValueError("allowed_sessions must not repeat")
+        return v
+
+
+class RiskPolicyOut(_FromAttrs):
+    id: uuid.UUID
+    broker_account_id: uuid.UUID
+    max_daily_loss: Decimal
+    max_exposure: Decimal
+    max_position_size: Decimal
+    max_drawdown_pct: Decimal
+    allowed_sessions: list[str]
+    kill_switch: bool
+    updated_at: datetime
+
+
+# --- live broker reads (adapter DTOs) -----------------------------------------------------
+
+
+class HealthOut(BaseModel):
+    broker: str
+    supported: bool
+    ok: bool
+    checked_at: datetime | None = None
+    detail: str | None = None
+    credentials_expire_at: datetime | None = None
+
+
+class FundsOut(_FromAttrs):
+    source: ValueSource = "broker"
+    account_id: str
+    currency: str
+    available: Decimal
+    used_margin: Decimal
+    equity: Decimal | None
+    as_of: datetime
+
+
+class PositionOut(_FromAttrs):
+    source: ValueSource = "broker"
+    account_id: str
+    symbol: str
+    broker_instrument_id: str | None
+    quantity: Decimal
+    avg_price: Decimal
+    currency: str
+    last_price: Decimal | None
+    unrealized_pnl: Decimal | None
+    realized_pnl: Decimal | None
+    product: str | None
+
+
+class OrderOut(_FromAttrs):
+    source: ValueSource = "broker"
+    account_id: str
+    order_id: str
+    symbol: str
+    side: str
+    order_type: str
+    quantity: Decimal
+    filled_quantity: Decimal
+    status: str
+    raw_status: str
+    placed_at: datetime
+    price: Decimal | None
+    avg_fill_price: Decimal | None
+    updated_at: datetime | None
+    correlation_id: str | None
+
+
+class QuoteOut(_FromAttrs):
+    source: ValueSource = "broker"
+    symbol: str
+    ts: datetime
+    last: Decimal | None
+    bid: Decimal | None
+    ask: Decimal | None
+    volume: Decimal | None
+
+
+# --- stored data --------------------------------------------------------------------------
+
+
+class InstrumentOut(_FromAttrs):
+    id: int
+    broker: str
+    broker_instrument_id: str
+    symbol: str
+    exchange: str | None
+    segment: str | None
+    instrument_type: str
+    currency: str
+    lot_size: Decimal
+    tick_size: Decimal
+    expiry: date | None
+    strike: Decimal | None
+    option_type: str | None
+    underlying: str | None
+
+
+class CandleOut(_FromAttrs):
+    ts: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
+    oi: Decimal | None
+    session: str
+    source: str
+    is_gap: bool
+
+
+class StrategyVersionOut(_FromAttrs):
+    id: uuid.UUID
+    version: int
+    code_ref: str
+    params: dict[str, object]
+    created_at: datetime
+
+
+class StrategyOut(_FromAttrs):
+    id: uuid.UUID
+    name: str
+    description: str | None
+    is_active: bool
+    created_at: datetime
+    versions: list[StrategyVersionOut] = []
+
+
+class SignalOut(_FromAttrs):
+    id: uuid.UUID
+    strategy_version_id: uuid.UUID
+    instrument_id: int
+    timeframe: str
+    candle_time: datetime
+    session: str
+    side: str
+    strength: Decimal | None
+    inputs: dict[str, object]
+    created_at: datetime
+
+
+class ExecutionOut(_FromAttrs):
+    id: uuid.UUID
+    broker_account_id: uuid.UUID
+    instrument_id: int
+    order_intent_id: uuid.UUID | None
+    broker_trade_id: str | None
+    side: str
+    quantity: Decimal
+    price: Decimal
+    fees: Decimal
+    currency: str
+    executed_at: datetime
+    session: str
+    is_simulated: bool
+    source: ValueSource
+
+
+class TradingAgentStatus(BaseModel):
+    id: str
+    name: str
+    state: str
+    paused: bool
+    last_heartbeat_at: datetime | None
+    details: dict[str, object]
