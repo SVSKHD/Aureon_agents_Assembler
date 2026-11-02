@@ -316,3 +316,18 @@ def test_non_dumpable_parent_hides_environ_from_children(guard: bool, expected: 
         pytest.skip("checkout not readable by the unprivileged user")
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == expected
+
+
+def test_image_prompt_cannot_become_an_option(tmp_path: Path) -> None:
+    from app.agents.imaging.generator import GenerationRequest, SubprocessGenerator
+
+    gen = SubprocessGenerator(
+        ["python", "gen.py", "--prompt", "{prompt}", "--seed", "{seed}", "--out={output}"],
+        tmp_path,
+        {},
+    )
+    req = GenerationRequest("--output=/etc/evil", "-x", 1, 1, 512, 512)
+    argv = gen.argv(req, tmp_path / "o.png")
+    assert argv[3] == " --output=/etc/evil"
+    assert argv[-1] == f"--out={tmp_path / 'o.png'}"
+    assert not any(a.startswith("--output") for a in argv)
