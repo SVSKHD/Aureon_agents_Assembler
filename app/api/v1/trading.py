@@ -13,7 +13,8 @@ import uuid
 from datetime import UTC, date, datetime
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Path, Query, Request, status
+from fastapi import APIRouter, Header, HTTPException, Path, Query, Request, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 
@@ -78,7 +79,7 @@ from app.schemas.trading import (
     TradeOut,
     TradingAgentStatus,
 )
-from app.services import audit, mt5_sync, research
+from app.services import audit, mt5_sync, research, trading_stream
 from app.services.audit import ClientInfo
 from app.services.trading import (
     ModeChangeDenied,
@@ -1023,3 +1024,39 @@ async def ai_analyses(
         stmt = stmt.where(AiAnalysis.backtest_run_id == backtest_run_id)
     rows = (await db.scalars(stmt.order_by(AiAnalysis.created_at.desc()).limit(limit))).all()
     return [AiAnalysisOut.model_validate(r) for r in rows]
+
+
+# --- real-time stream (Phase 6 / Trading Phase E frontend) --------------------------------
+
+
+@router.get(
+    "/stream",
+    response_class=StreamingResponse,
+    status_code=200,
+    responses={200: {"content": {"text/event-stream": {}}}},
+)
+async def stream(
+    request: Request,
+    current: Current,
+    settings: SettingsDep,
+    instrument_id: Annotated[list[int] | None, Query(max_length=50)] = None,
+    last_event_id: Annotated[str | None, Header(max_length=512)] = None,
+) -> StreamingResponse:
+    """Server-Sent Events: new signals, risk decisions, backtest status, agent state and Dhan
+    quotes. Read-only. Resumes after `Last-Event-ID`; see app/services/trading_stream.py."""
+    gen = trading_stream.events(
+        request.app.state.sessionmaker,
+        request.app.state.redis,
+        current,
+        last_event_id=last_event_id,
+        instrument_ids=list(instrument_id or []),
+        poll_seconds=settings.TRADING_STREAM_POLL_SECONDS,
+        heartbeat_seconds=settings.TRADING_STREAM_HEARTBEAT_SECONDS,
+        max_seconds=settings.TRADING_STREAM_MAX_SECONDS,
+        stale_after=settings.AGENT_STALE_SECONDS,
+    )
+    return StreamingResponse(
+        gen,
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
