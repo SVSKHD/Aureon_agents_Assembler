@@ -217,5 +217,69 @@ class Tick(_Checked):
     ask: Decimal | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class Holding(_Checked):
+    """Delivery holdings (demat), as opposed to intraday/F&O positions."""
+
+    account_id: str
+    symbol: str
+    broker_instrument_id: str | None
+    isin: str | None
+    quantity: Decimal
+    available_quantity: Decimal
+    avg_cost: Decimal
+    last_price: Decimal | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class BrokerTrade(_Checked):
+    """One fill from the broker's trade book."""
+
+    account_id: str
+    trade_id: str
+    order_id: str
+    symbol: str
+    broker_instrument_id: str | None
+    side: Side
+    quantity: Decimal
+    price: Decimal
+    executed_at: datetime
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class OptionLeg(_Checked):
+    broker_instrument_id: str | None
+    last_price: Decimal | None
+    oi: Decimal | None
+    volume: Decimal | None
+    implied_volatility: Decimal | None
+    delta: Decimal | None = None
+    gamma: Decimal | None = None
+    theta: Decimal | None = None
+    vega: Decimal | None = None
+    previous_close: Decimal | None = None
+    previous_oi: Decimal | None = None
+    bid: Decimal | None = None
+    ask: Decimal | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OptionStrike(_Checked):
+    strike: Decimal
+    call: OptionLeg | None
+    put: OptionLeg | None
+
+
+@dataclass(frozen=True, slots=True)
+class OptionChain(_Checked):
+    underlying: str
+    expiry: date
+    underlying_price: Decimal | None
+    strikes: list[OptionStrike]
+    as_of: datetime
+
+
 def utc_now() -> datetime:
     return datetime.now(UTC)

@@ -10,17 +10,20 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, HTTPException, Path, Query, Request, status
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 
 from app.agents.registry import effective_state
 from app.agents.trading.base import BrokerAdapter
+from app.agents.trading.mt5.adapter import MT5Adapter
 from app.agents.trading.types import Broker, SignalSide, Timeframe
 from app.auth.deps import AdminRequired, Current, DbSession, SettingsDep
 from app.models.agents import Agent, AgentLog
+from app.models.brokers import Mt5Symbol
 from app.models.trading import (
     BrokerAccount,
     Execution,
@@ -40,9 +43,13 @@ from app.schemas.trading import (
     ExecutionOut,
     FundsOut,
     HealthOut,
+    HoldingOut,
     InstrumentOut,
     LiveToken,
     ModeChange,
+    Mt5InstrumentIn,
+    Mt5StatusOut,
+    OptionChainOut,
     OrderOut,
     PositionOut,
     QuoteOut,
@@ -51,9 +58,10 @@ from app.schemas.trading import (
     SignalOut,
     StrategyOut,
     StrategyVersionOut,
+    TradeOut,
     TradingAgentStatus,
 )
-from app.services import audit
+from app.services import audit, mt5_sync
 from app.services.audit import ClientInfo
 from app.services.trading import (
     ModeChangeDenied,
@@ -335,6 +343,64 @@ async def account_orders(
     return _page([OrderOut.model_validate(o) for o in rows], limit, offset)
 
 
+@router.get("/accounts/{account_id}/holdings", response_model=Page[HoldingOut])
+async def account_holdings(
+    account_id: uuid.UUID,
+    request: Request,
+    db: DbSession,
+    current: Current,
+    settings: SettingsDep,
+    limit: Limit = 100,
+    offset: Offset = 0,
+) -> Page[HoldingOut]:
+    acct = await get_visible_account(db, current, account_id)
+    adapter = adapter_for(_adapters(request), acct.broker, "holdings")
+    rows = await call_adapter(adapter.holdings(acct.account_id), settings)
+    return _page([HoldingOut.model_validate(h) for h in rows], limit, offset)
+
+
+@router.get("/accounts/{account_id}/trades", response_model=Page[TradeOut])
+async def account_trades(
+    account_id: uuid.UUID,
+    request: Request,
+    db: DbSession,
+    current: Current,
+    settings: SettingsDep,
+    limit: Limit = 100,
+    offset: Offset = 0,
+) -> Page[TradeOut]:
+    acct = await get_visible_account(db, current, account_id)
+    adapter = adapter_for(_adapters(request), acct.broker, "trades")
+    rows = await call_adapter(adapter.trades(acct.account_id), settings)
+    return _page([TradeOut.model_validate(t) for t in rows], limit, offset)
+
+
+@router.get("/option-chain/expiries", response_model=list[date])
+async def option_expiries(
+    request: Request,
+    _: Current,
+    settings: SettingsDep,
+    underlying: Annotated[str, Query(max_length=40)],
+    broker: Broker = Broker.DHAN,
+) -> list[date]:
+    adapter = adapter_for(_adapters(request), broker.value, "option_expiries")
+    return await call_adapter(adapter.option_expiries(underlying), settings)
+
+
+@router.get("/option-chain", response_model=OptionChainOut)
+async def option_chain(
+    request: Request,
+    _: Current,
+    settings: SettingsDep,
+    underlying: Annotated[str, Query(max_length=40, description="e.g. IDX_I:13 (NIFTY)")],
+    expiry: date,
+    broker: Broker = Broker.DHAN,
+) -> OptionChainOut:
+    adapter = adapter_for(_adapters(request), broker.value, "option_chain")
+    chain = await call_adapter(adapter.option_chain(underlying, expiry), settings)
+    return OptionChainOut.model_validate(chain)
+
+
 @router.get("/quotes", response_model=list[QuoteOut])
 async def quotes(
     request: Request,
@@ -559,3 +625,128 @@ async def trading_agent_logs(
         limit=limit,
         offset=offset,
     )
+
+
+# --- MT5 bot (Trading Phase C) ------------------------------------------------------------
+
+
+def _mt5(request: Request) -> MT5Adapter:
+    adapter = adapter_for(_adapters(request), Broker.MT5.value, "mt5_status")
+    assert isinstance(adapter, MT5Adapter)
+    return adapter
+
+
+def _jsonable_dict(d: dict[str, object]) -> dict[str, object]:
+    out = mt5_sync._jsonable(d)
+    assert isinstance(out, dict)
+    return out
+
+
+@router.get("/mt5/status", response_model=Mt5StatusOut)
+async def mt5_status(request: Request, _: Current, settings: SettingsDep) -> Mt5StatusOut:
+    """Live read of the bot's export: health, agents, positions, backtests and performance
+    calculated from its journal (labelled `calculated`). Nothing is sent to the bot."""
+    adapter = _mt5(request)
+    status_ = await call_adapter(adapter.status(), settings)
+    ok, why = adapter.assess(status_)
+    agents = {
+        sym: _jsonable_dict(
+            a.model_dump(
+                mode="python",
+                include={
+                    "strategy",
+                    "exec_tf",
+                    "alive",
+                    "snapshot_at",
+                    "market_open",
+                    "connected",
+                    "mt5",
+                    "tick_age",
+                    "positions",
+                    "today",
+                    "offset_h",
+                    "latest_signal",
+                },
+            )
+        )
+        for sym, a in status_.agents.items()
+    }
+    return Mt5StatusOut(
+        ok=ok,
+        detail=why,
+        source="file" if adapter.source.kind == "file" else "http",
+        generated_at=status_.generated_at,
+        age_s=int(status_.age().total_seconds()),
+        bot=_jsonable_dict(status_.bot.model_dump(mode="python")),
+        agents=agents,
+        halt=_jsonable_dict(status_.halt) if status_.halt else None,
+        backtests=[_jsonable_dict(b) for b in status_.backtests],
+        performance=mt5_sync.performance(status_),
+        export_errors=status_.errors,
+    )
+
+
+@router.put("/mt5/instruments/{symbol}", response_model=InstrumentOut)
+async def put_mt5_instrument(
+    symbol: Annotated[str, Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._#-]+$")],
+    body: Mt5InstrumentIn,
+    request: Request,
+    db: DbSession,
+    admin: AdminRequired,
+    settings: SettingsDep,
+) -> InstrumentOut:
+    """Register an MT5 symbol's contract spec so the bot's signals and positions can be
+    linked to it. Admin-only, CSRF-protected, audited."""
+    sym = symbol.upper()
+    ins = insert(Instrument).values(
+        broker=Broker.MT5.value,
+        broker_instrument_id=sym,
+        symbol=sym,
+        instrument_type=body.instrument_type,
+        currency=body.currency,
+        lot_size=body.lot_size,
+        tick_size=body.tick_size,
+    )
+    inst_id = await db.scalar(
+        ins.on_conflict_do_update(
+            constraint="uq_instruments_broker_broker_instrument_id",
+            set_={
+                k: ins.excluded[k] for k in ("instrument_type", "currency", "lot_size", "tick_size")
+            },
+        ).returning(Instrument.id)
+    )
+    if settings.MT5_SERVER:
+        spec = {
+            "digits": body.digits,
+            "point": body.tick_size,
+            "contract_size": body.contract_size,
+            "volume_min": body.volume_min,
+            "volume_step": body.volume_step,
+            "volume_max": body.volume_max,
+            "currency_profit": body.currency,
+            "trading_instrument_id": inst_id,
+            "raw": {"source": "admin"},
+        }
+        s_ins = insert(Mt5Symbol).values(server=settings.MT5_SERVER, symbol=sym, **spec)
+        await db.execute(
+            s_ins.on_conflict_do_update(
+                constraint="pk_symbols", set_={k: s_ins.excluded[k] for k in spec}
+            )
+        )
+    audit.record(
+        db,
+        "trading_mt5_instrument_set",
+        ClientInfo.from_request(request),
+        actor_user_id=admin.user.id,
+        details={
+            "symbol": sym,
+            "lot_size": str(body.lot_size),
+            "tick_size": str(body.tick_size),
+            "currency": body.currency,
+        },
+    )
+    await db.commit()
+    row = await db.get(Instrument, inst_id)
+    assert row is not None
+    await db.refresh(row)
+    return InstrumentOut.model_validate(row)

@@ -169,6 +169,8 @@ async def call_adapter[T](awaitable: Awaitable[T], settings: Settings) -> T:
             return await awaitable
     except NotSupported as exc:
         raise _not_supported(exc) from exc
+    except ValueError as exc:  # e.g. a malformed "SEGMENT:SECURITY_ID" reference
+        raise HTTPException(422, detail={"code": "bad_request", "detail": str(exc)}) from exc
     except TimeoutError as exc:
         raise HTTPException(
             status.HTTP_504_GATEWAY_TIMEOUT, detail={"code": "broker_timeout"}

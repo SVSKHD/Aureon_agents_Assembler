@@ -13,6 +13,8 @@ from redis.asyncio import Redis
 from app.agents.ollama.client import OllamaClient
 from app.agents.ollama.limiter import GenerationLimiter
 from app.agents.registry import OLLAMA, AgentRegistry, Heartbeat
+from app.agents.trading.dhan import build_dhan_adapter
+from app.agents.trading.mt5 import build_mt5_adapter
 from app.api.router import api_router
 from app.core.config import Environment, Settings, get_settings
 from app.core.logging import configure_logging, get_logger
@@ -54,8 +56,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             settings.OLLAMA_MAX_QUEUE,
             settings.OLLAMA_QUEUE_RETRY_AFTER,
         )
-        # Read-only broker adapters by broker name. Empty until Trading Phase B (Dhan) / C (MT5).
+        # Read-only broker adapters by broker name: Dhan (Phase B), the MT5 bot export (Phase C).
         app.state.trading_adapters = {}
+        dhan = build_dhan_adapter(settings, redis, app.state.sessionmaker)
+        if dhan is not None:
+            app.state.trading_adapters["dhan"] = dhan
+        mt5 = build_mt5_adapter(settings)
+        if mt5 is not None:
+            app.state.trading_adapters["mt5"] = mt5
         registry = AgentRegistry(app.state.sessionmaker)
         app.state.registry = registry
         app.state.agent_paused = {}
@@ -82,6 +90,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             log.info("shutdown")
             await heartbeat.stop()
+            if dhan is not None:
+                await dhan.aclose()
+            if mt5 is not None:
+                await mt5.aclose()
             await ollama.aclose()
             await http.aclose()
             await redis.aclose()

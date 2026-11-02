@@ -146,6 +146,61 @@ class QuoteOut(_FromAttrs):
     volume: Decimal | None
 
 
+class HoldingOut(_FromAttrs):
+    source: ValueSource = "broker"
+    account_id: str
+    symbol: str
+    isin: str | None
+    quantity: Decimal
+    available_quantity: Decimal
+    avg_cost: Decimal
+    last_price: Decimal | None
+
+
+class TradeOut(_FromAttrs):
+    source: ValueSource = "broker"
+    account_id: str
+    trade_id: str
+    order_id: str
+    symbol: str
+    broker_instrument_id: str | None
+    side: str
+    quantity: Decimal
+    price: Decimal
+    executed_at: datetime
+
+
+class OptionLegOut(_FromAttrs):
+    broker_instrument_id: str | None
+    last_price: Decimal | None
+    oi: Decimal | None
+    volume: Decimal | None
+    implied_volatility: Decimal | None
+    delta: Decimal | None
+    gamma: Decimal | None
+    theta: Decimal | None
+    vega: Decimal | None
+    previous_close: Decimal | None
+    previous_oi: Decimal | None
+    bid: Decimal | None
+    ask: Decimal | None
+
+
+class OptionStrikeOut(_FromAttrs):
+    strike: Decimal
+    call: OptionLegOut | None
+    put: OptionLegOut | None
+
+
+class OptionChainOut(_FromAttrs):
+    source: ValueSource = "broker"
+    underlying: str
+    expiry: date
+    underlying_price: Decimal | None
+    as_of: datetime
+    strikes: list[OptionStrikeOut]
+
+
 # --- stored data --------------------------------------------------------------------------
 
 
@@ -233,3 +288,39 @@ class TradingAgentStatus(BaseModel):
     paused: bool
     last_heartbeat_at: datetime | None
     details: dict[str, object]
+
+
+# --- MT5 bot (Trading Phase C) ------------------------------------------------------------
+
+PosDecimal = Annotated[Decimal, Field(gt=0, max_digits=24, decimal_places=8)]
+
+
+class Mt5InstrumentIn(BaseModel):
+    """Contract spec typed in by an admin from MT5's symbol Specification window.
+    The bot's export does not carry it, so Aureon never guesses it."""
+
+    lot_size: PosDecimal  # minimum volume step the strategy trades in (e.g. 0.01)
+    tick_size: PosDecimal  # MT5 "point" / tick size (e.g. 0.01 for XAUUSD)
+    currency: str = Field(pattern=r"^[A-Z]{3}$")  # profit currency
+    instrument_type: str = Field(default="CFD", min_length=1, max_length=32)
+    digits: int | None = Field(default=None, ge=0, le=10)
+    contract_size: PosDecimal | None = None
+    volume_min: PosDecimal | None = None
+    volume_step: PosDecimal | None = None
+    volume_max: PosDecimal | None = None
+
+
+class Mt5StatusOut(BaseModel):
+    """The bot as Aureon sees it right now (live read of its export)."""
+
+    ok: bool
+    detail: str | None
+    source: Literal["file", "http"]
+    generated_at: datetime
+    age_s: int
+    bot: dict[str, object]
+    agents: dict[str, dict[str, object]]
+    halt: dict[str, object] | None
+    backtests: list[dict[str, object]]
+    performance: dict[str, object]
+    export_errors: dict[str, str]

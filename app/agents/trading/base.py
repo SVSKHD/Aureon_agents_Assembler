@@ -16,16 +16,19 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Sequence
-from datetime import datetime
+from datetime import date, datetime
 from typing import ClassVar
 
 from app.agents.trading.types import (
     AccountInfo,
     AdapterHealth,
     BrokerOrder,
+    BrokerTrade,
     Candle,
     Funds,
+    Holding,
     InstrumentInfo,
+    OptionChain,
     Position,
     Quote,
     Tick,
@@ -79,6 +82,22 @@ class BrokerAdapter(ABC):
     async def orders(self, account_id: str) -> list[BrokerOrder]:
         """Today's / open orders as the broker reports them."""
         raise self._unsupported("orders")
+
+    async def holdings(self, account_id: str) -> list[Holding]:
+        """Delivery (demat) holdings."""
+        raise self._unsupported("holdings")
+
+    async def trades(self, account_id: str) -> list[BrokerTrade]:
+        """Today's trade book (fills)."""
+        raise self._unsupported("trades")
+
+    async def option_expiries(self, underlying: str) -> list[date]:
+        """Listed expiries for an option underlying."""
+        raise self._unsupported("option_expiries")
+
+    async def option_chain(self, underlying: str, expiry: date) -> OptionChain:
+        """Full option chain (OI, IV, greeks when the broker provides them)."""
+        raise self._unsupported("option_chain")
 
     async def instruments(self) -> list[InstrumentInfo]:
         """Full tradable instrument master."""

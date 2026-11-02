@@ -1,0 +1,66 @@
+{
+  "schema": "aureon.mt5.status/v1",
+  "generated_at": "2026-11-02T10:00:15+00:00",
+  "generated_ts": 1793613615,
+  "bot": {"version": "3.0.0", "mode": "ema5080", "symbols": ["XAUUSD", "XAGUSD"], "exec_tf": "M5",
+          "dry": false, "server_utc_offset": 3.0, "uptime_s": 5400, "pid": 4242},
+  "agents": {
+    "XAUUSD": {
+      "symbol": "XAUUSD", "strategy": "ema5080", "exec_tf": "M5", "alive": true,
+      "snapshot_at": "2026-11-02T10:00:10+00:00", "market_open": true, "connected": true,
+      "mt5": "CONNECTED", "tick_age": 1.4,
+      "positions": [
+        {"ticket": 101, "symbol": "XAUUSD", "direction": "long", "price_open": 2650.55, "time": 1793620800,
+         "sl": 2640.0, "tp": 0.0, "volume": 0.10, "current": 2655.25, "comment": "", "magic": 0, "points": 4.7}
+      ],
+      "today": {"signals": 2, "secured": 0.0, "errors": 0, "closed": 1},
+      "health": {"status": "ok", "last_bar": 1793620500, "offset_h": 2.0, "errors": 0,
+                 "last_signal": "LONG cross @ 15:25"},
+      "offset_h": 2.0,
+      "latest_signal": {"bar_time": 1793620500, "symbol": "XAUUSD", "strategy": "ema5080", "kind": "cross",
+                        "direction": "LONG", "consumed": false}
+    },
+    "XAGUSD": {
+      "symbol": "XAGUSD", "strategy": "ema5080", "exec_tf": "M5", "alive": true,
+      "snapshot_at": "2026-11-02T10:00:11+00:00", "market_open": true, "connected": true,
+      "mt5": "CONNECTED", "tick_age": 3.0,
+      "positions": [
+        {"ticket": 202, "symbol": "XAGUSD", "direction": "short", "price_open": 31.405, "time": 1793619900,
+         "sl": 31.6, "tp": 0.0, "volume": 0.5, "current": 31.38, "comment": "", "magic": 0, "points": 0.025}
+      ],
+      "today": {"signals": 0, "secured": 0.0, "errors": 0, "closed": 0},
+      "health": {"status": "ok", "last_bar": 1793620500, "offset_h": 2.0},
+      "offset_h": 2.0,
+      "latest_signal": null
+    }
+  },
+  "halt": null,
+  "console": {"version": "3.0.0", "t": "2026-11-02T15:30:15+05:30", "session": {"in_session": true},
+              "regime": {"XAUUSD": {"state": "TREND", "score": 0.71}}, "timeframe": {"exec": "M5"},
+              "network": {"degraded": false}, "health": {"discord_ok": true}},
+  "ema921e": null,
+  "events": [
+    {"t": 1793610000, "event": "process_start", "version": "3.0.0"},
+    {"t": 1793612000, "event": "signal", "symbol": "XAUUSD", "mode": "ema5080", "side": "LONG",
+     "signal_kind": "cross", "price": 2650.10, "bar": 1793620500, "chop": false, "chop_crosses": 1, "spread_pts": 18},
+    {"t": 1793612001, "event": "signal", "symbol": "EURUSD", "mode": "ema5080", "side": "SHORT",
+     "signal_kind": "cross", "price": 1.0855, "bar": 1793620500},
+    {"t": 1793612100, "event": "position_seen", "symbol": "XAUUSD", "mode": "ema5080", "ticket": 101,
+     "side": "LONG", "entry": 2650.55, "open_time": 1793620800},
+    {"t": 1793612500, "event": "exit", "symbol": "XAUUSD", "mode": "ema5080", "ticket": 99, "points": 12.5,
+     "reason": "TP", "auto": true},
+    {"t": 1793612600, "event": "exit", "symbol": "XAUUSD", "mode": "ema5080", "ticket": 98, "points": -4.0,
+     "reason": "SL", "auto": true},
+    {"t": 1793612700, "event": "error", "symbol": "XAGUSD", "where": "poll", "error": "tick timeout"}
+  ],
+  "ema921e_trades": [
+    {"symbol": "XAUUSD", "time": "1793500000", "dir": "LONG", "entry": "2600.5", "pnl_usd": "12.30"},
+    {"symbol": "XAUUSD", "time": "1793510000", "dir": "SHORT", "entry": "2610.0", "pnl_usd": "-3.10"}
+  ],
+  "backtests": [
+    {"file": "XAUUSD_jan_ema5080.json", "mode": "ema5080", "symbol": "XAUUSD",
+     "summary": {"trades": 10, "wins": 6, "win_rate": 0.6, "net": 55.5, "avg": 5.55},
+     "modified_at": "2026-10-30T12:00:00+00:00"}
+  ],
+  "errors": {}
+}
