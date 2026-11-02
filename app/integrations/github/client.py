@@ -12,7 +12,13 @@
   locally with `GitHubRateLimited(code="github_rate_limit_floor")`.
 - Timeouts are set; redirects are followed by hand and only to the API host itself, so the
   token is never sent anywhere else.
-- Successful GETs are cached in memory for `cache_ttl` seconds (0 disables the cache).
+- Successful GETs are cached in memory for `cache_ttl` seconds (0 disables the cache). Any
+  write clears the cache, so a read after a write sees the change.
+- Writes (docs/19-github-issues-prs.md): a POST is never retried after a 5xx or a network
+  error, because GitHub may already have acted on it (a second issue, a second comment).
+  PUT/PATCH/DELETE set state and are retried like GETs.
+- `request(..., accept=..., raw=True)` returns the body as bytes (e.g. a unified diff),
+  read at most `max_bytes` (+1, so the caller can tell it was cut).
 """
 
 from __future__ import annotations
@@ -38,6 +44,9 @@ API_VERSION = "2022-11-28"
 USER_AGENT = "aureon-agentic-github/1"
 MAX_REDIRECTS = 3
 CACHE_MAX_ENTRIES = 256
+WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+# Methods that may be re-sent after a 5xx / network failure.
+RETRYABLE_METHODS = frozenset({"GET", "HEAD", "PUT", "PATCH", "DELETE"})
 
 
 def fingerprint(token: str) -> str:
@@ -241,12 +250,28 @@ class GitHubClient:
         return parts.scheme in ("https", "http") and parts.netloc.lower() == self._host
 
     async def _send(
-        self, method: str, url: str, params: dict[str, Any] | None, json: Any
+        self,
+        method: str,
+        url: str,
+        params: dict[str, Any] | None,
+        json: Any,
+        accept: str | None = None,
+        max_bytes: int | None = None,
     ) -> httpx.Response:
-        """One logical request: same-host redirects only, Authorization added here."""
+        """One logical request: same-host redirects only, Authorization added here.
+
+        With `max_bytes`, a successful body is streamed and cut after max_bytes + 1 bytes.
+        """
         headers = {"Authorization": f"Bearer {self._token}"}
+        if accept:
+            headers["Accept"] = accept
         for _ in range(MAX_REDIRECTS + 1):
-            resp = await self._http.request(method, url, params=params, json=json, headers=headers)
+            if max_bytes is None:
+                resp = await self._http.request(
+                    method, url, params=params, json=json, headers=headers
+                )
+            else:
+                resp = await self._send_capped(method, url, params, json, headers, max_bytes)
             if resp.status_code not in (301, 302, 303, 307, 308):
                 return resp
             target = urljoin(str(resp.url), resp.headers.get("location", ""))
@@ -258,6 +283,32 @@ class GitHubClient:
             if resp.status_code == 303:
                 method, json = "GET", None
         raise GitHubError("too many redirects from GitHub", code="github_redirect")
+
+    async def _send_capped(
+        self,
+        method: str,
+        url: str,
+        params: dict[str, Any] | None,
+        json: Any,
+        headers: dict[str, str],
+        max_bytes: int,
+    ) -> httpx.Response:
+        req = self._http.build_request(method, url, params=params, json=json, headers=headers)
+        resp = await self._http.send(req, stream=True)
+        try:
+            if resp.status_code >= 300:
+                await resp.aread()  # error bodies are small; parsed by _error_for
+                return resp
+            buf = bytearray()
+            async for chunk in resp.aiter_bytes():
+                buf.extend(chunk)
+                if len(buf) > max_bytes:
+                    break
+        finally:
+            await resp.aclose()
+        return httpx.Response(
+            resp.status_code, headers=resp.headers, content=bytes(buf[: max_bytes + 1]), request=req
+        )
 
     def _rate_limit_wait(self, resp: httpx.Response) -> int | None:
         """Seconds to wait if `resp` is a 429 or a (secondary) rate-limit 403, else None."""
@@ -296,6 +347,8 @@ class GitHubClient:
             )
         if s in (409, 422):
             return GitHubError(text, status=s, code="github_conflict", upstream_status=s)
+        if s == 405:  # e.g. "Pull Request is not mergeable"
+            return GitHubError(text, status=409, code="github_conflict", upstream_status=s)
         if s >= 500:
             return GitHubUnavailable(f"GitHub returned {s}: {text}", upstream_status=s)
         return GitHubError(f"GitHub returned {s}: {text}", upstream_status=s)
@@ -307,17 +360,27 @@ class GitHubClient:
         *,
         params: dict[str, Any] | None = None,
         json: Any = None,
+        accept: str | None = None,
+        raw: bool = False,
+        max_bytes: int | None = None,
     ) -> GitHubResponse:
-        """Send with retry/backoff/rate-limit handling. Raises a GitHubError on failure."""
+        """Send with retry/backoff/rate-limit handling. Raises a GitHubError on failure.
+
+        `raw=True` returns the body as bytes in `data` instead of decoding JSON.
+        """
+        method = method.upper()
+        retryable = method in RETRYABLE_METHODS
+        if method in WRITE_METHODS:
+            self.clear_cache()
         attempt = 0
         while True:
             attempt += 1
             self._check_floor()
             try:
-                resp = await self._send(method, path, params, json)
+                resp = await self._send(method, path, params, json, accept, max_bytes)
             except httpx.TransportError as exc:
                 detail = self.redact(f"{type(exc).__name__}: {exc}")
-                if attempt >= self.max_attempts:
+                if attempt >= self.max_attempts or not retryable:
                     log.warning("github_request_failed", path=self.redact(path), error=detail)
                     raise GitHubUnavailable(f"GitHub unreachable: {detail}") from None
                 await self._backoff(attempt, path, detail)
@@ -329,7 +392,9 @@ class GitHubClient:
 
             if resp.status_code < 300 or resp.status_code == 304:
                 data: Any = None
-                if resp.content:
+                if raw:
+                    data = resp.content
+                elif resp.content:
                     try:
                         data = resp.json()
                     except ValueError:
@@ -348,7 +413,7 @@ class GitHubClient:
                 continue
 
             err = self._error_for(resp)
-            if resp.status_code >= 500 and attempt < self.max_attempts:
+            if resp.status_code >= 500 and attempt < self.max_attempts and retryable:
                 await self._backoff(attempt, path, err.message)
                 continue
             log.warning(

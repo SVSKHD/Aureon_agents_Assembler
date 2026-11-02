@@ -286,6 +286,18 @@ class Settings(BaseSettings):
     GITHUB_SYNC_CRON: str = "*/20 * * * *"
     # The `github` agent is reported stale when no sync heartbeat arrived within this long.
     GITHUB_AGENT_STALE_SECONDS: float = Field(default=3600.0, gt=0)
+    # GET .../pulls/{n}/diff returns at most this many bytes, with `truncated: true` beyond it
+    # (docs/19-github-issues-prs.md).
+    GITHUB_DIFF_MAX_BYTES: int = Field(default=2 * 1024 * 1024, ge=1024, le=50 * 1024 * 1024)
+
+    # --- Approval gate (docs/19-github-issues-prs.md; grown by the Phase 20 engine). ---
+    # A pending approval request expires this many minutes after it was created.
+    APPROVALS_TTL_MINUTES: int = Field(default=30, ge=1, le=24 * 60)
+    # The requester may approve their own request only when this is true AND they are the only
+    # active admin (single-owner deployments). False: someone else must always approve.
+    APPROVALS_ALLOW_SELF_APPROVAL: bool = True
+    # After this many wrong re-auth passwords on one request it is denied automatically.
+    APPROVALS_MAX_REAUTH_FAILURES: int = Field(default=5, ge=1, le=50)
 
     @property
     def github_configured(self) -> bool:
