@@ -4,7 +4,7 @@ Self-hosted backend for Spasta: a FastAPI modular monolith on PostgreSQL 17, Red
 Ollama. It is offline-first, has no external AI APIs and does no live trading.
 
 **Status: Phases 1, 2 (auth), 3, 4, 5 (registry, scheduler, monitoring) and Trading Phases A, B
-(Dhan, read-only) and C (MT5 bot, read-only) are done; finance is blocked on the live schema, the image pipeline hookup is pending the
+(Dhan, read-only), C (MT5 bot, read-only) and D (research agents) are done; finance is blocked on the live schema, the image pipeline hookup is pending the
 /opt/image-agent inspection, and the Phase 5 coding agent comes in its own PR.** Phase 1 provides
 health, config, logging, async DB and Alembic. Phase 2 adds cookie-session auth with CSRF,
 rate limiting and an audit log ([docs/02-auth-and-finance.md](docs/02-auth-and-finance.md)).
@@ -15,6 +15,7 @@ Trading Phase A adds the read-only, broker-agnostic trading core: schemas, Broke
 execution modes (LIVE unreachable) and risk types ([docs/10-trading-foundation.md](docs/10-trading-foundation.md)).
 Trading Phase B adds the read-only DhanHQ v2 adapter, live-feed worker and sync jobs ([docs/11-dhan.md](docs/11-dhan.md)).
 Trading Phase C watches the separate Aureon MT5 bot through its read-only status export ([docs/12-mt5-adapter.md](docs/12-mt5-adapter.md)).
+Trading Phase D adds the research agents: market data, indicators, signals, risk decisions, backtests and Ollama explanations ([docs/13-research-agents.md](docs/13-research-agents.md)).
 
 ## Layout
 
@@ -36,6 +37,8 @@ app/
   agents/trading/dhan/ DhanHQ v2 client, parsers, adapter, binary feed parser
   workers/dhan_feed.py Dhan live feed → Redis (own process)
   agents/trading/mt5/ MT5 bot status export reader + MT5Adapter (no MT5 calls)
+  agents/research/   indicators, strategies, backtest engine, AI explainer (pandas/numpy)
+  workers/research.py research agents (own process, bounded queues)
   agents/coding/     (later phase)
 alembic/             async migrations (version table: public.aureon_alembic_version)
 tests/  scripts/  deploy/  docs/
@@ -72,6 +75,10 @@ tests/  scripts/  deploy/  docs/
 | GET | `/api/trading/accounts/{id}/holdings`, `/trades`, `/api/trading/option-chain[/expiries]` | Holdings, trade book, option chain (Dhan). |
 | GET | `/api/trading/mt5/status` | MT5 bot: health, agents, positions, backtests, calculated performance. |
 | PUT | `/api/trading/mt5/instruments/{symbol}` | Admin: register an MT5 symbol's contract spec (audited). |
+| POST | `/api/trading/strategies` | Admin: new strategy / next immutable version (audited). |
+| POST / GET | `/api/trading/strategies/backtest`, `/api/trading/backtests[/{id}]` | Queue backtests (param grid); results + trades. |
+| GET | `/api/trading/indicators`, `/api/trading/risk-decisions`, `/api/trading/ai-analyses` | Stored analysis output. |
+| POST | `/api/trading/signals/{id}/explain`, `/api/trading/backtests/{id}/explain` | Queue an Ollama explanation (explanation only). |
 | GET | `/api/docs` | Swagger UI (disabled when `ENV=prod`). |
 
 ## Configuration
@@ -133,6 +140,8 @@ Every variable is listed in [.env.example](.env.example).
 | `MT5_STATUS_FILE` / `MT5_STATUS_URL` / `MT5_STATUS_TOKEN` | unset | MT5 bot export (file wins); unset = no MT5 adapter or job. |
 | `MT5_ACCOUNT_ID` / `MT5_SERVER` / `MT5_ACCOUNT_CURRENCY` | unset / unset / `USD` | The bot's MT5 login, server, deposit currency. |
 | `MT5_STALE_SECONDS` / `MT5_SYNC_CRON` / `MT5_HTTP_TIMEOUT` | `90` / `* * * * *` / `5` | Bot stale window, sync job, HTTP timeout. |
+| `RESEARCH_*` / `RISK_*` / `BACKTEST_*` | see .env.example | Research worker cadence, queues, indicators; risk assumptions; backtest limits. |
+| `RESEARCH_AI_MODEL` | unset | Local Ollama model for explanations; unset = explanations off. |
 | `PRIVATE_AI_NETWORK` | required (compose) | Existing Docker network shared with Postgres/Ollama. |
 
 ## Development

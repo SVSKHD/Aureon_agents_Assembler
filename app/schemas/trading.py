@@ -324,3 +324,113 @@ class Mt5StatusOut(BaseModel):
     backtests: list[dict[str, object]]
     performance: dict[str, object]
     export_errors: dict[str, str]
+
+
+# --- research agents (Trading Phase D) ----------------------------------------------------
+
+
+class StrategyCreate(BaseModel):
+    """A new strategy (version 1) or, for an existing name, its next version."""
+
+    name: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9._: -]+$")
+    description: str | None = Field(default=None, max_length=2000)
+    code_ref: str = Field(min_length=1, max_length=100)
+    params: dict[str, object] = Field(default_factory=dict)
+
+
+class BacktestCosts(BaseModel):
+    spread_bps: NonNegDecimal = Decimal(0)
+    slippage_bps: NonNegDecimal = Decimal(0)
+    fee_bps: NonNegDecimal = Decimal(0)
+
+
+class BacktestRequest(BaseModel):
+    strategy_version_id: uuid.UUID
+    instrument_id: int
+    timeframe: Literal["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+    start: datetime
+    end: datetime
+    # Overrides on top of the version's params; `grid` expands to one run per combination.
+    params: dict[str, object] = Field(default_factory=dict)
+    grid: dict[str, list[object]] = Field(default_factory=dict)
+    costs: BacktestCosts = Field(default_factory=BacktestCosts)
+    quantity: PosDecimal | None = None
+
+    @field_validator("end")
+    @classmethod
+    def _tz(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            raise ValueError("timestamps must include a timezone")
+        return v
+
+
+class BacktestQueued(BaseModel):
+    run_ids: list[uuid.UUID]
+
+
+class BacktestRunOut(_FromAttrs):
+    id: uuid.UUID
+    strategy_version_id: uuid.UUID
+    instrument_id: int
+    timeframe: str
+    period_start: datetime
+    period_end: datetime
+    params: dict[str, object]
+    costs: dict[str, object]
+    status: str
+    metrics: dict[str, object]
+    error: str | None
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+
+
+class BacktestTradeOut(_FromAttrs):
+    side: str
+    quantity: Decimal
+    entry_time: datetime
+    entry_price: Decimal
+    exit_time: datetime | None
+    exit_price: Decimal | None
+    pnl: Decimal | None
+    fees: Decimal
+    session: str
+
+
+class BacktestDetail(BaseModel):
+    run: BacktestRunOut
+    trades: list[BacktestTradeOut]
+    trades_total: int
+    source: ValueSource = "simulated"
+
+
+class IndicatorOut(_FromAttrs):
+    name: str
+    ts: datetime
+    values: dict[str, object]
+
+
+class RiskDecisionOut(_FromAttrs):
+    id: int
+    broker_account_id: uuid.UUID
+    signal_id: uuid.UUID | None
+    approved: bool
+    reason: str
+    checks: list[dict[str, object]]
+    inputs: dict[str, object]
+    created_at: datetime
+
+
+class AiAnalysisOut(_FromAttrs):
+    id: uuid.UUID
+    signal_id: uuid.UUID | None
+    backtest_run_id: uuid.UUID | None
+    model: str
+    summary: str
+    content: str
+    created_at: datetime
+
+
+class ExplainQueued(BaseModel):
+    queued: bool = True
+    position: int
