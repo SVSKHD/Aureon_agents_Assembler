@@ -1,0 +1,18 @@
+[Unit]
+Description=Aureon: write host service states for /api/system/status
+After=local-fs.target
+RequiresMountsFor=/mnt/spasta-data
+
+[Service]
+Type=oneshot
+User=svskhd8
+Environment=AUREON_HOST_UNITS=cloudflared docker
+Environment=AUREON_HOST_STATUS_FILE=/mnt/spasta-data/status/host-services.json
+ExecStart=/opt/private-ai/aureon/deploy/host-status/aureon-host-status.sh
+# Read-only helper: no privileges, no network, no writes outside the status dir.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/mnt/spasta-data/status
+ProtectHome=yes
+PrivateNetwork=yes
+PrivateTmp=yes

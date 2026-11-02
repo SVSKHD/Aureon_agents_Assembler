@@ -3,12 +3,14 @@
 Self-hosted backend for Spasta: a FastAPI modular monolith on PostgreSQL 17, Redis and a local
 Ollama. It is offline-first, has no external AI APIs and does no live trading.
 
-**Status: Phases 1, 2 (auth), 3 and 4 are done; finance is blocked on the live schema, and the
-image pipeline hookup is pending the /opt/image-agent inspection.** Phase 1 provides
+**Status: Phases 1, 2 (auth), 3, 4 and 5 (registry, scheduler, monitoring) are done; finance is
+blocked on the live schema, the image pipeline hookup is pending the /opt/image-agent
+inspection, and the Phase 5 coding agent comes in its own PR.** Phase 1 provides
 health, config, logging, async DB and Alembic. Phase 2 adds cookie-session auth with CSRF,
 rate limiting and an audit log ([docs/02-auth-and-finance.md](docs/02-auth-and-finance.md)).
 Phase 3 adds local-Ollama chat over SSE with stored conversations ([docs/03-ollama.md](docs/03-ollama.md)).
 Phase 4 adds queued Stable Diffusion jobs run by a separate worker ([docs/04-imaging.md](docs/04-imaging.md)).
+Phase 5 adds the agent registry, a cron scheduler and system status ([docs/05-agents.md](docs/05-agents.md)).
 
 ## Layout
 
@@ -16,7 +18,7 @@ Phase 4 adds queued Stable Diffusion jobs run by a separate worker ([docs/04-ima
 app/
   main.py            app factory + lifespan
   core/              settings, JSON logging, request-ID middleware
-  api/v1/            routers (health, auth, models/chat/conversations, images)
+  api/v1/            routers (health, auth, models/chat/conversations, images, agents/system)
   auth/              password hashing, sessions, CSRF, rate limit, admin bootstrap
   db/                async engine/session, declarative base
   agents/ollama/     Ollama HTTP client + generation limiter
@@ -24,6 +26,8 @@ app/
   models/ schemas/   SQLAlchemy models (core, audit, ai) and Pydantic schemas
   agents/imaging/    image generators (subprocess wrapper, stub)
   workers/imaging.py image worker process (one job at a time)
+  agents/registry.py agent registration, heartbeats, runs, logs
+  workers/scheduler.py cron scheduler (code-registered tasks, retries + backoff)
   agents/{coding,trading}/   (later phases)
 alembic/             async migrations (version table: public.aureon_alembic_version)
 tests/  scripts/  deploy/  docs/
@@ -49,6 +53,11 @@ tests/  scripts/  deploy/  docs/
 | POST | `/api/images/jobs/{id}/cancel` | Cancel a queued or running job. |
 | GET | `/api/images` | Your image gallery, paginated. |
 | GET / DELETE | `/api/images/{id}/file`, `/api/images/{id}` | Download / delete an image. |
+| GET | `/api/agents`, `/api/agents/{id}`, `/api/agents/{id}/runs` | Agent registry, state, runs. |
+| GET | `/api/agents/{id}/logs` | Agent logs (admin). |
+| POST | `/api/agents/{id}/pause`, `/resume` | Pause / resume an agent (admin, audited). |
+| GET / POST | `/api/scheduler/jobs`, `…/{id}/pause\|resume\|run` | Scheduled jobs (admin, audited). |
+| GET | `/api/system/status` | Host, data stores, agents, containers, host services (admin). |
 | GET | `/api/docs` | Swagger UI (disabled when `ENV=prod`). |
 
 ## Configuration
@@ -92,6 +101,11 @@ Every variable is listed in [.env.example](.env.example).
 | `IMAGE_JOB_TIMEOUT_SECONDS` | `1800` | Per-job limit. |
 | `IMAGE_MAX_ATTEMPTS` | `2` | Times a job may start before an interruption marks it failed. |
 | `IMAGE_POLL_SECONDS` | `2` | Cancel / progress check interval. |
+| `AGENT_HEARTBEAT_SECONDS` / `AGENT_STALE_SECONDS` | `15` / `60` | Heartbeat interval; stale threshold. |
+| `AGENT_LOG_RETENTION_DAYS` / `AGENT_RUN_RETENTION_DAYS` | `30` / `90` | Purged by the scheduler. |
+| `SCHEDULER_TICK_SECONDS` / `SCHEDULER_TIMEZONE` | `5` / `Asia/Kolkata` | Poll interval; cron time zone. |
+| `DOCKER_API_URL` | `http://aureon-docker-proxy:2375` | Read-only Docker socket proxy (empty = off). |
+| `HOST_STATUS_FILE` / `HOST_STATUS_MAX_AGE_SECONDS` | `…/status/host-services.json` / `120` | Host unit states from deploy/host-status. |
 | `PRIVATE_AI_NETWORK` | required (compose) | Existing Docker network shared with Postgres/Ollama. |
 
 ## Development
