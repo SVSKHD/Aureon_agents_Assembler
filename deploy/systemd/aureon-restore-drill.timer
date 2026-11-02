@@ -1,0 +1,9 @@
+[Unit]
+Description=Aureon: weekly restore drill (Sunday 04:23 IST)
+
+[Timer]
+OnCalendar=Sun *-*-* 04:23:00 Asia/Kolkata
+Persistent=true
+
+[Install]
+WantedBy=timers.target

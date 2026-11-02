@@ -1,0 +1,36 @@
+# Aureon stack at boot: `docker compose up -d` once Docker is up AND the 2 TB HDD is
+# mounted. Install: docs/manual-setup.md, "Sudo steps for the owner" (needs sudo).
+#
+# Order inside compose (compose.yaml): mount-check -> redis (healthy) -> migrate (waits for
+# the existing Postgres, alembic upgrade head) -> api (healthy) -> scheduler + workers.
+# Opt-in workers: set COMPOSE_PROFILES below (e.g. dhan,research) in a drop-in
+#   sudo systemctl edit aureon.service   ->   [Service] Environment=COMPOSE_PROFILES=dhan,research
+[Unit]
+Description=Aureon API stack (docker compose)
+Documentation=file:///opt/private-ai/aureon/docs/16-production-hardening.md
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+# Never start on an empty mountpoint: systemd waits for (and requires) the HDD mount.
+RequiresMountsFor=/mnt/spasta-data
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=svskhd8
+Group=docker
+WorkingDirectory=/opt/private-ai/aureon
+Environment=COMPOSE_PROFILES=
+# Belt and braces: the marker proves the HDD (not the empty mountpoint) is there.
+ExecStartPre=/usr/bin/test -f /mnt/spasta-data/.spasta-data-mounted
+ExecStart=/usr/bin/docker compose up -d
+# Waits up to 5 min for everything to be healthy and logs the result to the journal. Report
+# only ("-"): a failing check does not fail the unit (compose keeps retrying via restarts).
+ExecStartPost=-/opt/private-ai/aureon/scripts/ops/healthcheck.sh --wait 300
+# `stop`, not `down`: containers, networks and data stay; the next start is fast.
+ExecStop=/usr/bin/docker compose stop --timeout 30
+TimeoutStartSec=600
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target
