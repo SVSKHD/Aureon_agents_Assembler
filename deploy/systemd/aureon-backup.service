@@ -1,0 +1,24 @@
+# Nightly backup (scripts/ops/backup.sh): pg_dump of the app's schemas + public finance
+# tables via `docker compose exec -T`, a tar of DATA_ROOT/images (+ finance-attachments),
+# MANIFEST.json + SHA256SUMS, retention BACKUP_RETENTION_DAYS. Started by aureon-backup.timer.
+[Unit]
+Description=Aureon: nightly backup to the HDD
+Requires=docker.service
+After=docker.service aureon.service
+RequiresMountsFor=/mnt/spasta-data
+
+[Service]
+Type=oneshot
+User=svskhd8
+Group=docker
+WorkingDirectory=/opt/private-ai/aureon
+# Optional overrides (PG_SERVICE, PG_CONTAINER, BACKUP_DIR, BACKUP_RETENTION_DAYS ...):
+EnvironmentFile=-/opt/private-ai/aureon/scripts/ops/ops.env
+ExecStart=/opt/private-ai/aureon/scripts/ops/backup.sh
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/mnt/spasta-data/backups /run/docker.sock
+PrivateTmp=yes

@@ -1,0 +1,23 @@
+# Weekly restore drill (scripts/ops/restore-drill.sh): restores the latest backup into a
+# scratch DB spasta_drill_<ts>, runs `alembic current` + row-count checks, writes a report to
+# BACKUP_DIR/drills/ and drops only that scratch DB. A failure shows as a failed unit.
+[Unit]
+Description=Aureon: weekly restore drill of the latest backup
+Requires=docker.service
+After=docker.service aureon.service aureon-backup.service
+RequiresMountsFor=/mnt/spasta-data
+
+[Service]
+Type=oneshot
+User=svskhd8
+Group=docker
+WorkingDirectory=/opt/private-ai/aureon
+EnvironmentFile=-/opt/private-ai/aureon/scripts/ops/ops.env
+ExecStart=/opt/private-ai/aureon/scripts/ops/restore-drill.sh latest
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/mnt/spasta-data/backups /run/docker.sock
+PrivateTmp=yes

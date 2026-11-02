@@ -125,3 +125,26 @@ async def test_empty_feed_list_is_a_noop_and_not_scheduled(data_root: Path) -> N
     assert out["items"] == 0 and "skipped" in out
     on = _settings(data_root, NEWS_FEED_URLS='["https://feeds.test/rss"]')
     assert ("news-pull", "news_pull", "*/30 * * * *") in default_jobs(on)
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "target",
+    [
+        "http://127.0.0.1:6379/",
+        "http://10.0.0.5/feed",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://[::1]/x",
+        "http://localhost:11434/api/tags",
+        "http://aureon-redis:6379/",
+        "http://aureon-docker-proxy:2375/containers/json",
+        "http://db.internal/x",
+    ],
+)
+async def test_fetch_refuses_redirects_to_internal_hosts(target: str) -> None:
+    respx.get("https://feeds.test/r").mock(
+        return_value=httpx.Response(302, headers={"location": target})
+    )
+    async with httpx.AsyncClient() as c:
+        with pytest.raises(news.FeedError, match="non-public"):
+            await news.fetch(c, "https://feeds.test/r", 10_000)

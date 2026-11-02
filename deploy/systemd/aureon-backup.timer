@@ -1,0 +1,11 @@
+[Unit]
+Description=Aureon: nightly backup at 02:17 IST
+
+[Timer]
+OnCalendar=*-*-* 02:17:00 Asia/Kolkata
+RandomizedDelaySec=10m
+# Catch up after the box was off at 02:17.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

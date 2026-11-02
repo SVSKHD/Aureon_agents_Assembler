@@ -50,3 +50,43 @@ class RequestIdMiddleware:
                 duration_ms=round((time.perf_counter() - start) * 1000, 2),
             )
             structlog.contextvars.unbind_contextvars("request_id")
+
+
+# Defaults for every API response; a header the route already set is left alone (e.g. the
+# image file's Cache-Control). HSTS is set by Nginx/Cloudflare, which terminate TLS.
+SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+    (b"x-content-type-options", b"nosniff"),
+    (b"x-frame-options", b"DENY"),
+    (b"referrer-policy", b"no-referrer"),
+    (b"permissions-policy", b"camera=(), microphone=(), geolocation=(), payment=(), usb=()"),
+    (b"cross-origin-opener-policy", b"same-origin"),
+    (b"content-security-policy", b"default-src 'none'; frame-ancestors 'none'; base-uri 'none'"),
+)
+# Swagger UI (dev only) loads its own scripts and styles, so it gets no CSP.
+_NO_CSP_PATHS = ("/api/docs",)
+
+
+class SecurityHeadersMiddleware:
+    """Pure ASGI (no buffering, so SSE streams are untouched)."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        skip_csp = str(scope.get("path", "")).startswith(_NO_CSP_PATHS)
+
+        async def send_wrapper(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                present = {k.lower() for k, _ in headers}
+                for name, value in SECURITY_HEADERS:
+                    if name in present or (skip_csp and name == b"content-security-policy"):
+                        continue
+                    headers.append((name, value))
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)

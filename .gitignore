@@ -13,3 +13,4 @@ dist/
 .ruff_cache/
 .coverage
 htmlcov/
+scripts/ops/ops.env

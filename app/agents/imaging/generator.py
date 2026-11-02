@@ -118,6 +118,15 @@ def parse_progress(line: str, steps: int) -> int | None:
     return None
 
 
+def _not_an_option(template_arg: str, value: str) -> str:
+    """A user's text in its own argv slot ("{prompt}") must not start with '-': the image
+    agent's argument parser would read "--output=/elsewhere" as an option. A leading space
+    changes nothing for the model."""
+    if template_arg.startswith("{") and value.startswith("-"):
+        return " " + value
+    return value
+
+
 class SubprocessGenerator:
     supports_cancel = True  # by terminating the process group
 
@@ -143,7 +152,7 @@ class SubprocessGenerator:
             "height": req.height,
             "output": str(output),
         }
-        return [arg.format_map(values) for arg in self.template]
+        return [_not_an_option(arg, arg.format_map(values)) for arg in self.template]
 
     async def generate(
         self, req: GenerationRequest, output: Path, on_progress: ProgressCallback

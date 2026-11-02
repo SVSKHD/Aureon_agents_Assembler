@@ -50,6 +50,7 @@ from app.models.trading import (
 from app.services import paper
 from app.workers.scheduler import TaskContext, paper_reconcile
 from tests.conftest import TEST_REDIS_URL
+from tests.routes import api_routes
 
 pytestmark = pytest.mark.db
 PASSWORD = "correct horse battery staple"
@@ -536,11 +537,11 @@ async def test_ai_routes_cannot_reach_intents_and_approve_is_admin_only(
     make_env: EnvFactory,
 ) -> None:
     async with make_env() as env:
+        # Flattened (included routers are lazy on current FastAPI; app.routes alone is empty).
         routes = [
-            (sorted(getattr(r, "methods", set())), getattr(r, "path", ""))
-            for r in env.app.routes
-            if "order-intents" in getattr(r, "path", "")
+            (sorted(r.methods), r.path) for r in api_routes(env.app) if "order-intents" in r.path
         ]
+        assert routes, "no order-intents routes found: the route walk is broken"
         assert all(p.startswith("/api/trading/order-intents") for _, p in routes)
         await env.policy()
         await env.tick("1000")

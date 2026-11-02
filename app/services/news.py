@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import ipaddress
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -88,6 +89,22 @@ def _http(url: str) -> bool:
     return parts.scheme in ("http", "https") and bool(parts.netloc)
 
 
+def _public_host(url: str) -> bool:
+    """A redirect may only lead to a public host: never an IP literal that is not global
+    (loopback, private, link-local), localhost, or a single-label name such as a Docker
+    service (aureon-redis, the Postgres/Ollama containers). Phase E, docs/17 S-16."""
+    try:
+        host = (urlsplit(url).hostname or "").rstrip(".").lower()
+    except ValueError:
+        return False
+    if not host or host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        return False
+    try:
+        return ipaddress.ip_address(host).is_global
+    except ValueError:
+        return "." in host
+
+
 def _date(raw: str) -> datetime | None:
     raw = raw.strip()
     if not raw:
@@ -157,6 +174,8 @@ async def fetch(client: httpx.AsyncClient, url: str, max_bytes: int) -> bytes:
             if resp.is_redirect:
                 location = resp.headers.get("location", "")
                 current = urljoin(current, location)
+                if _http(current) and not _public_host(current):
+                    raise FeedError("refusing a redirect to a non-public host")
                 continue
             resp.raise_for_status()
             buf = bytearray()

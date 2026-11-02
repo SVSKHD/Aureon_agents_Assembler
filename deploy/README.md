@@ -43,6 +43,8 @@ docker network inspect aureon -f '{{(index .IPAM.Config 0).Gateway}}'
 
 ```bash
 docker compose build
+# Phase E: `up` runs the migrate one-shot first (waits for Postgres, then upgrade head) and
+# starts the API only after it succeeds. Running it explicitly first is still fine:
 docker compose run --rm migrate        # 0001 version table; 0002 core.*/audit.*; 0003 ai.*; 0004 agents.image_*; 0005 agents registry/scheduler; 0006 trading.*/dhan.*/mt5.*; 0007 trading.indicator_values; 0008 agents.code_tasks (new tables only)
 docker compose up -d                   # api, redis, scheduler, docker-proxy
 docker compose run --rm -it migrate python -m app.auth.bootstrap --email you@example.com
@@ -51,7 +53,8 @@ docker compose run --rm -it migrate python -m app.auth.bootstrap --email you@exa
 ## 3. Validate
 
 ```bash
-docker compose ps                                   # mount-check exited 0; redis, api healthy
+docker compose ps                                   # mount-check + migrate exited 0; everything else healthy
+scripts/ops/healthcheck.sh                          # Phase E: health, ready and compose health in one go
 curl -fsS http://127.0.0.1:8000/api/health
 curl -sS  http://127.0.0.1:8000/api/health/ready | python3 -m json.tool
 docker compose logs --tail=50 api
@@ -94,6 +97,13 @@ Research agents (migration 0007, opt-in worker): see [docs/13-research-agents.md
 
 Paper trading (migration 0009, scheduler jobs `paper-process` / `paper-reconcile`): see
 [docs/15-paper-trading.md](../docs/15-paper-trading.md#deploy-and-validate).
+
+Production hardening (Phase E): startup checklist, compose start order and limits, backups,
+restore drill, systemd boot units, firewall and log limits: see
+[docs/16-production-hardening.md](../docs/16-production-hardening.md), the sudo steps in
+[docs/manual-setup.md](../docs/manual-setup.md#phase-e--production-hardening) and the security
+review [docs/17-security-review.md](../docs/17-security-review.md). Then run
+`scripts/ops/healthcheck.sh --wait 300`.
 
 Agents, scheduler, system status and the host-status helper: see
 [docs/05-agents.md](../docs/05-agents.md#deploy-and-validate).

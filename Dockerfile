@@ -28,7 +28,7 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=4).status==200 else 1)"
 CMD ["uvicorn", "--factory", "app.main:app_factory", "--host", "0.0.0.0", "--port", "8000", \
-     "--proxy-headers", "--timeout-graceful-shutdown", "20"]
+     "--proxy-headers", "--no-server-header", "--timeout-graceful-shutdown", "20"]
 
 # --- coding worker (opt-in) --------------------------------------------------------------
 # docker compose --profile coding build coding-worker

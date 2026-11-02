@@ -6,6 +6,34 @@
 #   PRIVATE_AI_NETWORK  — the network the Postgres + Ollama containers are on
 name: aureon
 
+# Hardening shared by every service (docs/16-production-hardening.md): bounded json-file logs,
+# no privilege escalation, no Linux capabilities. Merged in with `<<: *hardened`.
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "5" }
+
+x-hardened: &hardened
+  logging: *logging
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  read_only: true
+
+# Worker liveness: the agent heartbeat file on the container's own /tmp (app/workers/healthcheck.py).
+x-worker-health: &worker-health
+  test: ["CMD", "python", "-m", "app.workers.healthcheck", "--max-age", "90"]
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 60s
+
+# Boot order: mount-check → redis (healthy) → migrate (exit 0) → api (healthy) → workers.
+# The existing Postgres container is in another compose project; `migrate` waits for it.
+x-after-api: &after-api
+  mount-check: { condition: service_completed_successfully }
+  redis: { condition: service_healthy }
+  migrate: { condition: service_completed_successfully }
+  api: { condition: service_healthy }
+
 x-data-root: &data-root
   type: bind
   source: ${DATA_ROOT:-/mnt/spasta-data}
@@ -26,11 +54,17 @@ services:
         || { echo "FATAL: /mnt/spasta-data is not mounted (marker missing)"; exit 1; }
     volumes: [*data-root]
     network_mode: none
+    <<: *hardened
+    mem_limit: 32m
+    cpus: "0.1"
     restart: "no"
 
   redis:
     image: redis:7.4-alpine
     container_name: aureon-redis
+    # Runs as the image's redis user (999) directly, so the entrypoint needs no chown/gosu and
+    # every capability can be dropped. /mnt/spasta-data/redis must be owned by 999:999.
+    user: "999:999"
     command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb",
               "--maxmemory-policy", "noeviction"]
     volumes:
@@ -45,6 +79,11 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+      start_period: 10s
+    <<: *hardened
+    tmpfs: ["/tmp:size=16m"]
+    mem_limit: 384m
+    cpus: "0.5"
     depends_on:
       mount-check: { condition: service_completed_successfully }
     restart: unless-stopped
@@ -59,17 +98,24 @@ services:
     environment:
       ENV: ${ENV:-prod}
     volumes: [*data-root]
-    networks: [aureon, private-ai]
+    networks: [aureon, private-ai, aureon-docker]
     ports:
       - "127.0.0.1:8000:8000"   # loopback only; Nginx/cloudflared reach it locally
-    read_only: true
-    tmpfs: [/tmp]
-    security_opt: ["no-new-privileges:true"]
-    cap_drop: [ALL]
+    <<: *hardened
+    tmpfs: ["/tmp:size=64m"]
+    mem_limit: 2g
+    cpus: "2.0"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     stop_grace_period: 30s
     depends_on:
       mount-check: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
     restart: unless-stopped
 
   # Image worker (Phase 4). Opt-in profile: start it only after IMAGE_AGENT_COMMAND is set
@@ -101,14 +147,11 @@ services:
     # NO ports. One generation at a time; leave a core for Postgres/API/Ollama.
     cpus: "3.0"
     mem_limit: 10g
-    read_only: true
+    <<: *hardened
     tmpfs: ["/tmp:size=2g"]
-    security_opt: ["no-new-privileges:true"]
-    cap_drop: [ALL]
+    healthcheck: *worker-health
     stop_grace_period: 30s   # SIGTERM → running job is stopped and re-queued
-    depends_on:
-      mount-check: { condition: service_completed_successfully }
-      redis: { condition: service_healthy }
+    depends_on: *after-api
     profiles: [imaging]
     restart: unless-stopped
 
@@ -122,13 +165,13 @@ services:
     command: ["python", "-m", "app.workers.scheduler"]
     networks: [aureon, private-ai]
     # NO ports.
-    read_only: true
-    tmpfs: [/tmp]
-    security_opt: ["no-new-privileges:true"]
-    cap_drop: [ALL]
+    <<: *hardened
+    tmpfs: ["/tmp:size=32m"]
+    mem_limit: 512m
+    cpus: "1.0"
+    healthcheck: *worker-health
     stop_grace_period: 30s
-    depends_on:
-      api: { condition: service_started }
+    depends_on: *after-api
     restart: unless-stopped
 
   # Dhan live market feed (Trading Phase B). Opt-in: `docker compose --profile dhan up -d`.
@@ -142,14 +185,13 @@ services:
     command: ["python", "-m", "app.workers.dhan_feed"]
     networks: [aureon, private-ai]   # Redis + Postgres; outbound to api-feed.dhan.co
     # NO ports.
-    read_only: true
-    tmpfs: [/tmp]
-    security_opt: ["no-new-privileges:true"]
-    cap_drop: [ALL]
+    <<: *hardened
+    tmpfs: ["/tmp:size=32m"]
     mem_limit: 512m
+    cpus: "1.0"
+    healthcheck: *worker-health
     stop_grace_period: 15s
-    depends_on:
-      redis: { condition: service_healthy }
+    depends_on: *after-api
     profiles: [dhan]
     restart: unless-stopped
 
@@ -165,15 +207,13 @@ services:
     command: ["python", "-m", "app.workers.research"]
     networks: [aureon, private-ai]   # Redis + Postgres + Ollama (+ outbound to the broker APIs)
     # NO ports.
-    read_only: true
-    tmpfs: [/tmp]
-    security_opt: ["no-new-privileges:true"]
-    cap_drop: [ALL]
+    <<: *hardened
+    tmpfs: ["/tmp:size=64m"]
     cpus: "1.5"
     mem_limit: 1g
+    healthcheck: *worker-health
     stop_grace_period: 20s
-    depends_on:
-      redis: { condition: service_healthy }
+    depends_on: *after-api
     profiles: [research]
     restart: unless-stopped
 
@@ -197,17 +237,17 @@ services:
         source: ${CODE_REPOS_ROOT:-/opt/private-ai/repos}
         target: ${CODE_REPOS_ROOT:-/opt/private-ai/repos}
         bind: { create_host_path: false }
-    networks: [aureon, private-ai]      # Postgres + Ollama only
+    # Postgres + Ollama only. NOT on "aureon": the tests it runs execute model-patched code,
+    # which must not reach Redis or the Docker proxy (container env = every secret).
+    networks: [private-ai]
     # NO ports.
-    read_only: true
+    <<: *hardened
     tmpfs: ["/tmp:size=1g"]
-    security_opt: ["no-new-privileges:true"]
-    cap_drop: [ALL]
     cpus: "2.0"
     mem_limit: 3g
+    healthcheck: *worker-health
     stop_grace_period: 30s
-    depends_on:
-      mount-check: { condition: service_completed_successfully }
+    depends_on: *after-api
     profiles: [coding]
     restart: unless-stopped
 
@@ -229,24 +269,48 @@ services:
       EVENTS: "0"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks: [aureon]   # internal only; NO ports
-    read_only: true
+    # Its own internal network shared ONLY with the API: GET /containers/{id}/json returns each
+    # container's env (every secret), so no worker may reach it. NO ports.
+    networks: [aureon-docker]
+    <<: *hardened
+    # HAProxy runs as root inside (to read the socket) and binds 2375 (> 1024): no caps needed.
     tmpfs: [/run, /tmp]
-    security_opt: ["no-new-privileges:true"]
+    mem_limit: 64m
+    cpus: "0.25"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:2375/_ping || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
 
-  # One-shot: `docker compose run --rm migrate`
+  # One-shot on every `up`: waits for the existing Postgres, then `alembic upgrade head`
+  # (additive, idempotent at head). The API starts only after it exits 0.
+  # Ad-hoc: `docker compose run --rm migrate` (same) or `... migrate <other command>`.
   migrate:
     image: aureon-agentic:${IMAGE_TAG:-dev}
     env_file: .env
-    command: ["alembic", "upgrade", "head"]
+    environment:
+      ENV: ${ENV:-prod}
+    command: ["python", "-m", "app.workers.migrate"]
     networks: [private-ai]
-    profiles: [tools]
+    # NO ports.
+    healthcheck: { disable: true }   # the image's API healthcheck does not apply to a one-shot
+    <<: *hardened
+    tmpfs: ["/tmp:size=32m"]
+    mem_limit: 512m
+    cpus: "1.0"
+    depends_on:
+      redis: { condition: service_healthy }
     restart: "no"
 
 networks:
   aureon:
     name: aureon
+  aureon-docker:
+    name: aureon-docker
+    internal: true   # no route out; only the API and the read-only Docker proxy are on it
   private-ai:
     external: true
     name: ${PRIVATE_AI_NETWORK:?set PRIVATE_AI_NETWORK in .env (see docs/00-inspection.md)}

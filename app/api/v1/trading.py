@@ -24,7 +24,7 @@ from app.agents.research import strategies as strategy_impls
 from app.agents.trading.base import BrokerAdapter
 from app.agents.trading.mt5.adapter import MT5Adapter
 from app.agents.trading.types import Broker, SignalSide, Timeframe
-from app.auth.deps import AdminRequired, Current, DbSession, SettingsDep
+from app.auth.deps import AdminRequired, CsrfProtected, Current, DbSession, SettingsDep
 from app.models.agents import Agent, AgentLog
 from app.models.brokers import Mt5Symbol
 from app.models.trading import (
@@ -833,7 +833,7 @@ async def create_strategy_version(
     "/strategies/backtest", response_model=BacktestQueued, status_code=status.HTTP_202_ACCEPTED
 )
 async def queue_backtest(
-    body: BacktestRequest, db: DbSession, current: Current, settings: SettingsDep
+    body: BacktestRequest, db: DbSession, current: CsrfProtected, settings: SettingsDep
 ) -> BacktestQueued:
     """Queue one backtest per parameter combination; the research worker runs them."""
     if body.start.tzinfo is None or body.end <= body.start:
@@ -985,7 +985,7 @@ async def _explain(
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def explain_signal(
-    signal_id: uuid.UUID, request: Request, db: DbSession, _: Current, settings: SettingsDep
+    signal_id: uuid.UUID, request: Request, db: DbSession, _: CsrfProtected, settings: SettingsDep
 ) -> ExplainQueued:
     """Ask the AI research agent (local Ollama) to explain a signal. Explanation only."""
     if await db.get(TradingSignal, signal_id) is None:
@@ -999,7 +999,7 @@ async def explain_signal(
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def explain_backtest(
-    run_id: uuid.UUID, request: Request, db: DbSession, _: Current, settings: SettingsDep
+    run_id: uuid.UUID, request: Request, db: DbSession, _: CsrfProtected, settings: SettingsDep
 ) -> ExplainQueued:
     run = await db.get(BacktestRun, run_id)
     if run is None:

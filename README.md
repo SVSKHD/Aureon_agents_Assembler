@@ -19,6 +19,7 @@ Trading Phase B adds the read-only DhanHQ v2 adapter, live-feed worker and sync 
 Trading Phase C watches the separate Aureon MT5 bot through its read-only status export ([docs/12-mt5-adapter.md](docs/12-mt5-adapter.md)).
 Trading Phase D adds the research agents: market data, indicators, signals, risk decisions, backtests and Ollama explanations ([docs/13-research-agents.md](docs/13-research-agents.md)).
 Trading Phase F enables PAPER mode end to end: intents, risk, admin approval, simulated fills, P&L and reconciliation; no broker orders ([docs/15-paper-trading.md](docs/15-paper-trading.md)).
+Phase E hardens production: an ENV=prod startup checklist, health-gated compose start order, nightly backups with a weekly restore drill, systemd boot units and a security review ([docs/16-production-hardening.md](docs/16-production-hardening.md), [docs/17-security-review.md](docs/17-security-review.md); sudo steps in [docs/manual-setup.md](docs/manual-setup.md)).
 
 ## Layout
 
@@ -93,7 +94,7 @@ tests/  scripts/  deploy/  docs/
 | POST / GET / DELETE | `/api/finance/attachments[/{id}[/file]]` | Receipt attachments on the HDD (PNG/JPEG/WebP/PDF, owner-scoped). |
 | GET / DELETE | `/api/auth/sessions[/{id}]` | List your active sessions; revoke one (audited). |
 | GET | `/api/public/shares/{doc_id}`, `/api/public/forex` | No auth, rate limited: public shares, pulled forex news. |
-| GET | `/api/docs` | Swagger UI (disabled when `ENV=prod`). |
+| GET | `/api/docs`, `/api/openapi.json` | Swagger UI and schema; both off when `ENV=prod` ([docs/16-production-hardening.md](docs/16-production-hardening.md)). |
 
 ## Configuration
 
@@ -101,7 +102,10 @@ Every variable is listed in [.env.example](.env.example).
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `ENV` | `dev` | `dev`/`test`/`prod`. In `prod` the API refuses to start without the HDD marker. |
+| `ENV` | `dev` | `dev`/`test`/`prod`. In `prod` the API refuses to start unless the checklist in [docs/16](docs/16-production-hardening.md#production-checklist-envprod) passes (HDD marker, strong `SECRET_KEY`, secure cookies, no DEBUG/docs). |
+| `DEBUG` / `API_DOCS_ENABLED` | `false` / unset | Both refused in prod; docs default to on outside prod. |
+| `PHASE_G_APPROVED` | empty | Must be `yes` for `TRADING_LIVE_ENABLED=true` to load (LIVE stays blocked until Phase G). |
+| `MIGRATE_WAIT_SECONDS` | `180` | How long the `migrate` one-shot waits for Postgres before `alembic upgrade head`. |
 | `LOG_LEVEL` | `INFO` | Log level. |
 | `DATABASE_URL` | required | `postgresql+asyncpg://…@<postgres-container>:5432/spasta` |
 | `REDIS_URL` | `redis://aureon-redis:6379/0` | Redis from this compose file. |
@@ -148,7 +152,7 @@ Every variable is listed in [.env.example](.env.example).
 | `SCHEDULER_TICK_SECONDS` / `SCHEDULER_TIMEZONE` | `5` / `Asia/Kolkata` | Poll interval; cron time zone. |
 | `DOCKER_API_URL` | `http://aureon-docker-proxy:2375` | Read-only Docker socket proxy (empty = off). |
 | `HOST_STATUS_FILE` / `HOST_STATUS_MAX_AGE_SECONDS` | `…/status/host-services.json` / `120` | Host unit states from deploy/host-status. |
-| `TRADING_LIVE_ENABLED` | `false` | LIVE feature flag; LIVE also needs Phase G preconditions. |
+| `TRADING_LIVE_ENABLED` | `false` | LIVE feature flag; refused without `PHASE_G_APPROVED=yes`; LIVE also needs Phase G preconditions. |
 | `TRADING_LIVE_TOKEN_TTL_SECONDS` | `300` | LIVE confirmation token lifetime. |
 | `TRADING_ADAPTER_TIMEOUT` | `10` | Per-call broker adapter timeout. |
 | `DHAN_CLIENT_ID` / `DHAN_ACCESS_TOKEN` | unset | Dhan credentials (env only); unset = no Dhan adapter or jobs. |
@@ -181,12 +185,14 @@ readiness test, then drops it. Never point it at `spasta`.
 
 ## Deploy
 
-See [deploy/README.md](deploy/README.md). Admin bootstrap: `python -m app.auth.bootstrap --email …`. Server facts still to be collected:
+See [deploy/README.md](deploy/README.md) and the ops runbook
+[docs/16-production-hardening.md](docs/16-production-hardening.md) (backups, restore, reboot order). Admin bootstrap: `python -m app.auth.bootstrap --email …`. Server facts still to be collected:
 [docs/00-inspection.md](docs/00-inspection.md).
 
 ## Safety rules (Phase 1)
 
 - Only the API is published, on `127.0.0.1:8000`. Postgres, Ollama and Redis have no host ports.
-- The containers run as non-root, read-only, with all capabilities dropped and `no-new-privileges`.
+- The containers run as non-root, read-only, with all capabilities dropped and `no-new-privileges`,
+  with memory/CPU limits and capped logs (Phase E).
 - Migrations are additive. Autogenerate ignores tables that are not in our models.
 - Readiness errors report the exception type only, so DSNs and hosts never leak into responses.
