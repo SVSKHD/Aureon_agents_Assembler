@@ -12,6 +12,9 @@ from app.models.github import (
     GitHubRepository,
     GitHubSyncRun,
     GitHubTrackedOperation,
+    GitHubWebhookEvent,
+    GitHubWorkflowJob,
+    GitHubWorkflowRun,
 )
 from app.models.imaging import GeneratedAsset, ImageJob
 
@@ -32,6 +35,9 @@ __all__ = [
     "GitHubRepository",
     "GitHubSyncRun",
     "GitHubTrackedOperation",
+    "GitHubWebhookEvent",
+    "GitHubWorkflowJob",
+    "GitHubWorkflowRun",
     "ImageJob",
     "Message",
     "ModelInventory",
