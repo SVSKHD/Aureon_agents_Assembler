@@ -203,3 +203,27 @@ endpoints answer 503 `github_not_configured`.
 4. **If it leaks** (it shows up in a log, a paste or a commit): revoke it on GitHub
    immediately, create a new one and restart. Every log line and error is redacted, but
    revoking is the only real fix.
+
+## 16 — GitHub issues and PRs
+
+See [19-github-issues-prs.md](19-github-issues-prs.md). Phase 16 needs nothing beyond
+Phase 15's token, except one extra permission for the gated repo-config operations.
+
+1. **Add Administration: Read and write to the fine-grained PAT** (GitHub → Settings →
+   Developer settings → Fine-grained tokens → the token → Edit → Repository permissions).
+   Branch protection (`PUT`/`DELETE …/branches/{b}/protection`), repo settings (`PATCH
+   /repos/{o}/{r}`) and Actions enable/disable (`PUT …/actions/permissions`) need it.
+   Without it those approvals end `failed` with `github_forbidden`. Nothing else breaks.
+   Issues, Pull requests and Contents read/write (already asked for in Phase 15) cover
+   issues, comments, reviews, PR create/update, merge, force-push and branch delete.
+2. **Apply migration 0013:** `docker compose run --rm migrate`, then `docker compose up -d api`.
+3. **Pick the self-approval policy.** With a single owner, the default
+   (`APPROVALS_ALLOW_SELF_APPROVAL=true`) lets the only admin approve their own requests.
+   When a second admin account exists, self-approval stops automatically. Set it to
+   `false` in `.env` to always need a second person.
+4. **First run:** try the gated merge on a throwaway PR (see the doc's deploy steps) and
+   check that `GET /api/v1/github/operations` shows `pr.merge` going from
+   `pending_approval` to `succeeded`.
+5. **Branch protection on GitHub stays the real backstop.** Keep the `main` protection rules
+   enabled on GitHub itself. The approval gate controls what Aureon may do; it does not
+   replace GitHub's own rules.

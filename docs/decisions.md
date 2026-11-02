@@ -173,3 +173,70 @@ what would change it. Newest phase last.
   redaction (D-15-2), for tokens a third-party library might log.
 - **D-15-15: a prod guard for the API URL.** With `GITHUB_TOKEN` set, `ENV=prod` refuses to start
   unless `GITHUB_API_URL` is https, so the token is never sent in clear text.
+
+## 16 — GitHub issues and PRs
+
+- **D-16-1: `task_ref` is an opaque string.** Spasta tasks live in the frontend workspace
+  document (`public.astra_documents`, namespace `aureon-notes`), not in a backend table.
+  `github.issue_links.task_ref` is the id the frontend supplies (1–200 characters of
+  `[A-Za-z0-9_.:/-]`), with `task_kind` defaulting to `spasta_task`. The backend checks that the
+  GitHub issue exists and stores its `node_id`. It cannot check that the task exists. Repo
+  names are stored lower-case so a link is unique regardless of case.
+- **D-16-2: a minimal ApprovalGate now, the same interface in Phase 20.** The engine is
+  `app/services/approvals.py`:
+  - `request(kind, target, payload, artifact)`, `approve(id, admin, reauth_password)` and
+    `deny(id)`
+  - an executor registry mapping kind → `ExecutorSpec(execute, current_artifact, on_status,
+    requires)`
+  - tables in the `audit` schema
+
+  Phase 20 adds policies, artifacts tables and notifications without changing the callers.
+- **D-16-3: self-approval is allowed only for the only admin.** `APPROVALS_ALLOW_SELF_APPROVAL`
+  defaults to true because there is a single owner. Even when it is true, the requester can
+  approve their own request only while they are the only active admin. Once a second admin
+  exists, someone else must approve. Setting it to false always requires another admin.
+- **D-16-4: re-auth is the admin's own password, checked server-side.** It is verified with
+  the existing Argon2 hasher in a worker thread, never stored or logged. A wrong password is
+  403 `reauth_failed`, written as an `approval_events` row and an `approval_reauth_failed`
+  audit event. After `APPROVALS_MAX_REAUTH_FAILURES` (5) failures, the request is denied, so
+  a stolen session cannot guess the password against it indefinitely.
+- **D-16-5: single use is enforced before execution.** Under a row lock, approve moves the
+  request out of `pending` to `approved` and commits before anything runs. Any later
+  approve is 409 `approval_already_used`, even after a crash or a failure. A failed
+  execution needs a new request.
+- **D-16-6: the artifact is recomputed by the same function.** The artifact is canonical JSON
+  (sorted keys), hashed with sha256. The function that builds it at request time runs
+  again before execution, and any difference makes the request `invalidated` (409, no
+  write). For a merge, the artifact is the head sha + the sha256 of the unified diff (+ base
+  ref and state). The merge call also sends the approved `sha`, so GitHub itself refuses a
+  head that moved in between.
+- **D-16-7: the allowlist is re-checked at execution.** Removing a repo from the allowlist
+  between request and approval makes the execution fail (`not_found`) with no write.
+- **D-16-8: approve answers 200 for `executed` and `failed` alike.** The status and `result`
+  say which. 409 is kept for the gate's own refusals (expired, used, invalidated), and 403
+  for re-auth and self-approval.
+- **D-16-9: a missing token at approval time does not consume the request.** The executor's
+  `requires` dependencies are checked before the status changes (503, still pending).
+- **D-16-10: POSTs are never retried after a 5xx or a network error.** GitHub may have acted
+  already (a duplicate issue or comment). PUT, PATCH and DELETE set state and keep Phase 15's
+  retry. Any write clears the GET cache.
+- **D-16-11: the diff is streamed and capped.** At most `GITHUB_DIFF_MAX_BYTES` + 1 bytes are
+  read, so a huge diff never sits whole in memory. GitHub's own "too large" (406) is
+  answered as an empty `truncated` diff with `too_large_upstream`.
+- **D-16-12: force-push is a forced ref update.** `PATCH git/refs/heads/{branch}` with
+  `force: true` to a sha that must exist in the repo (checked at request time). Its artifact
+  is the branch's current sha + the target sha.
+- **D-16-13: route shapes.** Branch names can contain `/`, so protection lives at
+  `…/branch-protection/{branch}` and branch delete at `…/branches/{branch}` (both
+  `{branch:path}`). Force-push takes the branch in the body. Actions enable/disable is
+  `…/actions-permissions`, so it does not collide with Phase 17's `/actions/*` routes.
+- **D-16-14: bodies are redacted on the way out, the approval payload is exact.**
+  - Issue, PR and comment bodies, commit messages, patches and diffs pass through the
+    client's `redact()`.
+  - `tracked_operations.request_payload` is redacted and capped at 4,000 characters per
+    string.
+  - `approval_requests.payload` keeps the exact payload, because that is what gets
+    executed. It is admin-only.
+- **D-16-15: issue lists leave out PRs.** GitHub's issues endpoint returns PRs too. They are
+  filtered out unless `include_pulls=true`. Lists return one GitHub page with `has_next`
+  from the Link header.
