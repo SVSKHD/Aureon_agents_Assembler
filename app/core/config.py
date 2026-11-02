@@ -117,6 +117,38 @@ class Settings(BaseSettings):
     # Per-call timeout for read-only broker adapter calls.
     TRADING_ADAPTER_TIMEOUT: float = Field(default=10.0, gt=0)
 
+    # --- Dhan (docs/11-dhan.md). Credentials come from env only and are never stored. ---
+    DHAN_CLIENT_ID: str | None = None
+    DHAN_ACCESS_TOKEN: SecretStr | None = None
+    DHAN_BASE_URL: str = "https://api.dhan.co/v2"
+    DHAN_FEED_URL: str = "wss://api-feed.dhan.co"
+    DHAN_INSTRUMENT_CSV_URL: str = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
+    DHAN_HTTP_TIMEOUT: float = Field(default=15.0, gt=0)
+    # Warn (health detail + agent log) when the 24 h access token has less than this left.
+    DHAN_TOKEN_WARN_HOURS: float = Field(default=4.0, ge=0)
+    # Live feed worker: "SEGMENT:SECURITY_ID" list, e.g. "IDX_I:13,NSE_EQ:2885".
+    DHAN_FEED_INSTRUMENTS: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    DHAN_FEED_MODE: Literal["ticker", "quote", "full"] = "quote"
+    DHAN_FEED_QUEUE_MAX: int = Field(default=10_000, ge=100)
+    # A subscribed instrument with no tick for this long (market open) is marked stale.
+    DHAN_FEED_STALE_SECONDS: float = Field(default=60.0, gt=0)
+    DHAN_FEED_MAX_BACKOFF_SECONDS: float = Field(default=60.0, gt=0)
+    # Scheduled jobs (created only when DHAN_CLIENT_ID is set).
+    DHAN_RECONCILE_CRON: str = "*/5 9-15 * * 1-5"
+    DHAN_INSTRUMENTS_CRON: str = "11 8 * * 1-5"
+    DHAN_BACKFILL_CRON: str = "41 16 * * 1-5"
+    DHAN_BACKFILL_INSTRUMENTS: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    DHAN_BACKFILL_TIMEFRAMES: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["1d", "15m"]
+    )
+    DHAN_BACKFILL_DAYS: int = Field(default=30, ge=1, le=3650)
+    # The static IP you whitelisted on Dhan (only scripts/dhan_preflight.py reads it).
+    DHAN_STATIC_IP: str | None = None
+
+    @property
+    def dhan_configured(self) -> bool:
+        return bool(self.DHAN_CLIENT_ID and self.DHAN_ACCESS_TOKEN)
+
     @field_validator("IMAGE_AGENT_COMMAND", mode="before")
     @classmethod
     def _parse_command(cls, v: object) -> object:
@@ -125,7 +157,13 @@ class Settings(BaseSettings):
         return v
 
     @field_validator(
-        "CORS_ORIGINS", "IMAGE_AGENT_ENV_PASSTHROUGH", "IMAGE_ALLOWED_SIZES", mode="before"
+        "CORS_ORIGINS",
+        "IMAGE_AGENT_ENV_PASSTHROUGH",
+        "IMAGE_ALLOWED_SIZES",
+        "DHAN_FEED_INSTRUMENTS",
+        "DHAN_BACKFILL_INSTRUMENTS",
+        "DHAN_BACKFILL_TIMEFRAMES",
+        mode="before",
     )
     @classmethod
     def _split_origins(cls, v: object) -> object:
