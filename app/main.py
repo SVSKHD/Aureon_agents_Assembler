@@ -20,6 +20,7 @@ from app.core.config import Environment, Settings, get_settings
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import RequestIdMiddleware
 from app.db.session import build_engine, build_sessionmaker
+from app.integrations.github import build_github_client
 from app.services.health import HealthService, check_data_root
 
 log = get_logger(__name__)
@@ -64,6 +65,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         mt5 = build_mt5_adapter(settings)
         if mt5 is not None:
             app.state.trading_adapters["mt5"] = mt5
+        # GitHub REST client (docs/18-github-foundation.md); None without GITHUB_TOKEN.
+        github = build_github_client(settings)
+        app.state.github = github
         registry = AgentRegistry(app.state.sessionmaker)
         app.state.registry = registry
         app.state.agent_paused = {}
@@ -94,6 +98,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await dhan.aclose()
             if mt5 is not None:
                 await mt5.aclose()
+            if github is not None:
+                await github.aclose()
             await ollama.aclose()
             await http.aclose()
             await redis.aclose()
