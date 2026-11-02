@@ -350,11 +350,16 @@ what would change it. Newest phase last.
   never processed again automatically. A finished repair other than `pr_opened` hands the
   incident back to `open`, still escalated, so nothing loops. Only exception incidents map
   to a code location; other sources escalate to `_manual`.
-- **D-18-11: the hard blocks are wider than the spec.** They also cover `app/services/approvals*`,
-  `app/core/prod_checks*`, the repair system itself (`repair*`, `incidents*`, the exception
-  sink) and the sandbox (`app/agents/coding/**`), so a repair can never weaken its own
-  guards. `*secret*` and `*credential*` file names are blocked too. Settings changes are
-  allowed, except lines in `app/core/config.py` that name a secret field.
+- **D-18-11: the hard blocks come from `app/core/sensitive_paths.py`.** Phase 19 added that
+  module, so the repair list is not a second copy. `classify_path` covers secrets, infra,
+  trading/risk and auth by name globs, directories and path tokens. That is broader than the
+  spec's globs, which is safe for a writer. The repair-only additions live in the same module
+  (`classify_repair_path`): migrations, `scripts/ops`, research, `*key*` names, and the
+  repair system and sandbox themselves, so a repair can never weaken its own guards. They are
+  kept out of `classify_path` so the review filter's behaviour does not change. Settings are
+  allowed, except changed lines in `app/core/config.py` that name a secret field.
+- **D-18-16: migration id 0016.** Phase 19 merged its 0015 first, so this migration is 0016
+  with down_revision 0015 (one head).
 - **D-18-12: tests are required.** A repo with no allowlisted test command can never get a
   repair PR (`tests_failed`, "no allowlisted test commands").
 - **D-18-13: the circuit breaker pauses the `repair` agent row.** It upserts the row if the
@@ -366,3 +371,46 @@ what would change it. Newest phase last.
 - **D-18-15: the incident-scan job is a default job** (`INCIDENT_SCAN_CRON`, every minute;
   empty removes it). The existing default-jobs test now expects it and pauses it, so it
   stays out of that test's ticks.
+
+## 19 — Claude review
+
+See [22-claude-review.md](22-claude-review.md).
+
+- **D-19-1: the CLI, not an API client.** The reviewer shells nothing: it runs the local
+  `claude` binary with argv only, prompt on stdin, an empty temp cwd and an env of HOME,
+  PATH and the listed auth names. No HTTP client for an external AI API exists in the code.
+  Default flags turn off tools, MCP and session persistence; they are configurable
+  (`CLAUDE_CLI_ARGS`) because CLI flags change between versions.
+- **D-19-2: one shared sensitive-path list.** Phase 18 had not merged a hard-block list, so
+  `app/core/sensitive_paths.py` defines it (secrets, infra, trading_risk, auth). Phase 18
+  should import it instead of keeping its own (dedupe note for the orchestrator).
+- **D-19-3: classify first, check availability second.** A BLOCKED diff never starts any
+  process, not even `claude --version`, so "nothing sent" is trivially true and testable.
+- **D-19-4: block broadly, mask narrowly.** Any hit on a path or secret rule blocks the
+  whole review; reasons name the rule and place, never the value. `password=` counts as a
+  literal only when quoted, at the start of a config line, in a URL query or as a JSON
+  key, so `password: str` and `password=PASSWORD` in code do not block every diff.
+  `.env.example`-style files are not path-blocked (they change in most phases), but their
+  content is scanned like any other.
+- **D-19-5: the diff is pinned.** It is fetched as `compare/{base}...{head}` with the shas
+  read at request time, so the reviewed text, the stored head_sha and the published
+  `commit_id` always agree.
+- **D-19-6: dedupe with a partial unique index.** `(repo, pr_number, head_sha)` where not
+  forced and not REVIEW_UNAVAILABLE. A queued or running review dedupes too, and an
+  unavailable one can be requested again without force. A `status` column
+  (queued/running/done) and a `reason` column were added beyond the spec's list.
+- **D-19-7: background tasks in the API process, bounded.** A semaphore of 1 and
+  `CLAUDE_REVIEW_MAX_QUEUE` waiting (then 429), no new worker container. On a clean shutdown
+  running reviews are marked `cancelled`.
+- **D-19-8: publish is COMMENT only, claimed under a lock.** The event is hard-coded; an
+  APPROVED verdict is stated as advisory in the body. Findings on new-side diff lines become
+  inline comments, others go in the body. A failed GitHub call releases the claim.
+  BLOCKED reviews can be published (they tell humans the review was skipped and why);
+  REVIEW_UNAVAILABLE ones cannot.
+- **D-19-9: no PR-opened auto-review yet.** The Phase 17 webhook processor runs in a
+  separate worker without the CLI or the runner, and has only a workflow-failure callback
+  registry. Auto-queueing (`CLAUDE_REVIEW_AUTO`) is left for later, so the reviewer only
+  runs when an admin asks.
+- **D-19-10: migration id 0015.** Developed as 0016 beside Phase 18; Phase 18's 0015 was not
+  on main when this merged, so this migration took 0015 (down_revision 0014) and Phase 18
+  renumbers after it.

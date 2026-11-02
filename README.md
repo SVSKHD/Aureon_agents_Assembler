@@ -24,6 +24,7 @@ Phase 15 adds the read-only GitHub integration: a PAT-from-env client with redac
 Phase 16 adds issue and PR operations, issue ↔ Spasta task links, `github.tracked_operations` and a minimal approval gate. Merge, force-push, branch protection, branch delete and repo-config changes run only after an admin approves with their password re-entered ([docs/19-github-issues-prs.md](docs/19-github-issues-prs.md)).
 Phase 17 adds GitHub Actions: workflows, runs, jobs and sanitised logs, allowlisted dispatch and re-runs (production workflows behind the approval gate), and an HMAC-verified, idempotent webhook receiver processed by the `github-webhooks` worker into `github.workflow_runs` / `workflow_jobs` ([docs/20-github-actions-webhooks.md](docs/20-github-actions-webhooks.md)).
 Phase 18 adds incidents and self-repair: exceptions, stale heartbeats, Docker health, failed Actions runs and DB/API probes become `agents.incidents`; safe recovery actions run first; then the local Ollama coder model patches the code in a sandboxed worktree, the allowlisted tests gate it, and a PR is opened from `repair/<id>` (never merged automatically; hard blocks on trading, risk, auth, secrets and infra) ([docs/21-self-repair.md](docs/21-self-repair.md)).
+Phase 19 adds an advisory Claude PR reviewer via the local Claude CLI (off unless `CLAUDE_REVIEW_ENABLED`): an availability check, a data-classification filter (sensitive paths and secret-shaped content are never sent; emails, IPs and internal hosts are masked), structured verdicts in `agents.reviews`, and publishing as a COMMENT review that never replaces the approval gate ([docs/22-claude-review.md](docs/22-claude-review.md)).
 
 ## Layout
 
@@ -109,6 +110,8 @@ tests/  scripts/  deploy/  docs/
 | GET | `/api/v1/github/operations` | Tracked GitHub writes and gated operations (admin). |
 | GET | `/api/v1/github/repositories/{owner}/{repo}/actions/workflows\|runs[/{id}[/jobs\|logs]]`, `…/actions/jobs/{id}/logs` | Actions workflows, runs, jobs; logs as sanitised, tail-first text (admin) ([docs/20-github-actions-webhooks.md](docs/20-github-actions-webhooks.md)). |
 | POST | `…/actions/workflows/{workflow}/dispatch`, `…/actions/runs/{id}/rerun\|rerun-failed\|cancel` | Allowlisted dispatch and re-run (production workflows: 202 + approval), cancel; tracked (admin). |
+| POST | `/api/v1/github/repositories/{owner}/{repo}/pulls/{n}/claude-review` | Queue an advisory Claude review of the PR head (202; deduplicated per head sha; BLOCKED without sending anything when the diff is sensitive) (admin) ([docs/22-claude-review.md](docs/22-claude-review.md)). |
+| GET / POST | `/api/v1/reviews[/{id}]`, `/api/v1/reviews/{id}/publish` | Stored reviews; publish one as a GitHub COMMENT review, never APPROVE (admin). |
 | POST | `/api/v1/github/webhooks` | Public GitHub webhook receiver: HMAC-SHA256 verified, idempotent on the delivery id, processed by the worker. |
 | GET / POST | `/api/v1/repairs/status`, `/api/v1/repairs/incidents[/{id}]`, `…/incidents/{id}/resolve\|ignore` | Incidents with their recovery history; resolve or ignore (admin) ([docs/21-self-repair.md](docs/21-self-repair.md)). |
 | GET / POST | `/api/v1/repairs[/{id}]`, `/api/v1/repairs/{id}/cancel\|retry` | Repair tasks with patch and test output; manual repair from an incident, cancel, retry (admin). Merging a repair PR is the approval-gated merge. |

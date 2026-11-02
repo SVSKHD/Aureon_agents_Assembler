@@ -139,15 +139,17 @@ tasks are created `queued` with the reason in `blocked_reason` and are never cla
 ### Hard blocks
 
 A repair whose target or patch touches any of these is `blocked`, with the reason, and
-nothing is pushed:
+nothing is pushed. The list is **shared with the Phase 19 review filter** in
+`app/core/sensitive_paths.py` (`classify_path`). Self-repair calls `classify_repair_path`,
+which adds a few repair-only paths without changing what the review filter flags.
 
-| Area | Paths (case-insensitive) |
-|---|---|
-| Trading / risk | `app/agents/trading/**`, `app/services/trading*.py`, `app/services/paper*.py`, `app/services/research*.py`, anything under `app/` with `risk` in its path |
-| Auth / security | `app/auth/**`, `app/services/auth*`, `app/core/security*`, `app/core/prod_checks*`, `app/services/approvals*` |
-| Secrets | base names `.env*` (not `.env.example`), `*.pem`, `*key*`, `*secret*`, `*credential*`; secret fields in `app/core/config.py`; added token / private-key strings |
-| Infra | `docker-compose*`, `compose*.y*ml`, `Dockerfile*`, `*.dockerfile`, `deploy/**`, `scripts/ops/**`, `alembic/**`, `alembic.ini`, `.github/workflows/**` |
-| The repair system | `app/services/repair*`, `app/services/incidents*`, `app/core/exception_sink*`, `app/agents/coding/**` |
+| Category | From `classify_path` (case-insensitive) | Repair-only additions |
+|---|---|---|
+| `trading_risk` | any path token `trading`, `trade`, `risk`, `broker`, `dhan`, `mt5`, `order`, `execution`, `live`, `paper`, `position`… (so `app/agents/trading/**`, `app/services/trading*.py`, `paper*.py`, risk-policy code) | `app/services/research*` |
+| `auth` | tokens `auth`, `security`, `login`, `password`, `session`, `csrf`, `jwt`, `permissions`, `procsec`, `prod_checks`, `approvals`… (so `app/auth/**`, `app/services/auth*`, `app/core/security*`) | |
+| `secrets` | `.env`, `.env.*` (not `.env.example` and friends), `*.pem`, `*.key`, `*secret*`, `*credential*`, key stores, `secrets/`, `.ssh/`… | base names containing `key`; secret fields changed in `app/core/config.py`; added token / private-key strings (patch content) |
+| `infra` | `Dockerfile*`, `*.dockerfile`, `docker-compose*`, `compose*.y*ml`, `deploy/`, `.github/` (workflows), terraform, systemd, nginx… | `scripts/ops/`, `alembic/`, `alembic.ini` |
+| `repair_system` | | `app/services/repair*`, `app/services/incidents*`, `app/core/exception_sink*`, `app/core/sensitive_paths*`, `app/agents/coding/**` |
 
 The check runs twice: on the targets when the task is created and again before the model is
 called, and on the patch's files after.
@@ -195,7 +197,7 @@ Admin only (`AdminRequired`); POSTs need CSRF; every write is audited.
 | POST | `/api/v1/repairs/{id}/cancel` | Queued/blocked: cancelled at once. Mid-flight: the worker stops before the next step and cleans up |
 | POST | `/api/v1/repairs/{id}/retry` | A new task with `parent_repair_id` (from failed / tests_failed / blocked / cancelled) |
 
-## Tables (migration 0015, additive)
+## Tables (migration 0016, additive)
 
 - `agents.incidents`: id, fingerprint (unique among open incidents), source, severity,
   title, details jsonb (redacted), first_seen, last_seen, count, status, resolved_at,
@@ -233,7 +235,7 @@ Also used: `CODE_REPOS`, `CODE_ALLOWED_COMMANDS`, `CODE_WORKTREE_ROOT`, `CODE_MA
 
 1. Do the manual steps in [manual-setup.md](manual-setup.md#18--self-repair): pull the
    model, check RAM, set `REPAIR_*`, and give the PAT Contents + Pull requests write.
-2. `docker compose run --rm migrate` (0015), then `docker compose up -d api scheduler` and
+2. `docker compose run --rm migrate` (0016), then `docker compose up -d api scheduler` and
    `docker compose --profile coding up -d coding-worker` (the repair loop lives there;
    `--profile github up -d github-webhook-worker` for the Actions hook).
 3. Validate:
@@ -258,7 +260,7 @@ Also used: `CODE_REPOS`, `CODE_ALLOWED_COMMANDS`, `CODE_WORKTREE_ROOT`, `CODE_MA
   and set `INCIDENT_DOCKER_PROBE_SECONDS=0`. Exception capture only writes rows; to silence
   it entirely, roll the code back.
 - **Code:** check out the previous commit and rebuild. The tables can stay (nothing else
-  reads them), or `alembic downgrade 0014` drops only these two tables.
+  reads them), or `alembic downgrade 0015` drops only these two tables.
 - **A repair PR you don't want:** close it on GitHub and delete its `repair/*` branch. Nothing
   was merged.
 

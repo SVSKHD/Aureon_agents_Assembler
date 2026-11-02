@@ -119,11 +119,16 @@ github-webhook-worker`; the webhook, its secret and the Cloudflare Access bypass
 [docs/manual-setup.md](../docs/manual-setup.md#17--github-actions-and-webhooks)): see
 [docs/20-github-actions-webhooks.md](../docs/20-github-actions-webhooks.md#deploy-and-validate).
 
-Incidents and self-repair (migration 0015; the `incident-scan` job runs every minute; the
+Incidents and self-repair (migration 0016; the `incident-scan` job runs every minute; the
 repair loop runs in the opt-in coding worker, `docker compose --profile coding up -d
 coding-worker`; pulling the model, `REPAIR_*` and the PAT permissions are in
 [docs/manual-setup.md](../docs/manual-setup.md#18--self-repair)): see
 [docs/21-self-repair.md](../docs/21-self-repair.md#deploy-and-validate).
+
+Claude review (migration 0015; off unless `CLAUDE_REVIEW_ENABLED=true`; installing and
+authenticating the CLI, and the classification policy, are in
+[docs/manual-setup.md](../docs/manual-setup.md#19--claude-review)): see
+[docs/22-claude-review.md](../docs/22-claude-review.md#deploy-and-validate).
 
 Agents, scheduler, system status and the host-status helper: see
 [docs/05-agents.md](../docs/05-agents.md#deploy-and-validate).

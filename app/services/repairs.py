@@ -31,7 +31,6 @@ import shutil
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +46,7 @@ from app.agents.coding.repos import RepoConfig
 from app.agents.registry import AgentRegistry, AgentSpec
 from app.core.config import Settings
 from app.core.logging import get_logger, scrub
+from app.core.sensitive_paths import classify_repair_path
 from app.integrations.github.client import GitHubClient, GitHubNotFound
 from app.models.agents import Agent
 from app.models.repairs import Incident, RepairTask
@@ -66,40 +66,9 @@ CANCELLABLE = ("queued", "running", "patch_ready", "tests_passed", "blocked")
 
 # --- hard blocks ----------------------------------------------------------------------------
 
-# fnmatch on the lower-cased repo-relative path ("*" also matches "/").
-BLOCKED_PATHS: tuple[tuple[str, str], ...] = (
-    ("app/agents/trading/*", "trading agents"),
-    ("app/services/trading*.py", "trading service"),
-    ("app/services/paper*.py", "paper trading service"),
-    ("app/services/research*.py", "research / signal service"),
-    ("app/*risk*", "risk-policy code"),
-    ("app/auth/*", "authentication"),
-    ("app/services/auth*", "authentication"),
-    ("app/core/security*", "security core"),
-    ("app/core/prod_checks*", "production safety checks"),
-    ("app/services/approvals*", "approval gate"),
-    ("app/services/repair*", "the repair system itself"),
-    ("app/services/incidents*", "the repair system itself"),
-    ("app/core/exception_sink*", "the repair system itself"),
-    ("app/agents/coding/*", "the sandbox"),
-    ("deploy/*", "infrastructure"),
-    ("scripts/ops/*", "infrastructure"),
-    ("alembic/*", "migrations"),
-    ("alembic.ini", "migrations"),
-    (".github/workflows/*", "CI workflows"),
-)
-# Matched against the file's base name.
-BLOCKED_NAMES: tuple[tuple[str, str], ...] = (
-    (".env*", "secrets"),
-    ("*.pem", "secrets"),
-    ("*key*", "secrets"),
-    ("*secret*", "secrets"),
-    ("*credential*", "secrets"),
-    ("docker-compose*", "infrastructure"),
-    ("compose*.y*ml", "infrastructure"),
-    ("dockerfile*", "infrastructure"),
-    ("*.dockerfile", "infrastructure"),
-)
+# The path list is shared with the Phase 19 review filter: app/core/sensitive_paths.py
+# (secrets, infra, trading_risk, auth), plus its repair-only additions (migrations, ops
+# scripts, research, `*key*` names, and the repair system / sandbox itself).
 CONFIG_FILE = "app/core/config.py"
 # A changed line in settings that names a secret field.
 SECRET_FIELD = re.compile(
@@ -114,17 +83,8 @@ SECRET_VALUE = re.compile(
 
 def hard_block(path: str) -> str | None:
     """The reason `path` may never be touched by a repair, or None."""
-    low = path.strip().lower().lstrip("/")
-    for pat, why in BLOCKED_PATHS:
-        if fnmatch(low, pat):
-            return f"hard block ({why}): {path}"
-    base = low.rsplit("/", 1)[-1]
-    if base.endswith(".env.example"):
-        return None
-    for pat, why in BLOCKED_NAMES:
-        if fnmatch(base, pat):
-            return f"hard block ({why}): {path}"
-    return None
+    cat = classify_repair_path(path)
+    return f"hard block ({cat}): {path}" if cat else None
 
 
 def hard_block_any(paths: list[str] | tuple[str, ...]) -> str | None:

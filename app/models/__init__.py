@@ -18,6 +18,7 @@ from app.models.github import (
 )
 from app.models.imaging import GeneratedAsset, ImageJob
 from app.models.repairs import Incident, RepairTask
+from app.models.reviews import Review
 
 __all__ = [
     "Agent",
@@ -44,6 +45,7 @@ __all__ = [
     "Message",
     "ModelInventory",
     "RepairTask",
+    "Review",
     "Role",
     "ScheduledJob",
     "User",

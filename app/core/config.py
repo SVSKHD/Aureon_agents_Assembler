@@ -366,6 +366,36 @@ class Settings(BaseSettings):
     # POST /containers/{name}/restart (the shipped proxy does not: restarts are "manual").
     INCIDENT_DOCKER_PROXY_ALLOWS_RESTART: bool = False
     INCIDENT_RESTART_CONTAINERS: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # --- Claude review (docs/22-claude-review.md). The one non-Ollama AI path: the local
+    # Claude CLI, only when enabled, available, and the diff passes the classification filter.
+    CLAUDE_REVIEW_ENABLED: bool = False
+    # The CLI binary: a name looked up on PATH, or an absolute path.
+    CLAUDE_CLI_PATH: str = "claude"
+    # JSON argv after the binary: non-interactive print mode, JSON output, no tools, no MCP,
+    # no saved session. The prompt always goes on stdin, never in argv.
+    CLAUDE_CLI_ARGS: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: [
+            "-p",
+            "--output-format",
+            "json",
+            "--no-session-persistence",
+            "--strict-mcp-config",
+            "--tools",
+            "",
+        ]
+    )
+    # Env var NAMES (comma list) copied into the CLI's environment for its own auth. Repo
+    # secrets (GITHUB_*, DATABASE_URL, SECRET_KEY, ...) are refused even if listed.
+    CLAUDE_CLI_ENV_PASSTHROUGH: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    CLAUDE_REVIEW_TIMEOUT_SECONDS: int = Field(default=300, ge=10, le=3600)
+    # A diff larger than this is never sent: the review is REVIEW_UNAVAILABLE (too_large).
+    CLAUDE_REVIEW_MAX_DIFF_BYTES: int = Field(default=200 * 1024, ge=1024, le=5 * 1024 * 1024)
+    # Reviews run one at a time; at most this many may wait (more answers 429).
+    CLAUDE_REVIEW_MAX_QUEUE: int = Field(default=5, ge=1, le=100)
+    # Internal domains (comma list) masked as [internal-host] before anything is sent.
+    CLAUDE_REVIEW_INTERNAL_DOMAINS: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["spasta.online"]
+    )
 
     @property
     def github_configured(self) -> bool:
@@ -387,6 +417,7 @@ class Settings(BaseSettings):
         "GITHUB_LOG_HOSTS",
         "GITHUB_DISPATCH_ALLOWLIST",
         "GITHUB_PROD_WORKFLOWS",
+        "CLAUDE_CLI_ARGS",
         mode="before",
     )
     @classmethod
@@ -402,6 +433,7 @@ class Settings(BaseSettings):
                 "GITHUB_LOG_HOSTS",
                 "GITHUB_DISPATCH_ALLOWLIST",
                 "GITHUB_PROD_WORKFLOWS",
+                "CLAUDE_CLI_ARGS",
             )
             return [] if info.field_name in lists else {}
         return v
@@ -423,6 +455,8 @@ class Settings(BaseSettings):
         "RESEARCH_EMA_PERIODS",
         "CODE_PROTECTED_BRANCHES",
         "INCIDENT_RESTART_CONTAINERS",
+        "CLAUDE_CLI_ENV_PASSTHROUGH",
+        "CLAUDE_REVIEW_INTERNAL_DOMAINS",
         mode="before",
     )
     @classmethod

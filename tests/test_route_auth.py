@@ -137,6 +137,11 @@ ADMIN = {
     ("POST", "/api/v1/github/repositories/{owner}/{repo}/actions/runs/{run_id}/rerun"),
     ("POST", "/api/v1/github/repositories/{owner}/{repo}/actions/runs/{run_id}/rerun-failed"),
     ("POST", "/api/v1/github/repositories/{owner}/{repo}/actions/runs/{run_id}/cancel"),
+    # Phase 19 Claude review: admin only (docs/22-claude-review.md).
+    ("POST", "/api/v1/github/repositories/{owner}/{repo}/pulls/{n}/claude-review"),
+    ("GET", "/api/v1/reviews"),
+    ("GET", "/api/v1/reviews/{review_id}"),
+    ("POST", "/api/v1/reviews/{review_id}/publish"),
 }
 
 SAFE = {"GET", "HEAD", "OPTIONS"}
