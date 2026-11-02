@@ -12,6 +12,7 @@ from redis.asyncio import Redis
 
 from app.agents.ollama.client import OllamaClient
 from app.agents.ollama.limiter import GenerationLimiter
+from app.agents.registry import OLLAMA, AgentRegistry, Heartbeat
 from app.api.router import api_router
 from app.core.config import Environment, Settings, get_settings
 from app.core.logging import configure_logging, get_logger
@@ -53,11 +54,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             settings.OLLAMA_MAX_QUEUE,
             settings.OLLAMA_QUEUE_RETRY_AFTER,
         )
+        registry = AgentRegistry(app.state.sessionmaker)
+        app.state.registry = registry
+        app.state.agent_paused = {}
+        limiter = app.state.chat_limiter
+
+        def ollama_state() -> tuple[str, dict[str, object]]:
+            details = {
+                "running": limiter.running,
+                "admitted": limiter.admitted,
+                "capacity": limiter.capacity,
+            }
+            return ("busy" if limiter.running else "idle", details)
+
+        def ollama_paused(paused: bool) -> None:
+            app.state.agent_paused[OLLAMA.id] = paused
+
+        heartbeat = Heartbeat(
+            registry, OLLAMA, settings.AGENT_HEARTBEAT_SECONDS, ollama_state, ollama_paused
+        )
+        heartbeat.start()  # registers in the background; a DB outage doesn't block startup
         log.info("startup", env=settings.ENV.value)
         try:
             yield
         finally:
             log.info("shutdown")
+            await heartbeat.stop()
             await ollama.aclose()
             await http.aclose()
             await redis.aclose()

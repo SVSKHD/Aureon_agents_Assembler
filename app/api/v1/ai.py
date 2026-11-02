@@ -127,6 +127,10 @@ async def chat(
             status_code=status.HTTP_404_NOT_FOUND,
         )
 
+    if request.app.state.agent_paused.get("ollama"):
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "the ollama agent is paused by an admin"
+        )
     limiter: GenerationLimiter = request.app.state.chat_limiter
     try:
         ticket = limiter.admit()
@@ -165,6 +169,7 @@ async def chat(
             ticket=ticket,
             timeout=settings.CHAT_TIMEOUT_SECONDS,
             heartbeat=settings.CHAT_HEARTBEAT_SECONDS,
+            registry=request.app.state.registry,
         )
     except BaseException:
         ticket.release()

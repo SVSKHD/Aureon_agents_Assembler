@@ -112,6 +112,49 @@ services:
     profiles: [imaging]
     restart: unless-stopped
 
+  # Scheduler worker (Phase 5): cron jobs from agents.scheduled_jobs, retries + backoff.
+  scheduler:
+    image: aureon-agentic:${IMAGE_TAG:-dev}
+    container_name: aureon-scheduler
+    env_file: .env
+    environment:
+      ENV: ${ENV:-prod}
+    command: ["python", "-m", "app.workers.scheduler"]
+    networks: [aureon, private-ai]
+    # NO ports.
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    stop_grace_period: 30s
+    depends_on:
+      api: { condition: service_started }
+    restart: unless-stopped
+
+  # Read-only Docker API for GET /api/system/status. The API never mounts docker.sock
+  # (any socket mount, even :ro, is root-equivalent). This proxy allows only GET
+  # /containers/*; every write (POST/DELETE) and every other endpoint is refused.
+  # Pin to a tag you have verified exists before deploying.
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    container_name: aureon-docker-proxy
+    environment:
+      CONTAINERS: "1"
+      POST: "0"
+      IMAGES: "0"
+      NETWORKS: "0"
+      VOLUMES: "0"
+      EXEC: "0"
+      INFO: "0"
+      EVENTS: "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [aureon]   # internal only; NO ports
+    read_only: true
+    tmpfs: [/run, /tmp]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
   # One-shot: `docker compose run --rm migrate`
   migrate:
     image: aureon-agentic:${IMAGE_TAG:-dev}

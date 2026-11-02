@@ -35,6 +35,7 @@ from app.agents.imaging.generator import (
     build_generator,
     png_dimensions,
 )
+from app.agents.registry import IMAGING, AgentRegistry, Heartbeat
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging, get_logger
 from app.db.session import build_engine, build_sessionmaker
@@ -45,6 +46,12 @@ from app.services.imaging import output_path
 log = get_logger("worker.imaging")
 
 LOCK_KEY = "aureon:imaging:worker-lock"
+RUN_STATUS = {
+    "done": "succeeded",
+    "failed": "failed",
+    "cancelled": "cancelled",
+    "requeue": "cancelled",
+}
 LOCK_TTL = 30
 
 
@@ -58,11 +65,15 @@ class ImagingWorker:
         settings: Settings,
         maker: async_sessionmaker[AsyncSession],
         generator: ImageGenerator,
+        registry: AgentRegistry | None = None,
     ) -> None:
         self.settings = settings
         self.maker = maker
         self.generator = generator
+        self.registry = registry
         self.stopping = asyncio.Event()
+        self.paused = False
+        self.current_job: uuid.UUID | None = None
 
     # --- job state ------------------------------------------------------------------
 
@@ -151,6 +162,18 @@ class ImagingWorker:
         progress = {"now": 0, "saved": 0}
         started = time.monotonic()
         log.info("job_started", job_id=str(job.id), attempt=job.attempts)
+        self.current_job = job.id
+        run_id = await self._registry_call(
+            "start_run",
+            IMAGING.id,
+            "image_job",
+            attempt=job.attempts,
+            details={
+                "job_id": str(job.id),
+                "steps": job.steps,
+                "size": f"{job.width}x{job.height}",
+            },
+        )
 
         def on_progress(pct: int) -> None:
             progress["now"] = max(progress["now"], min(99, pct))
@@ -199,12 +222,39 @@ class ImagingWorker:
             await self._set(job.id, status="queued", progress=0, started_at=None)
         elif outcome != "done":
             await self._set(job.id, status=outcome, error=error, finished_at=func.now())
+        self.current_job = None
         log.info(
             "job_finished",
             job_id=str(job.id),
             outcome=outcome,
             seconds=round(time.monotonic() - started, 1),
         )
+        if isinstance(run_id, int):
+            status = RUN_STATUS[outcome]
+            await self._registry_call(
+                "finish_run",
+                run_id,
+                status,
+                error=error or ("re-queued on shutdown" if outcome == "requeue" else None),
+            )
+            await self._registry_call(
+                "log",
+                IMAGING.id,
+                "error" if outcome == "failed" else "info",
+                f"image job {outcome}",
+                run_id=run_id,
+                job_id=str(job.id),
+                error=error,
+            )
+
+    async def _registry_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        if self.registry is None:
+            return None
+        try:
+            return await getattr(self.registry, method)(*args, **kwargs)
+        except Exception as exc:  # the registry must never break image generation
+            log.warning("registry_call_failed", method=method, error=type(exc).__name__)
+            return None
 
     async def _store(self, job: ImageJob, tmp: Path, final: Path, seconds: float) -> None:
         if not await asyncio.to_thread(tmp.is_file):
@@ -242,7 +292,7 @@ class ImagingWorker:
 
     async def serve(self, redis: Redis) -> None:
         while not self.stopping.is_set():
-            while not self.stopping.is_set() and await self.run_once():
+            while not self.stopping.is_set() and not self.paused and await self.run_once():
                 pass
             with contextlib.suppress(asyncio.TimeoutError):
                 await redis.blpop([self.settings.IMAGE_QUEUE_KEY], timeout=5)
@@ -277,7 +327,27 @@ async def main() -> int:
         await redis.aclose()
         await engine.dispose()
         return 1
-    worker = ImagingWorker(settings, build_sessionmaker(engine), generator)
+    maker = build_sessionmaker(engine)
+    worker = ImagingWorker(settings, maker, generator, AgentRegistry(maker))
+
+    def state() -> tuple[str, dict[str, Any]]:
+        busy = worker.current_job is not None
+        return (
+            "busy" if busy else "idle",
+            {
+                "current_job": str(worker.current_job) if busy else None,
+                "generator": settings.IMAGE_GENERATOR,
+            },
+        )
+
+    def on_paused(p: bool) -> None:
+        worker.paused = p
+
+    assert worker.registry is not None
+    heartbeat = Heartbeat(
+        worker.registry, IMAGING, settings.AGENT_HEARTBEAT_SECONDS, state, on_paused
+    )
+    heartbeat.start()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, worker.stopping.set)
@@ -294,6 +364,7 @@ async def main() -> int:
             await serve
     finally:
         keeper.cancel()
+        await heartbeat.stop()
         await redis.eval(
             "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) "
             "else return 0 end",

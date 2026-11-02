@@ -31,12 +31,20 @@ from starlette.types import Receive, Scope, Send
 
 from app.agents.ollama.client import ModelInfo, OllamaClient, OllamaError
 from app.agents.ollama.limiter import Ticket
+from app.agents.registry import AgentRegistry
 from app.core.logging import get_logger
 from app.models.ai import Conversation, Message, ModelInventory
 
 log = get_logger(__name__)
 
 TITLE_LEN = 80
+RUN_STATUS = {
+    "complete": "succeeded",
+    "cancelled": "cancelled",
+    "error": "failed",
+    "timeout": "failed",
+    "running": "cancelled",
+}
 
 
 # --- storage --------------------------------------------------------------------------
@@ -180,7 +188,9 @@ class ChatStream:
         ticket: Ticket,
         timeout: float,
         heartbeat: float,
+        registry: AgentRegistry | None = None,
     ) -> None:
+        self.registry = registry
         self.job = job
         self.ollama = ollama
         self.maker = maker
@@ -259,6 +269,23 @@ class ChatStream:
             status=t.status,
             chars=sum(map(len, t.parts)),
         )
+        if self.registry is not None:
+            try:  # best-effort: never fail the chat over the registry
+                await self.registry.record_run(
+                    "ollama",
+                    "chat",
+                    RUN_STATUS[t.status],
+                    int((time.monotonic() - self._started) * 1000),
+                    error=t.error,
+                    details={
+                        "conversation_id": str(self.job.conversation_id),
+                        "message_id": msg.id,
+                        "model": self.job.model,
+                        "completion_tokens": t.completion_tokens,
+                    },
+                )
+            except Exception as exc:
+                log.warning("agent_run_record_failed", error=type(exc).__name__)
         return msg.id
 
     async def events(self) -> AsyncGenerator[str, None]:
