@@ -3,9 +3,9 @@
 Self-hosted backend for Spasta: a FastAPI modular monolith on PostgreSQL 17, Redis and a local
 Ollama. It is offline-first, has no external AI APIs and does no live trading.
 
-**Status: Phases 1, 2 (auth), 3, 4, 5 (registry, scheduler, monitoring) and Trading Phases A, B
-(Dhan, read-only), C (MT5 bot, read-only) and D (research agents) are done; finance is blocked on the live schema, the image pipeline hookup is pending the
-/opt/image-agent inspection, and the Phase 5 coding agent comes in its own PR.** Phase 1 provides
+**Status: Phases 1, 2 (auth), 3, 4, 5 (registry, scheduler, monitoring, coding agent) and Trading
+Phases A, B (Dhan, read-only), C (MT5 bot, read-only) and D (research agents) are done; finance is
+blocked on the live schema and the image pipeline hookup is pending the /opt/image-agent inspection.** Phase 1 provides
 health, config, logging, async DB and Alembic. Phase 2 adds cookie-session auth with CSRF,
 rate limiting and an audit log ([docs/02-auth-and-finance.md](docs/02-auth-and-finance.md)).
 Phase 3 adds local-Ollama chat over SSE with stored conversations ([docs/03-ollama.md](docs/03-ollama.md)).
@@ -39,7 +39,8 @@ app/
   agents/trading/mt5/ MT5 bot status export reader + MT5Adapter (no MT5 calls)
   agents/research/   indicators, strategies, backtest engine, AI explainer (pandas/numpy)
   workers/research.py research agents (own process, bounded queues)
-  agents/coding/     (later phase)
+  agents/coding/     coding agent guards: repo allowlist, path safety, command allowlist, git, patches
+  workers/coding.py  coding worker (worktrees + allowlisted tests; never pushes)
 alembic/             async migrations (version table: public.aureon_alembic_version)
 tests/  scripts/  deploy/  docs/
 ```
@@ -80,6 +81,8 @@ tests/  scripts/  deploy/  docs/
 | GET | `/api/trading/indicators`, `/api/trading/risk-decisions`, `/api/trading/ai-analyses` | Stored analysis output. |
 | POST | `/api/trading/signals/{id}/explain`, `/api/trading/backtests/{id}/explain` | Queue an Ollama explanation (explanation only). |
 | GET | `/api/trading/stream` | SSE: signals, risk decisions, backtests, agent state, Dhan quotes ([docs/14-frontend.md](docs/14-frontend.md)). |
+| GET | `/api/repos`, `/api/repos/{name}/tree\|file\|commits\|branches` | Allowlisted local repos, read from git (admin). |
+| POST / GET | `/api/code/analyze`, `/api/code/tasks[/{id}[/diff\|approve\|reject]]` | Coding agent: explain code; patch in an isolated worktree, test, approve (admin, audited; never pushes). |
 | GET | `/api/docs` | Swagger UI (disabled when `ENV=prod`). |
 
 ## Configuration
@@ -144,6 +147,7 @@ Every variable is listed in [.env.example](.env.example).
 | `RESEARCH_*` / `RISK_*` / `BACKTEST_*` | see .env.example | Research worker cadence, queues, indicators; risk assumptions; backtest limits. |
 | `RESEARCH_AI_MODEL` | unset | Local Ollama model for explanations; unset = explanations off. |
 | `TRADING_STREAM_POLL_SECONDS` / `_HEARTBEAT_SECONDS` / `_MAX_SECONDS` | `2` / `15` / `1800` | Trading SSE stream cadence and lifetime. |
+| `CODE_REPOS` / `CODE_ALLOWED_COMMANDS` / `CODE_MODEL` | unset / built-in list / unset | Coding agent repo allowlist, exact-argv command allowlist, local Ollama coding model. |
 | `PRIVATE_AI_NETWORK` | required (compose) | Existing Docker network shared with Postgres/Ollama. |
 
 ## Development

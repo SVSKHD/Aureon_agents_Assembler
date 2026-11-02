@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from typing import Any
 
@@ -17,6 +18,7 @@ from sqlalchemy import (
     SmallInteger,
     String,
     Text,
+    Uuid,
     func,
     text,
 )
@@ -126,3 +128,47 @@ class ScheduledJob(Base):
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class CodeTask(Base):
+    """A coding-agent job: `analyze` (explain code, read-only) or `change` (a patch in an
+    isolated worktree, tested, then waiting for an admin's approval)."""
+
+    __tablename__ = "code_tasks"
+    __table_args__ = (
+        CheckConstraint("kind IN ('analyze','change')", name="kind"),
+        CheckConstraint(
+            "status IN ('queued','running','ready','failed','approved','rejected')",
+            name="status",
+        ),
+        Index("ix_agents_code_tasks_status_created_at", "status", "created_at"),
+        {"schema": "agents"},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    kind: Mapped[str] = mapped_column(String(8))
+    repo: Mapped[str] = mapped_column(String(64))
+    title: Mapped[str] = mapped_column(String(200))
+    instruction: Mapped[str] = mapped_column(Text)
+    paths: Mapped[list[str]] = mapped_column(JSONB, server_default=text("'[]'::jsonb"))
+    status: Mapped[str] = mapped_column(String(10), server_default=text("'queued'"))
+    base_ref: Mapped[str] = mapped_column(String(100))
+    base_sha: Mapped[str | None] = mapped_column(String(64))
+    branch: Mapped[str | None] = mapped_column(String(100))
+    worktree: Mapped[str | None] = mapped_column(Text)
+    commit_sha: Mapped[str | None] = mapped_column(String(64))
+    model: Mapped[str | None] = mapped_column(String(200))
+    # analyze: {"answer"}; change: {"explanation", "files", "diff_stat"}
+    result: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("'{}'::jsonb"))
+    tests: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, server_default=text("'[]'::jsonb"))
+    error: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("core.users.id", ondelete="SET NULL")
+    )
+    decided_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("core.users.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

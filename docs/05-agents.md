@@ -1,9 +1,8 @@
 # 05 — Agent registry, scheduler and system monitoring
 
 **Status:** registry, heartbeats, runs and logs, the scheduler worker and `/api/system/status`
-are done (revision `0005`). The **restricted coding agent** (Prompt 6 §5–8) is **not in this
-change**. It gets its own PR because it creates git worktrees and runs allowlisted test commands,
-which deserves separate review.
+are done (revision `0005`). The **restricted coding agent** (Prompt 6 §5–8) is done too (revision
+`0008`); see [Coding agent](#coding-agent) below.
 
 ## Agents
 
@@ -12,7 +11,8 @@ which deserves separate review.
 | `ollama` | API | at startup, in the background | a chat generation is running | `POST /api/chat` returns 503 (this process: immediately; others: within one heartbeat) |
 | `imaging` | `imaging-worker` | at startup | an image job is running | stops claiming new jobs; the running job finishes; `POST /images/generate` still queues |
 | `scheduler` | `scheduler` | at startup, before seeding jobs | a scheduled task is running | no scheduled job starts |
-| `coding`, `trading-adapter` | later phases | when built | — | — |
+| `coding` | `coding-worker` (profile `coding`) | at startup | a code task is running | stops claiming new tasks; the running task finishes |
+| trading agents | Dhan feed, MT5 sync, research worker | see docs/11–13 | — | — |
 
 - **Heartbeats:** each process heartbeats every `AGENT_HEARTBEAT_SECONDS` (15 s), recording
   its state (`idle`, `busy`, `error` or `stopped`) and a small `details` object. The same call
@@ -108,7 +108,7 @@ registering a task and a default row.
   `HOST_STATUS_MAX_AGE_SECONDS` (120 s) is reported as `stale`. The unit runs sandboxed:
   no network, a read-only system, and writes only to the status directory.
 
-## Tables (migration `0005`, additive, in schema `agents`)
+## Tables (migrations `0005` and `0008`, additive, in schema `agents`)
 
 | Table | Key columns |
 | --- | --- |
@@ -117,7 +117,82 @@ registering a task and a default row.
 | `agents.agent_logs` | `id`, `agent_id` →, `run_id` → (on delete set null), `level` (CHECK), `message`, `context` JSONB, `created_at`; index on (`agent_id`, `created_at`) |
 | `agents.scheduled_jobs` | `id` (slug) PK, `agent_id` →, `task`, `cron`, `paused`, `max_retries`, `retry_backoff_seconds`, `timeout_seconds`, `attempt`, `consecutive_failures`, `next_run_at`, `last_run_at`, `last_status`, `last_error`, `locked_until` |
 
-The downgrade to `0004` drops only these four tables.
+| `agents.code_tasks` (`0008`) | `id` uuid PK, `kind` (analyze/change), `repo`, `title`, `instruction`, `paths`, `status` (queued/running/ready/failed/approved/rejected), `base_ref`, `base_sha`, `branch`, `worktree`, `commit_sha`, `model`, `result` JSONB, `tests` JSONB, `error`, `created_by` →, `decided_by` →, timestamps |
+
+The downgrade to `0004` drops only the four Phase 5 tables; `alembic downgrade 0007` drops only `agents.code_tasks`.
+
+## Coding agent
+
+A restricted agent that reads your allowlisted repos and makes **reviewed** changes. Every
+endpoint is **admin-only** (`AdminRequired`); writes also need CSRF and are audited.
+
+| Endpoint | What |
+|---|---|
+| `GET /api/repos` | the allowlisted repos: base branch, head, branch count, test commands |
+| `GET /api/repos/{name}/tree?ref=&path=` | directory listing from git (`.env`, keys and `.git` hidden) |
+| `GET /api/repos/{name}/file?ref=&path=` | one file from git, capped at `CODE_MAX_FILE_BYTES`; binaries are flagged, not sent |
+| `GET /api/repos/{name}/commits`, `/branches` | history and branches |
+| `POST /api/code/analyze` | queue a question about the code (local Ollama, read-only); the answer lands in the task |
+| `POST /api/code/tasks` | queue a change (below) |
+| `GET /api/code/tasks[/{id}]`, `GET /api/code/tasks/{id}/diff` | status, test results, the diff |
+| `POST /api/code/tasks/{id}/approve` | keep the change on its branch, optionally also as `feature/<name>` or `fix/<name>` |
+| `POST /api/code/tasks/{id}/reject` | delete the task branch and its worktree |
+
+### What a change task does
+
+1. **Isolated worktree:** `git worktree add -b aureon/task-<id>` under `CODE_WORKTREE_ROOT`,
+   from the repo's base branch. The main checkout is never modified (tests check this).
+2. **Model:** the local Ollama `CODE_MODEL` sees a file listing plus the files you name in
+   `paths`, and must answer with one unified diff.
+3. **Patch checks before anything is applied:**
+   - each path: no absolute paths, no `..`, never `.git`, `.env*`, keys, `secrets/`
+   - no binary patches, symlinks, submodules or executable modes; size ≤ `CODE_MAX_PATCH_BYTES`
+   - each path re-checked **inside the worktree with symlinks resolved**, so a patch cannot
+     write through `node_modules` → the main checkout
+   - `git apply --check`
+4. **Apply + commit:** only in the worktree, committing exactly the patch's files, as
+   "Aureon coding agent". Git hooks never run (`core.hooksPath` points nowhere), commits skip
+   hooks (`--no-verify`) and `protocol.allow=never` blocks any fetch or push.
+5. **Tests:** the repo's `tests` commands. Each must be an **exact argv match** in
+   `CODE_ALLOWED_COMMANDS`, run **without a shell**, in the worktree, with a scrubbed
+   environment (only `PATH`, `LANG`, `TZ`, a temp `HOME`, `CI=1`), a hard timeout that kills
+   the process group, and capped output. The repo's `node_modules` / `.venv` are symlinked in
+   (`link`) so tests run offline; they are never committed.
+6. **Review:** the task is `ready` with its diff and test results. **Approve** needs every
+   test to pass and never accepts a protected branch (`CODE_PROTECTED_BRANCHES`: main,
+   master, dev01, …). It keeps `aureon/task-<id>` and can add a `feature/…` name. **Nothing is
+   pushed, merged into a protected branch, or deployed.** Pushing and opening a PR stay with you.
+
+A crash mid-task marks it failed and removes its worktree on the next start.
+
+### Configure
+
+```bash
+mkdir -p /opt/private-ai/repos && cd /opt/private-ai/repos
+git clone https://github.com/SVSKHD/ASTRA-FRONTEND.git astra-frontend
+git -C astra-frontend switch dev01
+(cd astra-frontend && npm ci)          # node_modules the tests will reuse
+nano /opt/private-ai/aureon/.env       # CODE_REPOS, CODE_MODEL (see .env.example)
+docker exec <ollama-container> ollama pull qwen2.5-coder:7b
+docker compose run --rm migrate        # 0008: agents.code_tasks (new table only)
+docker compose --profile coding up -d --build coding-worker
+curl -sS -b $J $B/api/repos | python3 -m json.tool
+curl -sS -b $J -H "x-csrf-token: $CSRF" -H 'content-type: application/json' $B/api/code/analyze \
+  -d '{"repo":"astra-frontend","question":"What does src/api/client.ts do?","paths":["src/api/client.ts"]}'
+```
+
+### Risks to know
+
+- **Tests run repo code.** `npm test` or `pytest` executes code from the repo and the
+  model's patch. The environment is scrubbed, but the process runs as the same user as the
+  worker and could read the worker's own environment (`/proc`), which includes `DATABASE_URL`.
+  Only allowlist repos you own, and review the diff before approving.
+- **Repos are read-write inside `coding-worker`,** because git keeps worktrees and branches in
+  `.git`. The agent itself only writes `aureon/task-*` and approved `feature/*` / `fix/*` refs.
+- **Partial replacement for the GitHub proxy:** `/api/repos/*` covers trees, files, commits and
+  branches of local checkouts. GitHub issues, pull requests and comments are not served,
+  because Aureon makes no external API calls. Stage 5 of the frontend migration uses these
+  endpoints for the code browser only.
 
 ## Deploy and validate
 

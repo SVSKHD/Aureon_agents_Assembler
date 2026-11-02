@@ -43,7 +43,7 @@ docker network inspect aureon -f '{{(index .IPAM.Config 0).Gateway}}'
 
 ```bash
 docker compose build
-docker compose run --rm migrate        # 0001 version table; 0002 core.*/audit.*; 0003 ai.*; 0004 agents.image_*; 0005 agents registry/scheduler; 0006 trading.*/dhan.*/mt5.*; 0007 trading.indicator_values (new tables only)
+docker compose run --rm migrate        # 0001 version table; 0002 core.*/audit.*; 0003 ai.*; 0004 agents.image_*; 0005 agents registry/scheduler; 0006 trading.*/dhan.*/mt5.*; 0007 trading.indicator_values; 0008 agents.code_tasks (new tables only)
 docker compose up -d                   # api, redis, scheduler, docker-proxy
 docker compose run --rm -it migrate python -m app.auth.bootstrap --email you@example.com
 ```
@@ -82,6 +82,9 @@ MT5 bot (read-only status export, sync job): see [docs/12-mt5-adapter.md](../doc
 
 Frontend routing (nginx `/api/*` → 127.0.0.1:8000) and the trading stream: see
 [docs/14-frontend.md](../docs/14-frontend.md).
+
+Coding agent (migration 0008, opt-in `coding-worker`): see
+[docs/05-agents.md](../docs/05-agents.md#coding-agent).
 
 Research agents (migration 0007, opt-in worker): see [docs/13-research-agents.md](../docs/13-research-agents.md#deploy-and-validate).
 

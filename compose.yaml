@@ -177,6 +177,40 @@ services:
     profiles: [research]
     restart: unless-stopped
 
+  # Coding agent (Phase 5b): patch tasks in isolated git worktrees, allowlisted test commands,
+  # never pushes or deploys. Opt-in: `docker compose --profile coding up -d --build`.
+  # CODE_REPOS paths must live under CODE_REPOS_ROOT (mounted read-write at the same path,
+  # because git records worktrees and task branches inside each repo's .git).
+  coding-worker:
+    build:
+      context: .
+      target: coding
+    image: aureon-coding:${IMAGE_TAG:-dev}
+    container_name: aureon-coding
+    env_file: .env
+    environment:
+      ENV: ${ENV:-prod}
+    command: ["python", "-m", "app.workers.coding"]
+    volumes:
+      - *data-root                      # worktrees under /mnt/spasta-data/code-worktrees
+      - type: bind
+        source: ${CODE_REPOS_ROOT:-/opt/private-ai/repos}
+        target: ${CODE_REPOS_ROOT:-/opt/private-ai/repos}
+        bind: { create_host_path: false }
+    networks: [aureon, private-ai]      # Postgres + Ollama only
+    # NO ports.
+    read_only: true
+    tmpfs: ["/tmp:size=1g"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    cpus: "2.0"
+    mem_limit: 3g
+    stop_grace_period: 30s
+    depends_on:
+      mount-check: { condition: service_completed_successfully }
+    profiles: [coding]
+    restart: unless-stopped
+
   # Read-only Docker API for GET /api/system/status. The API never mounts docker.sock
   # (any socket mount, even :ro, is root-equivalent). This proxy allows only GET
   # /containers/*; every write (POST/DELETE) and every other endpoint is refused.
