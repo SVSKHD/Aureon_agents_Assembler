@@ -58,6 +58,8 @@ def production_problems(settings: Settings) -> list[str]:
         check_data_root(settings)
     except RuntimeError as exc:
         problems.append(f"data root: {exc}")
+    if bool((settings.CF_ACCESS_TEAM_DOMAIN or "").strip()) != bool(settings.CF_ACCESS_AUD):
+        problems.append("CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD must be set together")
     return problems
 
 
