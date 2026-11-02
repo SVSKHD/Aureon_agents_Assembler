@@ -267,3 +267,57 @@ See [20-github-actions-webhooks.md](20-github-actions-webhooks.md).
    `github-webhooks`.
 7. **Secret rotation:** change `.env` and the GitHub webhook secret together, restart the
    API, and redeliver any 401 deliveries from GitHub's Recent Deliveries page.
+
+## 19 — Claude review
+
+See [22-claude-review.md](22-claude-review.md). Optional: without these steps every review is
+REVIEW_UNAVAILABLE and nothing is sent anywhere.
+
+1. **Install the Claude CLI where the API runs.** This is not added to the image by default.
+   - **On the host** (when the API runs on the host), as an admin: install Node 18+ and then
+     `npm install -g @anthropic-ai/claude-code` (or the vendor's native installer). Set
+     `CLAUDE_CLI_PATH` to the absolute path if the service user's PATH does not include it.
+   - **In the API image** (the usual compose setup): add an optional build arg to the
+     `runtime` stage of the Dockerfile, for example:
+     ```dockerfile
+     ARG INSTALL_CLAUDE_CLI=false
+     USER root
+     RUN if [ "$INSTALL_CLAUDE_CLI" = "true" ]; then \
+           apt-get update && apt-get install -y --no-install-recommends nodejs npm ca-certificates \
+           && npm install -g @anthropic-ai/claude-code && rm -rf /var/lib/apt/lists/*; fi
+     USER aureon
+     ```
+     Then build with `docker compose build --build-arg INSTALL_CLAUDE_CLI=true api`. Pin the
+     CLI version (`@anthropic-ai/claude-code@<version>`) and re-check `claude --help` after
+     upgrades (flags in `CLAUDE_CLI_ARGS`).
+   - The `aureon` user has no home directory. The CLI needs a writable `HOME` for its config:
+     give the api service `HOME=/var/lib/aureon-claude` plus a small named volume mounted
+     there (owned by UID 10001), or a tmpfs if you authenticate by env var only. The API
+     container's network must allow outbound HTTPS to the vendor's API.
+2. **Authenticate non-interactively, as the service user.** Pick one:
+   - an OAuth token: run `claude setup-token` once on a machine with a browser, store the
+     token in the server's `.env` as `CLAUDE_CODE_OAUTH_TOKEN=…`, and set
+     `CLAUDE_CLI_ENV_PASSTHROUGH=CLAUDE_CODE_OAUTH_TOKEN`
+   - an API key: put `ANTHROPIC_API_KEY=…` in `.env` and set
+     `CLAUDE_CLI_ENV_PASSTHROUGH=ANTHROPIC_API_KEY`
+   - an interactive login stored in `$HOME/.claude` of the service user (run `claude` once
+     as that user, inside the container with the HOME volume above); no passthrough needed
+
+   Only the names in `CLAUDE_CLI_ENV_PASSTHROUGH` reach the CLI. Names like `GITHUB_*`,
+   `DATABASE_*`, `SECRET*` and `REDIS*` are always refused. Never commit the token.
+3. **Verify** as the service user: `docker compose exec api claude --version` (or
+   `sudo -u <service-user> claude --version` on the host) must print a version and exit 0.
+   A real check: `echo 'Reply with {"ok":true}' | docker compose exec -T api claude -p
+   --output-format json --tools ""` should print a JSON result.
+4. **Enable it:** `CLAUDE_REVIEW_ENABLED=true` in `.env`, then `docker compose run --rm migrate`
+   (0015) and `docker compose up -d api`. Availability is cached for 5 minutes, so restart
+   the API after fixing the CLI to see the change at once.
+5. **Know the data-classification policy** before enabling it:
+   - nothing is sent for a PR that touches secrets, infra, trading/risk/auth paths, or that
+     contains secret-shaped strings (keys, tokens, `password=`, `.env` values, high-entropy
+     literals). Those reviews come back BLOCKED with the reasons.
+   - emails, IPv4 addresses and `*.spasta.online` host names are masked in what is sent. Add
+     other internal domains to `CLAUDE_REVIEW_INTERNAL_DOMAINS`.
+   - diffs over `CLAUDE_REVIEW_MAX_DIFF_BYTES` (200 KiB) are never sent.
+   - the review is advisory: it is published only as a COMMENT, and merges still need an
+     admin approval with the password re-entered.

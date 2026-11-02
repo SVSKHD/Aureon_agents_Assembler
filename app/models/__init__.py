@@ -17,6 +17,7 @@ from app.models.github import (
     GitHubWorkflowRun,
 )
 from app.models.imaging import GeneratedAsset, ImageJob
+from app.models.reviews import Review
 
 __all__ = [
     "Agent",
@@ -41,6 +42,7 @@ __all__ = [
     "ImageJob",
     "Message",
     "ModelInventory",
+    "Review",
     "Role",
     "ScheduledJob",
     "User",
