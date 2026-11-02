@@ -5,6 +5,7 @@ from app.models.agents import Agent, AgentLog, AgentRun, ScheduledJob
 from app.models.ai import Conversation, Message, ModelInventory
 from app.models.auth import AuditEvent, Role, User, UserSession
 from app.models.finance import FinanceAttachment, FinanceIdentity, FinanceTombstone
+from app.models.github import GitHubConnection, GitHubRepository, GitHubSyncRun
 from app.models.imaging import GeneratedAsset, ImageJob
 
 __all__ = [
@@ -17,6 +18,9 @@ __all__ = [
     "FinanceIdentity",
     "FinanceTombstone",
     "GeneratedAsset",
+    "GitHubConnection",
+    "GitHubRepository",
+    "GitHubSyncRun",
     "ImageJob",
     "Message",
     "ModelInventory",
