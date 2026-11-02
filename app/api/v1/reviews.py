@@ -81,7 +81,7 @@ async def request_review(r: RepoDep, n: Number, body: ReviewRequest | None = Non
         number=n,
         head_sha=head,
         base_sha=base,
-        requested_by=actor.user_id,
+        requested_by=r.admin.user.id,
         force=force,
     )
     audit.record(

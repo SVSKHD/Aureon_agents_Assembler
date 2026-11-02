@@ -115,6 +115,17 @@ ADMIN = {
     ("GET", "/api/v1/approvals/{approval_id}"),
     ("POST", "/api/v1/approvals/{approval_id}/approve"),
     ("POST", "/api/v1/approvals/{approval_id}/deny"),
+    # Phase 18 incidents + self-repair: admin only (docs/21-self-repair.md).
+    ("GET", "/api/v1/repairs/status"),
+    ("GET", "/api/v1/repairs/incidents"),
+    ("GET", "/api/v1/repairs/incidents/{incident_id}"),
+    ("POST", "/api/v1/repairs/incidents/{incident_id}/resolve"),
+    ("POST", "/api/v1/repairs/incidents/{incident_id}/ignore"),
+    ("GET", "/api/v1/repairs"),
+    ("GET", "/api/v1/repairs/{repair_id}"),
+    ("POST", "/api/v1/repairs"),
+    ("POST", "/api/v1/repairs/{repair_id}/cancel"),
+    ("POST", "/api/v1/repairs/{repair_id}/retry"),
     # Phase 17 Actions: admin only (docs/20-github-actions-webhooks.md).
     ("GET", "/api/v1/github/repositories/{owner}/{repo}/actions/workflows"),
     ("GET", "/api/v1/github/repositories/{owner}/{repo}/actions/runs"),

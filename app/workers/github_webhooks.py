@@ -13,7 +13,8 @@
   issues, push and ping are recorded. Failures retry with exponential backoff, and an event
   is marked `failed` after GITHUB_WEBHOOK_MAX_ATTEMPTS.
 - `on_workflow_failed(fn)` (re-exported from app.services.github_webhooks) is the hook Phase
-  18 (self-repair) subscribes to. Nothing subscribes yet.
+  18 (self-repair) subscribes to: `incidents.subscribe_actions` records each failed run as
+  an `actions` incident (docs/21-self-repair.md).
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging, get_logger
 from app.db.session import build_engine, build_sessionmaker
 from app.services import github_webhooks as hooks
+from app.services import incidents
 from app.services.github_webhooks import WorkflowFailure, on_workflow_failed
 
 log = get_logger("worker.github_webhooks")
@@ -114,6 +116,8 @@ async def main() -> int:
     redis = Redis.from_url(settings.REDIS_URL)
     worker = WebhookWorker(settings, maker, redis)
     registry = AgentRegistry(maker)
+    incidents.subscribe_actions(maker)
+    flusher = incidents.start_exception_flusher(maker, settings, "github-webhook-worker")
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -150,6 +154,7 @@ async def main() -> int:
                     with contextlib.suppress(TimeoutError):
                         await asyncio.wait_for(stop.wait(), settings.GITHUB_WEBHOOK_POLL_SECONDS)
     finally:
+        await incidents.stop_exception_flusher(flusher)
         await hb.stop()
         await redis.aclose()
         await engine.dispose()

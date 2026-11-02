@@ -46,6 +46,11 @@ def _scrub(value: Any, depth: int = 0) -> Any:
     return value
 
 
+def scrub(value: Any) -> Any:
+    """Public redaction helper: secret-looking keys masked, credentials in text removed."""
+    return _scrub(value)
+
+
 def redact_secrets(
     _logger: Any, _method: str, event_dict: structlog.types.EventDict
 ) -> structlog.types.EventDict:
@@ -60,10 +65,16 @@ def redact_secrets(
 
 
 def configure_logging(level: str = "INFO") -> None:
+    # Exceptions are also handed to the incident sink (docs/21-self-repair.md); imported here
+    # because the sink itself uses `scrub` from this module.
+    from app.core.exception_sink import capture_exceptions, install_excepthook
+
+    install_excepthook()
     shared: list[structlog.types.Processor] = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso", utc=True),
+        capture_exceptions,
     ]
     structlog.configure(
         processors=[
@@ -85,6 +96,9 @@ def configure_logging(level: str = "INFO") -> None:
             foreign_pre_chain=shared,
             processors=[
                 structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+                # Render stdlib tracebacks as text so redact_secrets can scrub them (a raw
+                # exc_info tuple used to be serialised with its repr, secrets included).
+                structlog.processors.format_exc_info,
                 redact_secrets,
                 structlog.processors.JSONRenderer(),
             ],

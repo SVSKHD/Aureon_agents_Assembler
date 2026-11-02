@@ -84,7 +84,7 @@ async def db_clean(migrated: str) -> AsyncIterator[str]:
         await conn.execute(
             text(
                 "TRUNCATE agents.agent_logs, agents.agent_runs, agents.scheduled_jobs, "
-                "agents.agents, "
+                "agents.agents, agents.repair_tasks, agents.incidents, "
                 "agents.generated_assets, agents.image_jobs, "
                 "ai.messages, ai.conversations, ai.model_inventory, "
                 "audit.audit_events, core.sessions, core.users RESTART IDENTITY CASCADE"

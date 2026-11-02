@@ -7,6 +7,10 @@
   admin has it paused. Each task is recorded as an agent run.
 - At startup, tasks left `running` by a crash are marked failed (their worktree is removed).
 - Never pushes, never merges into a protected branch, never deploys: see app/services/coding.py.
+- Also runs the self-repair loop (agent `repair`, docs/21-self-repair.md): one repair at a
+  time. Both loops hold HEAVY_MODEL_LOCK for a whole task, so a code task and a repair never
+  run a model (or a test suite) at the same time. Repairs reach GitHub only through the REST
+  client, after their allowlisted tests pass.
 """
 
 from __future__ import annotations
@@ -22,13 +26,16 @@ from sqlalchemy import select, update
 
 from app.agents.coding.git import Git
 from app.agents.ollama.client import OllamaClient
+from app.agents.ollama.heavy import HEAVY_MODEL_LOCK
 from app.agents.registry import AgentRegistry, AgentSpec, Heartbeat
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
 from app.core.procsec import make_non_dumpable
 from app.db.session import build_engine, build_sessionmaker
+from app.integrations.github import build_github_client
+from app.integrations.github.client import GitHubClient
 from app.models.agents import CodeTask
-from app.services import coding
+from app.services import coding, incidents, repairs
 
 log = get_logger("worker.coding")
 CODING = AgentSpec("coding", "Coding agent", "coding")
@@ -52,6 +59,41 @@ async def recover(maker: Any, cfg: coding.CodingConfig) -> int:
                 .values(status="failed", error="worker restarted during the task", worktree=None)
             )
     return len(stuck)
+
+
+async def repair_loop(
+    maker: Any,
+    settings: Any,
+    cfg: repairs.RepairConfig,
+    ollama: OllamaClient,
+    github: GitHubClient | None,
+    registry: AgentRegistry,
+    stop: asyncio.Event,
+    state: dict[str, Any],
+) -> None:
+    while not stop.is_set():
+        rid = None
+        try:
+            rid = await repairs.claim(maker, settings)
+        except Exception as exc:  # DB hiccup: back off
+            log.warning("repair_claim_failed", error=type(exc).__name__)
+        if rid is None:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), settings.REPAIR_POLL_SECONDS)
+            continue
+        state["repair"] = str(rid)
+        started = time.monotonic()
+        async with HEAVY_MODEL_LOCK:
+            status = await repairs.run_repair(maker, settings, cfg, ollama, github, rid)
+        with contextlib.suppress(Exception):
+            await registry.record_run(
+                repairs.REPAIR.id,
+                "repair_task",
+                "succeeded" if status == "pr_opened" else "failed",
+                int((time.monotonic() - started) * 1000),
+                details={"repair_id": str(rid), "status": status},
+            )
+        state["repair"] = None
 
 
 async def main() -> int:
@@ -91,6 +133,28 @@ async def main() -> int:
     hb.start()
     recovered = await recover(maker, cfg)
     log.info("coding_worker_started", repos=sorted(cfg.repos), recovered=recovered)
+
+    # --- self-repair loop (same process: shares the heavy-model lock) ---
+    rcfg = repairs.RepairConfig.from_settings(settings)
+    github = build_github_client(settings)
+
+    def repair_report() -> tuple[str, dict[str, Any]]:
+        return ("busy" if state.get("repair") else "idle"), {
+            "running": state.get("repair"),
+            "model": rcfg.model,
+            "repo": rcfg.repo,
+            "disabled": repairs.disabled_reason(settings),
+        }
+
+    repair_hb = Heartbeat(registry, repairs.REPAIR, settings.AGENT_HEARTBEAT_SECONDS, repair_report)
+    await repair_hb.beat()
+    repair_hb.start()
+    await repairs.recover_stuck(maker, rcfg)
+    repair_task = asyncio.create_task(
+        repair_loop(maker, settings, rcfg, ollama, github, registry, stop, state),
+        name="repair-loop",
+    )
+    flusher = incidents.start_exception_flusher(maker, settings, "coding-worker")
     try:
         while not stop.is_set():
             tid = None if state["paused"] else await coding.claim(maker)
@@ -100,7 +164,8 @@ async def main() -> int:
                 continue
             state["running"] = str(tid)
             started = time.monotonic()
-            status = await coding.run_task(maker, cfg, ollama, tid)
+            async with HEAVY_MODEL_LOCK:
+                status = await coding.run_task(maker, cfg, ollama, tid)
             with contextlib.suppress(Exception):
                 await registry.record_run(
                     CODING.id,
@@ -111,7 +176,14 @@ async def main() -> int:
                 )
             state["running"] = None
     finally:
+        stop.set()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(repair_task, 60)
+        await incidents.stop_exception_flusher(flusher)
+        await repair_hb.stop()
         await hb.stop()
+        if github is not None:
+            await github.aclose()
         await ollama.aclose()
         await engine.dispose()
         log.info("coding_worker_stopped")

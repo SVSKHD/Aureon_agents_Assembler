@@ -1,6 +1,7 @@
 """Fixed git invocations for the coding agent. Repo hooks never run (core.hooksPath is
-pointed at an empty directory), nothing is pushed, and no ref outside `aureon/task-*` is
-ever written."""
+pointed at an empty directory), nothing is pushed, and no ref outside `aureon/task-*` (and,
+for self-repair, `repair/<hex>`) is ever written. Repair branches reach GitHub through the
+REST API (app/services/repairs.py), never through git."""
 
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ import re
 from pathlib import Path
 
 TASK_BRANCH = re.compile(r"^aureon/task-[0-9a-f]{8,32}$")
+REPAIR_BRANCH = re.compile(r"^repair/[0-9a-f]{8,32}$")
 FEATURE_BRANCH = re.compile(r"^(feature|fix|aureon)/[A-Za-z0-9._-]{1,80}$")
 AUTHOR = "Aureon coding agent <coding-agent@aureon.local>"
 EMPTY_HOOKS = "/nonexistent-aureon-hooks"
@@ -106,16 +108,16 @@ class Git:
 
     # --- task worktrees (writes only aureon/task-* refs) -----------------------------
     async def worktree_add(self, path: Path, branch: str, base: str) -> None:
-        if not TASK_BRANCH.match(branch):
-            raise GitError("refusing a branch outside aureon/task-*")
+        if not (TASK_BRANCH.match(branch) or REPAIR_BRANCH.match(branch)):
+            raise GitError("refusing a branch outside aureon/task-* and repair/*")
         await self.run("worktree", "add", "-b", branch, str(path), base)
 
     async def worktree_remove(self, path: Path) -> None:
         await self.run("worktree", "remove", "--force", str(path))
 
     async def branch_delete(self, branch: str) -> None:
-        if not TASK_BRANCH.match(branch):
-            raise GitError("refusing to delete a branch outside aureon/task-*")
+        if not (TASK_BRANCH.match(branch) or REPAIR_BRANCH.match(branch)):
+            raise GitError("refusing to delete a branch outside aureon/task-* and repair/*")
         await self.run("branch", "-D", branch)
 
     async def apply(self, worktree: Path, patch: str, *, check: bool) -> None:
