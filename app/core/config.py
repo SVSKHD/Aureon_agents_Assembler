@@ -109,6 +109,14 @@ class Settings(BaseSettings):
     HOST_STATUS_FILE: Path = Path("/mnt/spasta-data/status/host-services.json")
     HOST_STATUS_MAX_AGE_SECONDS: float = Field(default=120.0, gt=0)
 
+    # --- trading (docs/10-trading-foundation.md) ---
+    # Feature flag for LIVE mode. Off: LIVE cannot be selected at all. On: LIVE still needs
+    # an admin confirmation token AND the Phase G preconditions (not implemented yet).
+    TRADING_LIVE_ENABLED: bool = False
+    TRADING_LIVE_TOKEN_TTL_SECONDS: int = Field(default=300, ge=30, le=3600)
+    # Per-call timeout for read-only broker adapter calls.
+    TRADING_ADAPTER_TIMEOUT: float = Field(default=10.0, gt=0)
+
     @field_validator("IMAGE_AGENT_COMMAND", mode="before")
     @classmethod
     def _parse_command(cls, v: object) -> object:
