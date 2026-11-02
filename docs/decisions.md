@@ -414,3 +414,73 @@ See [22-claude-review.md](22-claude-review.md).
 - **D-19-10: migration id 0015.** Developed as 0016 beside Phase 18; Phase 18's 0015 was not
   on main when this merged, so this migration took 0015 (down_revision 0014) and Phase 18
   renumbers after it.
+
+## 20 — Approval engine
+
+See [23-approval-engine.md](23-approval-engine.md).
+
+- **D-20-1: the same interface, grown.** `request` / `approve` / `deny` and `ExecutorSpec`
+  keep their Phase 16 signatures; every new parameter is optional (`artifacts`, `summary`,
+  `reauth_stamped_at`, `current_artifacts`, `policy_subject`). `reauth_password` may now be
+  None (stamp path). Phase 16/17/19 tests pass unchanged; only the admin-route pin list grew.
+- **D-20-2: the policy is snapshotted onto the request.** Editing or disabling a policy
+  never loosens or tightens a pending request; the snapshot is what approve enforces. No
+  match (or an empty table) falls back to the built-in Phase 16 rules.
+- **D-20-3: specificity = exact > more literal characters > fewer wildcards > lowest id.**
+  fnmatch patterns, case-sensitive. Simple to explain and test; no regexes in the DB.
+- **D-20-4: repair PRs are classified by the head branch, not a new kind.** Phase 18 merges
+  through `github.pr.merge`. `request_merge` adds `head_ref` and `labels` to the approval
+  payload (metadata only, never sent to GitHub) and `merge_policy_subject` maps `repair/*` or
+  the `repair` label to the subject `repair.pr_merge`, which the seeded `repair.*` policy
+  matches (password every time, 1 approval, risk high). The branch cannot change after the PR
+  is opened; the label is read at request time.
+- **D-20-5: `allow_self_approval` keeps the D-16-3 meaning.** true = the sole active admin
+  may approve their own request (and only with `APPROVALS_ALLOW_SELF_APPROVAL`); false =
+  never. With `required_approvals` ≥ 2 the requester counts as one approver only under that
+  rule, so N must be ≤ the number of admins.
+- **D-20-6: partial approvals keep status `pending`.** No new status (the check constraint is
+  unchanged); `received_approvals` counts, and each partial approval is an
+  `approval_recorded` event. Distinctness is checked from the events. The quorum approval is
+  the `approved` event, so a single-approval flow has exactly the Phase 16 events.
+- **D-20-7: the re-auth stamp lives in Redis, keyed by the session id.** Value `{user_id,
+  at}`, TTL = the largest enabled `reauth_max_age_seconds` capped by
+  `APPROVALS_REAUTH_STAMP_MAX_SECONDS`; each request's own policy decides how old a stamp may
+  be. Redis down = no stamp = the password is needed (fail closed). Stamp attempts share the
+  `APPROVALS_MAX_REAUTH_FAILURES` budget per session per 15 min. `{}` stays a 422.
+- **D-20-8: high-risk kinds never accept the stamp.** The seeds give force-push, branch
+  protection/delete, repo settings, Actions permissions, prod dispatch and repair merges
+  `reauth_max_age_seconds = 0`; ordinary merges, the fallback and paper intents accept a
+  stamp up to 300 s.
+- **D-20-9: changing policies needs the password.** A policy can switch re-auth off, so
+  `PUT /policies` re-verifies the admin's password and audits before/after.
+- **D-20-10: the hash chain is per request and anchored on the request row.** `hash =
+  sha256(prev_hash + canonical(event))`, `at` set in Python with microseconds so it hashes
+  exactly; `event_head_hash` on the request detects a deleted tail. Events are only written
+  under the request's row lock, so the chain cannot fork. Pre-Phase-20 events (hash NULL)
+  are reported as a legacy prefix.
+- **D-20-11: notifications are queued in the session and sent after commit.** An SQLAlchemy
+  `after_commit` hook hands them to background tasks; a rollback drops them, so Discord never
+  reports something that did not happen, and a slow or failing webhook never delays or fails
+  a request. Bounded: 100 pending deliveries, capped attempts.
+- **D-20-12: Discord gets an allowlist and a link, never a capability.** No payload, no
+  artifacts, redacted and capped text, mentions disabled, no components and no interaction
+  endpoint. The link opens the app; acting needs sign-in + re-auth.
+- **D-20-13: voice is a pure function plus an optional local model.** The modules import
+  nothing stateful (asserted by a test), the endpoint writes nothing (not even an audit row,
+  so "changes no state" is literal), and the transcript is not logged. The model can only
+  choose among the five intents; the route is always built by code.
+- **D-20-14: paper approval reuses `approve_and_execute` unchanged.** The executor lives in
+  `app/api/v1/paper.py` so `app.services.paper` keeps its two importers (the Prompt 12 test).
+  Artifacts are `intent` + `risk_decision`; the requester is the intent's creator. The old
+  endpoint checks LIVE / not-pending first (same codes as before), files or reuses the pending
+  request, commits, and only then approves in a fresh session (no lock held across, so no
+  deadlock with the executor's row lock). No live kind exists (asserted).
+- **D-20-15: drift on GET is opt-in (`check_drift=true`).** Recomputing a merge artifact
+  calls GitHub; the inbox and lists must stay cheap and offline-safe.
+- **D-20-16: the SSE stream polls the events table by id with a 1 s lag** (same pattern as
+  the trading stream), re-checks the session and the admin role every poll, and carries no
+  payload. Redis pub/sub was not needed.
+- **D-20-17: migration id 0017 on top of Phase 18's 0016.**
+- **D-20-18: `GET /api/v1/audit/events` (for the Phase 21 audit module)** is admin-only and
+  read-only; `event_type` is a literal prefix (LIKE metacharacters escaped); details are
+  returned as stored because every writer already redacts.

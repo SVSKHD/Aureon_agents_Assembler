@@ -130,6 +130,11 @@ authenticating the CLI, and the classification policy, are in
 [docs/manual-setup.md](../docs/manual-setup.md#19--claude-review)): see
 [docs/22-claude-review.md](../docs/22-claude-review.md#deploy-and-validate).
 
+Approval engine (migration 0017 seeds the default policies; the `approval-expire` job runs
+every minute; the Discord webhook, `PUBLIC_APP_URL` and policy tuning are in
+[docs/manual-setup.md](../docs/manual-setup.md#20--approval-engine)): see
+[docs/23-approval-engine.md](../docs/23-approval-engine.md#deploy-and-validate).
+
 Agents, scheduler, system status and the host-status helper: see
 [docs/05-agents.md](../docs/05-agents.md#deploy-and-validate).
 

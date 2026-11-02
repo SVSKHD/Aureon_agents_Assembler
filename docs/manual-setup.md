@@ -357,3 +357,46 @@ REVIEW_UNAVAILABLE and nothing is sent anywhere.
    - diffs over `CLAUDE_REVIEW_MAX_DIFF_BYTES` (200 KiB) are never sent.
    - the review is advisory: it is published only as a COMMENT, and merges still need an
      admin approval with the password re-entered.
+
+## 20 — Approval engine
+
+See [23-approval-engine.md](23-approval-engine.md). Nothing is required: without these steps
+the engine works with the seeded policies and no notifications.
+
+1. **Discord webhook (optional).** In Discord: the channel → Edit Channel → Integrations →
+   Webhooks → New Webhook → name it (e.g. "Spasta approvals") → Copy Webhook URL. Use a private
+   channel only the owner can read. Put it in the server's `.env` (never in Git):
+   ```
+   DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/<id>/<token>
+   PUBLIC_APP_URL=https://spasta.online
+   ```
+   then `docker compose up -d api scheduler`. File a test approval (e.g. the paper approve
+   with no body) and check the message arrives and its link opens
+   `https://spasta.online/dev/approvals/<id>`. Treat the webhook URL as a secret: anyone with
+   it can post to the channel (but never approve anything). To rotate, delete the webhook in
+   Discord and create a new one.
+2. **Policy tuning.** `GET /api/v1/approvals/policies` lists them; `PUT` upserts by
+   `kind_pattern` with your password:
+   ```bash
+   curl -s -b jar -H "x-csrf-token: $CSRF" -H 'content-type: application/json' -X PUT \
+     https://api.spasta.online/api/v1/approvals/policies -d '{"password":"…","policies":[
+       {"kind_pattern":"github.pr.merge","required_approvals":1,"reauth_max_age_seconds":300,
+        "risk_level":"high"}]}'
+   ```
+   Guidance:
+   - The most specific pattern wins (exact > longer literal > fewer wildcards). Add a narrow
+     pattern rather than loosening `*` or `github.*`.
+   - `required_approvals` > 1 only once there are that many active admins; otherwise requests
+     can only expire. With a single owner keep 1.
+   - `reauth_max_age_seconds` lets a recent `POST /api/v1/approvals/reauth` stand in for the
+     password (≤ 3600, capped by `APPROVALS_REAUTH_STAMP_MAX_SECONDS`). Keep 0 for
+     production deploys, force-push, repo settings and `repair.*`.
+   - `require_reauth=false` means the admin session alone approves — avoid it.
+   - `expiry_seconds` short for things that go stale (paper intents: 900 s).
+   - `notify_channels: []` silences a noisy kind.
+   - Edits apply to new requests only; deny pending ones to re-file them under new rules.
+   - Disable (`"enabled": false`) instead of deleting; every change is in
+     `GET /api/v1/audit/events?event_type=approval_policies`.
+3. **Voice (optional).** To let the local model resolve phrases the grammar misses, pull a
+   small model on the Ollama box and set `VOICE_OLLAMA_MODEL=<model>`; otherwise leave it
+   empty (grammar only).

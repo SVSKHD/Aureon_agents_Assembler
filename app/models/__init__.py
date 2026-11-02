@@ -3,7 +3,12 @@
 from app.models import brokers, trading  # noqa: F401  (registers trading/dhan/mt5 tables)
 from app.models.agents import Agent, AgentLog, AgentRun, ScheduledJob
 from app.models.ai import Conversation, Message, ModelInventory
-from app.models.approvals import ApprovalEvent, ApprovalRequest
+from app.models.approvals import (
+    ApprovalArtifact,
+    ApprovalEvent,
+    ApprovalPolicy,
+    ApprovalRequest,
+)
 from app.models.auth import AuditEvent, Role, User, UserSession
 from app.models.finance import FinanceAttachment, FinanceIdentity, FinanceTombstone
 from app.models.github import (
@@ -24,7 +29,9 @@ __all__ = [
     "Agent",
     "AgentLog",
     "AgentRun",
+    "ApprovalArtifact",
     "ApprovalEvent",
+    "ApprovalPolicy",
     "ApprovalRequest",
     "AuditEvent",
     "Conversation",

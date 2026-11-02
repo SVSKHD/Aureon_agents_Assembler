@@ -41,6 +41,11 @@ Phase A tables.
 | `POST …/{id}/cancel` (creator or admin) while open | `CANCELLED` | `CANCELLED` |
 | DAY intent still open on a later market day (IST for Dhan, UTC for MT5) | `EXPIRED` | `EXPIRED` |
 
+Since Phase 20 the approve call goes through the approval engine (kind `trading.paper_intent`):
+without a body it answers 202 with an approval id for the inbox; with `{"password"}` and a
+single-approval policy it approves in the same call. See
+[23-approval-engine.md](23-approval-engine.md#frontend-compatibility-paper-tab--inbox).
+
 Every event carries the intent's `correlation_id`. Each risk run is a `trading.risk_decisions` row with
 `order_intent_id`, the policy snapshot, its inputs (including the cost estimate) and per-check results.
 
