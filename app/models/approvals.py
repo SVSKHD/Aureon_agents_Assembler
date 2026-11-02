@@ -16,7 +16,6 @@ from sqlalchemy import (
     Identity,
     Index,
     String,
-    Text,
     Uuid,
     func,
     text,
@@ -35,16 +34,13 @@ APPROVAL_STATUSES = (
     "executed",
     "failed",
 )
+_STATUS_CHECK = "status IN (" + ",".join(f"'{s}'" for s in APPROVAL_STATUSES) + ")"
 
 
 class ApprovalRequest(Base):
     __tablename__ = "approval_requests"
     __table_args__ = (
-        CheckConstraint(
-            "status IN ('pending','approved','denied','expired','invalidated','executed',"
-            "'failed')",
-            name="status",
-        ),
+        CheckConstraint(_STATUS_CHECK, name="status"),
         Index("ix_audit_approval_requests_status", "status", "created_at"),
         {"schema": "audit"},
     )

@@ -112,6 +112,7 @@ OPERATION_STATUSES = (
     "expired",
     "invalidated",
 )
+_OP_STATUS_CHECK = "status IN (" + ",".join(f"'{s}'" for s in OPERATION_STATUSES) + ")"
 
 
 class GitHubIssueLink(Base):
@@ -142,11 +143,7 @@ class GitHubTrackedOperation(Base):
 
     __tablename__ = "tracked_operations"
     __table_args__ = (
-        CheckConstraint(
-            "status IN ('pending_approval','running','succeeded','failed','denied','expired',"
-            "'invalidated')",
-            name="status",
-        ),
+        CheckConstraint(_OP_STATUS_CHECK, name="status"),
         Index("ix_github_tracked_operations_created_at", "created_at"),
         Index("ix_github_tracked_operations_repo", "repo"),
         Index("ix_github_tracked_operations_approval", "approval_request_id"),
