@@ -4,6 +4,41 @@ These steps need the owner: sudo on the server, real secrets, or outside account
 never run by an agent. Each phase appends its own section below. Run commands as `svskhd8` on
 the server, from `/opt/private-ai/aureon`, unless a step says otherwise.
 
+## A, C, D — finance, image agent, frontend
+
+1. **Finance (A).**
+   - **Check the live DDL first.** Before `alembic upgrade 0010`, dump the live tables and
+     compare them with ASTRA-FRONTEND `supabase/migrations` (decision D-A1):
+     ```bash
+     docker exec <postgres-container> pg_dump -U <user> -d spasta --schema-only \
+       -t public.astra_documents -t public.trades -t public.expenses \
+       -t public.secured -t public.portfolio_profiles
+     ```
+   - **Migrate:** `docker compose run --rm migrate`. It only adds things: the
+     `aureon_user_id` column, its indexes and `core.finance_identities`.
+   - **Claim the existing rows.** They stay invisible until you do. Run the claim once per
+     legacy owner id, as a dry run first, then with `"apply": true`:
+     ```bash
+     curl -sS -b $J -H "x-csrf-token: $CSRF" -H 'content-type: application/json' \
+       $B/api/finance/claim -d '{"legacy_user_id":"<uid>","user_id":"<aureon user id>"}'
+     ```
+     Find the legacy ids with `select distinct user_id from public.trades;`.
+2. **Image agent (C).** Point the worker at the real Stable Diffusion entrypoint, per
+   docs/04-imaging.md:
+   - set `IMAGE_GENERATOR=subprocess` and `IMAGE_AGENT_COMMAND=[...]` (a JSON argv with a
+     `{output}` placeholder) in `.env`
+   - start it with `docker compose --profile imaging up -d imaging-worker`
+
+   Until then only the stub generator runs.
+3. **Frontend (D, 21).**
+   - **Netlify:** the build defaults are now `VITE_AUTH_PROVIDER=aureon` and
+     `VITE_AI_BACKEND=aureon`. Aureon is reached same-origin through nginx on spasta.online.
+     Netlify-hosted deploys and previews cannot sign in with Aureon's SameSite=Strict cookies,
+     so set `VITE_AUTH_PROVIDER=supabase` and `VITE_AI_BACKEND=proxy` in the Netlify site
+     environment if those builds should keep working.
+   - **Paper fills:** after deploying, try one paper approval. Approve now asks for the
+     admin password, or it files a request that you approve in `/dev` → Inbox.
+
 ## D-backend — Frontend support APIs
 
 - **Migration:** run `alembic upgrade 0011` (additive: `core.finance_tombstones`,
