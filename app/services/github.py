@@ -412,24 +412,28 @@ async def commits(
     if path:
         params["path"] = path
     data = await client.get_json(f"/repos/{full}/commits", params)
-    out: list[CommitOut] = []
-    for c in data if isinstance(data, list) else []:
-        commit = c.get("commit") or {}
-        author = commit.get("author") or {}
-        committer = commit.get("committer") or {}
-        out.append(
-            CommitOut(
-                sha=c["sha"],
-                message=client.redact(str(commit.get("message") or ""))[:MAX_COMMIT_MESSAGE],
-                author_name=author.get("name"),
-                author_login=(c.get("author") or {}).get("login"),
-                authored_at=_dt(author.get("date")),
-                committer_name=committer.get("name"),
-                committed_at=_dt(committer.get("date")),
-                html_url=c.get("html_url"),
-            )
-        )
-    return out
+    return (
+        [commit_out(client, c) for c in data if isinstance(c, dict)]
+        if isinstance(data, list)
+        else []
+    )
+
+
+def commit_out(client: GitHubClient, c: dict[str, Any]) -> CommitOut:
+    """A GitHub commit object (repo or PR commit listing) -> CommitOut, message redacted."""
+    commit = c.get("commit") or {}
+    author = commit.get("author") or {}
+    committer = commit.get("committer") or {}
+    return CommitOut(
+        sha=c["sha"],
+        message=client.redact(str(commit.get("message") or ""))[:MAX_COMMIT_MESSAGE],
+        author_name=author.get("name"),
+        author_login=(c.get("author") or {}).get("login"),
+        authored_at=_dt(author.get("date")),
+        committer_name=committer.get("name"),
+        committed_at=_dt(committer.get("date")),
+        html_url=c.get("html_url"),
+    )
 
 
 async def _default_branch(client: GitHubClient, full: str) -> str:
@@ -560,6 +564,7 @@ __all__ = [
     "check_name",
     "check_path",
     "check_ref",
+    "commit_out",
     "commits",
     "contents",
     "known_login",
