@@ -109,6 +109,10 @@ GitHub foundation (migration 0012, `github-sync` job only with `GITHUB_TOKEN`; P
 [docs/manual-setup.md](../docs/manual-setup.md#15--github-foundation)): see
 [docs/18-github-foundation.md](../docs/18-github-foundation.md#deploy-and-validate).
 
+GitHub issues, PRs and the approval gate (migration 0013; the extra PAT permission is in
+[docs/manual-setup.md](../docs/manual-setup.md#16--github-issues-and-prs)): see
+[docs/19-github-issues-prs.md](../docs/19-github-issues-prs.md#deploy-and-validate).
+
 Agents, scheduler, system status and the host-status helper: see
 [docs/05-agents.md](../docs/05-agents.md#deploy-and-validate).
 

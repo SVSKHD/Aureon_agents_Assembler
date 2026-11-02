@@ -20,6 +20,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
     text,
 )
@@ -97,4 +98,76 @@ class GitHubSyncRun(Base):
     repos_removed: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     error: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+# --- Phase 16: issues + PRs (docs/19-github-issues-prs.md) --------------------------------
+
+OPERATION_STATUSES = (
+    "pending_approval",
+    "running",
+    "succeeded",
+    "failed",
+    "denied",
+    "expired",
+    "invalidated",
+)
+_OP_STATUS_CHECK = "status IN (" + ",".join(f"'{s}'" for s in OPERATION_STATUSES) + ")"
+
+
+class GitHubIssueLink(Base):
+    """A GitHub issue linked to a Spasta task. `task_ref` is an opaque id the frontend
+    supplies (tasks live in the workspace document, public.astra_documents)."""
+
+    __tablename__ = "issue_links"
+    __table_args__ = (
+        UniqueConstraint("repo_full_name", "issue_number", "task_ref", name="uq_issue_task"),
+        Index("ix_github_issue_links_task_ref", "task_ref"),
+        {"schema": "github"},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    repo_full_name: Mapped[str] = mapped_column(String(201))
+    issue_number: Mapped[int] = mapped_column(Integer)
+    issue_node_id: Mapped[str | None] = mapped_column(String(100))
+    task_ref: Mapped[str] = mapped_column(Text)
+    task_kind: Mapped[str] = mapped_column(Text, server_default=text("'spasta_task'"))
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("core.users.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class GitHubTrackedOperation(Base):
+    """Every write this service sends (or asks approval to send) to GitHub."""
+
+    __tablename__ = "tracked_operations"
+    __table_args__ = (
+        CheckConstraint(_OP_STATUS_CHECK, name="status"),
+        Index("ix_github_tracked_operations_created_at", "created_at"),
+        Index("ix_github_tracked_operations_repo", "repo"),
+        Index("ix_github_tracked_operations_approval", "approval_request_id"),
+        {"schema": "github"},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    # e.g. "issue.create", "pr.merge"
+    op: Mapped[str] = mapped_column(String(64))
+    repo: Mapped[str] = mapped_column(String(201))
+    # e.g. "issue#12", "pr#3", "branch:main"
+    target: Mapped[str | None] = mapped_column(String(300))
+    # The request body, token-redacted and size-capped.
+    request_payload: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb")
+    )
+    status: Mapped[str] = mapped_column(String(20), server_default=text("'running'"))
+    approval_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("audit.approval_requests.id", ondelete="SET NULL")
+    )
+    github_response_summary: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    error: Mapped[str | None] = mapped_column(Text)
+    actor: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("core.users.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

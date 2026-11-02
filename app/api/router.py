@@ -5,10 +5,13 @@ from fastapi import APIRouter
 from app.api.v1 import (
     agents,
     ai,
+    approvals,
     auth,
     code,
     finance,
     github,
+    github_issues,
+    github_pulls,
     health,
     images,
     paper,
@@ -28,3 +31,6 @@ api_router.include_router(paper.router)
 api_router.include_router(code.router)
 api_router.include_router(public.router)
 api_router.include_router(github.router)  # /api/v1/github
+api_router.include_router(github_issues.router)  # /api/v1/github issues, links, operations
+api_router.include_router(github_pulls.router)  # /api/v1/github pulls + gated operations
+api_router.include_router(approvals.router)  # /api/v1/approvals

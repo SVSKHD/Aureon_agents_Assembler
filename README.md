@@ -21,6 +21,7 @@ Trading Phase D adds the research agents: market data, indicators, signals, risk
 Trading Phase F enables PAPER mode end to end: intents, risk, admin approval, simulated fills, P&L and reconciliation; no broker orders ([docs/15-paper-trading.md](docs/15-paper-trading.md)).
 Phase E hardens production: an ENV=prod startup checklist, health-gated compose start order, nightly backups with a weekly restore drill, systemd boot units and a security review ([docs/16-production-hardening.md](docs/16-production-hardening.md), [docs/17-security-review.md](docs/17-security-review.md); sudo steps in [docs/manual-setup.md](docs/manual-setup.md)).
 Phase 15 adds the read-only GitHub integration: a PAT-from-env client with redaction, pagination, retry and rate limits, connection health, synced `github.*` tables and repo browsing ([docs/18-github-foundation.md](docs/18-github-foundation.md)).
+Phase 16 adds issue and PR operations, issue ↔ Spasta task links, `github.tracked_operations` and a minimal approval gate. Merge, force-push, branch protection, branch delete and repo-config changes run only after an admin approves with their password re-entered ([docs/19-github-issues-prs.md](docs/19-github-issues-prs.md)).
 
 ## Layout
 
@@ -98,6 +99,12 @@ tests/  scripts/  deploy/  docs/
 | GET / POST | `/api/v1/github/connection[/check]` | GitHub connection health; check it now (admin; never returns the token) ([docs/18-github-foundation.md](docs/18-github-foundation.md)). |
 | GET | `/api/v1/github/repositories[?refresh=true]`, `/api/v1/github/repositories/{owner}/{repo}` | Allowlisted repos from `github.repositories` (sync on demand); live repo detail (admin). |
 | GET | `/api/v1/github/repositories/{owner}/{repo}/branches\|commits\|tree\|contents/{path}` | Branches, commits, git tree, file contents (text up to a cap; binaries metadata only) (admin). |
+| GET / POST / PATCH | `/api/v1/github/repositories/{owner}/{repo}/issues[/{n}]`, `…/issues/{n}/close\|reopen\|comments\|labels\|lock`, `…/issues/comments/{id}` | Issues: list, detail with comments, create, update, close and reopen, comments, labels, lock. Every write is tracked and audited (admin) ([docs/19-github-issues-prs.md](docs/19-github-issues-prs.md)). |
+| POST / DELETE / GET | `…/issues/{n}/links`, `/api/v1/github/links?task_ref=` | Issue ↔ Spasta task links (admin). |
+| GET / POST / PATCH | `/api/v1/github/repositories/{owner}/{repo}/pulls[/{n}]`, `…/pulls/{n}/files\|diff\|commits\|merge-status\|comments\|issue-comments\|reviews` | PRs: list, detail, files, size-capped diff, commits, comments, reviews, create and update (admin). |
+| POST / PUT / PATCH / DELETE | `…/pulls/{n}/merge`, `…/force-push`, `…/branch-protection/{branch}`, `…/branches/{branch}`, `…/settings`, `…/actions-permissions` | Gated: 202 with an approval id. Nothing is written to GitHub until it is approved (admin). |
+| GET / POST | `/api/v1/approvals[/{id}]`, `/api/v1/approvals/{id}/approve\|deny` | Approval requests. Approve re-verifies the admin password, then executes once (admin). |
+| GET | `/api/v1/github/operations` | Tracked GitHub writes and gated operations (admin). |
 | GET | `/api/docs`, `/api/openapi.json` | Swagger UI and schema; both off when `ENV=prod` ([docs/16-production-hardening.md](docs/16-production-hardening.md)). |
 
 ## Configuration
