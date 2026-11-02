@@ -40,6 +40,16 @@ class Settings(BaseSettings):
     # Readiness-probe timeout per dependency, seconds.
     HEALTH_CHECK_TIMEOUT: float = 3.0
 
+    # --- auth ---
+    SESSION_TTL_HOURS: int = Field(default=12, ge=1, le=24 * 30)
+    # Secure cookies (and the __Host- prefix). Browsers drop Secure cookies over plain http
+    # except on localhost, so only disable this for local http development.
+    COOKIE_SECURE: bool = True
+    # Failed logins allowed per (email, client IP) and per client IP within the window.
+    LOGIN_MAX_FAILURES: int = Field(default=5, ge=1)
+    LOGIN_MAX_FAILURES_PER_IP: int = Field(default=20, ge=1)
+    LOGIN_WINDOW_SECONDS: int = Field(default=900, ge=1)
+
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def _split_origins(cls, v: object) -> object:
@@ -57,6 +67,14 @@ class Settings(BaseSettings):
     @property
     def data_marker_path(self) -> Path:
         return self.DATA_ROOT / self.DATA_ROOT_MARKER
+
+    @property
+    def session_cookie_name(self) -> str:
+        return "__Host-aureon_session" if self.COOKIE_SECURE else "aureon_session"
+
+    @property
+    def csrf_cookie_name(self) -> str:
+        return "__Host-aureon_csrf" if self.COOKIE_SECURE else "aureon_csrf"
 
 
 @lru_cache

@@ -10,6 +10,9 @@ RUN pip install .
 
 FROM python:3.12-slim AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PATH=/opt/venv/bin:$PATH
+# Proxies whose X-Forwarded-For uvicorn trusts (login rate limits key on client IP).
+# Override in .env with the Docker bridge gateway Nginx connects from (see deploy/README.md).
+ENV FORWARDED_ALLOW_IPS=127.0.0.1
 # Fixed UID/GID so file ownership on /mnt/spasta-data is predictable.
 ARG APP_UID=10001
 ARG APP_GID=10001
@@ -25,4 +28,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=4).status==200 else 1)"
 CMD ["uvicorn", "--factory", "app.main:app_factory", "--host", "0.0.0.0", "--port", "8000", \
-     "--proxy-headers", "--forwarded-allow-ips", "127.0.0.1", "--timeout-graceful-shutdown", "20"]
+     "--proxy-headers", "--timeout-graceful-shutdown", "20"]

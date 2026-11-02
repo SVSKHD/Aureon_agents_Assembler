@@ -43,7 +43,7 @@ async def client(settings: Settings) -> AsyncIterator[AsyncClient]:
     app = create_app(settings)
     async with LifespanManager(app) as mgr:
         transport = ASGITransport(app=mgr.app)
-        async with AsyncClient(transport=transport, base_url="http://test") as c:
+        async with AsyncClient(transport=transport, base_url="https://test") as c:
             yield c
 
 
@@ -52,3 +52,38 @@ def require_db() -> Iterator[str]:
     if not TEST_DATABASE_URL:
         pytest.skip("TEST_DATABASE_URL not set (run `make test-db`)")
     yield TEST_DATABASE_URL
+
+
+@pytest.fixture(scope="session")
+def migrated() -> Iterator[str]:
+    """Bring the isolated test database to head once per run."""
+    import subprocess
+    import sys
+
+    if not TEST_DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL not set (run `make test-db`)")
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        check=True,
+        env={**os.environ, "DATABASE_URL": TEST_DATABASE_URL},
+    )
+    yield TEST_DATABASE_URL
+
+
+@pytest.fixture
+async def db_clean(migrated: str) -> AsyncIterator[str]:
+    """Empty auth tables and the test Redis DB before each test."""
+    from redis.asyncio import Redis
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(migrated)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("TRUNCATE audit.audit_events, core.sessions, core.users RESTART IDENTITY")
+        )
+    await engine.dispose()
+    redis = Redis.from_url(TEST_REDIS_URL)
+    await redis.flushdb()
+    await redis.aclose()
+    yield migrated
