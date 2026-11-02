@@ -332,6 +332,27 @@ class Settings(BaseSettings):
     APPROVALS_ALLOW_SELF_APPROVAL: bool = True
     # After this many wrong re-auth passwords on one request it is denied automatically.
     APPROVALS_MAX_REAUTH_FAILURES: int = Field(default=5, ge=1, le=50)
+    # --- Approval engine (docs/23-approval-engine.md). Policies live in audit.approval_policies.
+    # Upper bound for a session re-auth stamp (POST /api/v1/approvals/reauth); the stamp's TTL
+    # is the largest enabled policy's reauth_max_age_seconds, capped by this.
+    APPROVALS_REAUTH_STAMP_MAX_SECONDS: int = Field(default=900, ge=0, le=3600)
+    # Characters of an artifact's canonical text stored in audit.approval_artifacts.content.
+    APPROVALS_ARTIFACT_MAX_CHARS: int = Field(default=65536, ge=0, le=1024 * 1024)
+    # Scheduler sweep that marks due pending requests expired (task approval_expire).
+    APPROVALS_EXPIRE_CRON: str = "* * * * *"
+    APPROVALS_STREAM_POLL_SECONDS: float = Field(default=2.0, gt=0)
+    APPROVALS_STREAM_HEARTBEAT_SECONDS: float = Field(default=15.0, gt=0)
+    APPROVALS_STREAM_MAX_SECONDS: float = Field(default=1800.0, gt=0)
+    # Base URL of the web app, used for deep links in notifications.
+    PUBLIC_APP_URL: str = "https://spasta.online"
+    # Discord incoming webhook (the URL is a secret). Unset = notifications disabled.
+    DISCORD_WEBHOOK_URL: SecretStr | None = None
+    DISCORD_MAX_ATTEMPTS: int = Field(default=3, ge=1, le=10)
+    DISCORD_REQUEST_SECONDS: float = Field(default=5.0, gt=0, le=60)
+    DISCORD_RETRY_BASE_SECONDS: float = Field(default=1.0, ge=0, le=60)
+    # Voice navigation (POST /api/v1/voice/intent): an optional local Ollama model used only
+    # when the deterministic grammar finds no intent. Unset = grammar only.
+    VOICE_OLLAMA_MODEL: str | None = None
 
     # --- Incidents + self-repair (docs/21-self-repair.md) ---
     # Local Ollama model for repair patches. Unset / empty = repairs disabled (tasks stay
@@ -400,6 +421,12 @@ class Settings(BaseSettings):
     @property
     def github_configured(self) -> bool:
         return bool(self.GITHUB_TOKEN and self.GITHUB_TOKEN.get_secret_value().strip())
+
+    @property
+    def discord_webhook_url(self) -> str | None:
+        s = self.DISCORD_WEBHOOK_URL
+        url = s.get_secret_value().strip() if s else ""
+        return url or None
 
     @property
     def github_webhook_configured(self) -> bool:
