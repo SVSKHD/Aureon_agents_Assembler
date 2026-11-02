@@ -35,6 +35,7 @@ dev = [
     "types-psutil",
     "types-croniter",
     "pandas-stubs",
+    "pyyaml>=6.0",
 ]
 
 [build-system]

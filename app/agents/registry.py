@@ -19,6 +19,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.core.heartbeat import touch_heartbeat_file
 from app.core.logging import get_logger
 from app.models.agents import Agent, AgentLog, AgentRun
 
@@ -218,6 +219,9 @@ class Heartbeat:
             self.on_paused(paused)
         except Exception as exc:  # DB hiccup: keep the agent running, try again next beat
             log.warning("heartbeat_failed", agent=self.spec.id, error=type(exc).__name__)
+            return
+        # The container healthcheck (python -m app.workers.healthcheck) reads this file's age.
+        await asyncio.to_thread(touch_heartbeat_file)
 
     async def _loop(self) -> None:
         while True:
