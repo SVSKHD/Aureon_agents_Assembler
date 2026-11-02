@@ -305,3 +305,43 @@ what would change it. Newest phase last.
 - **D-17-17: the worker is its own agent and compose service.** `github-webhooks` (kind
   integration), same image as the scheduler, profile `github`, 0.5 CPU / 256 MB, the shared
   hardening, the heartbeat-file healthcheck, Redis + Postgres networks only, no ports.
+
+## 19 — Claude review
+
+See [22-claude-review.md](22-claude-review.md).
+
+- **D-19-1: the CLI, not an API client.** The reviewer shells nothing: it runs the local
+  `claude` binary with argv only, prompt on stdin, an empty temp cwd and an env of HOME,
+  PATH and the listed auth names. No HTTP client for an external AI API exists in the code.
+  Default flags turn off tools, MCP and session persistence; they are configurable
+  (`CLAUDE_CLI_ARGS`) because CLI flags change between versions.
+- **D-19-2: one shared sensitive-path list.** Phase 18 had not merged a hard-block list, so
+  `app/core/sensitive_paths.py` defines it (secrets, infra, trading_risk, auth). Phase 18
+  should import it instead of keeping its own (dedupe note for the orchestrator).
+- **D-19-3: classify first, check availability second.** A BLOCKED diff never starts any
+  process, not even `claude --version`, so "nothing sent" is trivially true and testable.
+- **D-19-4: block broadly, mask narrowly.** Any hit on a path or secret rule blocks the
+  whole review; reasons name the rule and place, never the value. `password=` counts as a
+  literal only when quoted, at the start of a config line, in a URL query or as a JSON
+  key, so `password: str` and `password=PASSWORD` in code do not block every diff.
+  `.env.example`-style files are not path-blocked (they change in most phases), but their
+  content is scanned like any other.
+- **D-19-5: the diff is pinned.** It is fetched as `compare/{base}...{head}` with the shas
+  read at request time, so the reviewed text, the stored head_sha and the published
+  `commit_id` always agree.
+- **D-19-6: dedupe with a partial unique index.** `(repo, pr_number, head_sha)` where not
+  forced and not REVIEW_UNAVAILABLE. A queued or running review dedupes too, and an
+  unavailable one can be requested again without force. A `status` column
+  (queued/running/done) and a `reason` column were added beyond the spec's list.
+- **D-19-7: background tasks in the API process, bounded.** A semaphore of 1 and
+  `CLAUDE_REVIEW_MAX_QUEUE` waiting (then 429), no new worker container. On a clean shutdown
+  running reviews are marked `cancelled`.
+- **D-19-8: publish is COMMENT only, claimed under a lock.** The event is hard-coded; an
+  APPROVED verdict is stated as advisory in the body. Findings on new-side diff lines become
+  inline comments, others go in the body. A failed GitHub call releases the claim.
+  BLOCKED reviews can be published (they tell humans the review was skipped and why);
+  REVIEW_UNAVAILABLE ones cannot.
+- **D-19-9: no PR-opened auto-review yet.** The Phase 17 webhook processor runs in a
+  separate worker without the CLI or the runner, and has only a workflow-failure callback
+  registry. Auto-queueing (`CLAUDE_REVIEW_AUTO`) is left for later, so the reviewer only
+  runs when an admin asks.
