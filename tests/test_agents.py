@@ -445,6 +445,8 @@ async def test_default_jobs_and_builtin_tasks(make_env: EnvFactory) -> None:
             "purge-agent-history",
             "purge-expired-sessions",
             "refresh-model-inventory",
+            "paper-process",
+            "paper-reconcile",
         }
         assert all(j["next_run_at"] for j in jobs)
 

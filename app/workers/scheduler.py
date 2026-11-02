@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.ollama.client import OllamaClient
 from app.agents.registry import SCHEDULER, AgentRegistry, Heartbeat
+from app.agents.trading.base import BrokerAdapter
 from app.agents.trading.dhan import build_dhan_adapter
 from app.agents.trading.dhan.adapter import DhanAdapter
 from app.agents.trading.mt5 import build_mt5_adapter
@@ -42,7 +43,8 @@ from app.core.logging import configure_logging, get_logger
 from app.db.session import build_engine, build_sessionmaker
 from app.models.agents import Agent, AgentLog, AgentRun, ScheduledJob
 from app.models.auth import UserSession
-from app.services import dhan_sync, mt5_sync
+from app.models.trading import BrokerAccount
+from app.services import dhan_sync, mt5_sync, paper
 
 log = get_logger("worker.scheduler")
 MAX_BACKOFF_SECONDS = 3600
@@ -55,6 +57,7 @@ class TaskContext:
     ollama: OllamaClient | None
     dhan: DhanAdapter | None = None
     mt5: MT5Adapter | None = None
+    redis: Redis | None = None
 
 
 TaskFn = Callable[[TaskContext], Awaitable[dict[str, Any]]]
@@ -141,6 +144,48 @@ async def mt5_sync_status(ctx: TaskContext) -> dict[str, Any]:
     return await mt5_sync.sync_status(ctx.maker, ctx.mt5, ctx.settings)
 
 
+def _adapters(ctx: TaskContext) -> dict[str, BrokerAdapter]:
+    out: dict[str, BrokerAdapter] = {}
+    if ctx.dhan is not None:
+        out["dhan"] = ctx.dhan
+    if ctx.mt5 is not None:
+        out["mt5"] = ctx.mt5
+    return out
+
+
+async def paper_process(ctx: TaskContext) -> dict[str, Any]:
+    """Paper trading: fill resting approved intents once marketable; expire past-day ones.
+    Simulated only; never contacts a broker's order API."""
+    async with ctx.maker() as db, db.begin():
+        return await paper.process_open(db, ctx.redis, _adapters(ctx), ctx.settings)
+
+
+async def paper_reconcile(ctx: TaskContext) -> dict[str, Any]:
+    """Compare every PAPER account's simulated positions with its replayed ledger."""
+    out: dict[str, Any] = {"accounts": 0, "drift": []}
+    async with ctx.maker() as db, db.begin():
+        accounts = (
+            await db.scalars(
+                select(BrokerAccount).where(
+                    BrokerAccount.mode == "PAPER", BrokerAccount.is_active.is_(True)
+                )
+            )
+        ).all()
+        for account in accounts:
+            row = await paper.reconcile(db, account)
+            out["accounts"] += 1
+            if not row.ok:
+                out["drift"].append({"account": str(account.id), "items": row.drift})
+    if out["drift"]:
+        await AgentRegistry(ctx.maker).log(
+            SCHEDULER.id,
+            "error",
+            f"paper reconciliation drift on {len(out['drift'])} account(s)",
+            details=out,
+        )
+    return out
+
+
 TASKS: dict[str, TaskFn] = {
     "purge_agent_history": purge_agent_history,
     "purge_expired_sessions": purge_expired_sessions,
@@ -149,6 +194,8 @@ TASKS: dict[str, TaskFn] = {
     "dhan_reconcile": dhan_reconcile,
     "dhan_backfill_candles": dhan_backfill_candles,
     "mt5_sync_status": mt5_sync_status,
+    "paper_process": paper_process,
+    "paper_reconcile": paper_reconcile,
 }
 
 # (id, task, cron) — created if missing; an admin's later edits (pause etc.) are kept.
@@ -156,6 +203,8 @@ DEFAULT_JOBS: list[tuple[str, str, str]] = [
     ("purge-agent-history", "purge_agent_history", "17 3 * * *"),
     ("purge-expired-sessions", "purge_expired_sessions", "29 3 * * *"),
     ("refresh-model-inventory", "refresh_model_inventory", "*/30 * * * *"),
+    ("paper-process", "paper_process", "* * * * *"),
+    ("paper-reconcile", "paper_reconcile", "*/15 * * * *"),
 ]
 
 
@@ -202,12 +251,13 @@ class Scheduler:
         ollama: OllamaClient | None = None,
         dhan: DhanAdapter | None = None,
         mt5: MT5Adapter | None = None,
+        redis: Redis | None = None,
     ) -> None:
         self.settings = settings
         self.maker = maker
         self.tasks = TASKS if tasks is None else tasks
         self.registry = AgentRegistry(maker)
-        self.ctx = TaskContext(settings, maker, ollama, dhan, mt5)
+        self.ctx = TaskContext(settings, maker, ollama, dhan, mt5, redis)
         self.paused = False
         self.running_job: str | None = None
 
@@ -349,7 +399,7 @@ async def main() -> int:
     redis = Redis.from_url(settings.REDIS_URL)
     dhan = build_dhan_adapter(settings, redis, maker)
     mt5 = build_mt5_adapter(settings)
-    scheduler = Scheduler(settings, maker, ollama=ollama, dhan=dhan, mt5=mt5)
+    scheduler = Scheduler(settings, maker, ollama=ollama, dhan=dhan, mt5=mt5, redis=redis)
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
