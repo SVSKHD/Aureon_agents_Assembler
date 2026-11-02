@@ -79,6 +79,7 @@ tests/  scripts/  deploy/  docs/
 | POST / GET | `/api/trading/strategies/backtest`, `/api/trading/backtests[/{id}]` | Queue backtests (param grid); results + trades. |
 | GET | `/api/trading/indicators`, `/api/trading/risk-decisions`, `/api/trading/ai-analyses` | Stored analysis output. |
 | POST | `/api/trading/signals/{id}/explain`, `/api/trading/backtests/{id}/explain` | Queue an Ollama explanation (explanation only). |
+| GET | `/api/trading/stream` | SSE: signals, risk decisions, backtests, agent state, Dhan quotes ([docs/14-frontend.md](docs/14-frontend.md)). |
 | GET | `/api/docs` | Swagger UI (disabled when `ENV=prod`). |
 
 ## Configuration
@@ -142,6 +143,7 @@ Every variable is listed in [.env.example](.env.example).
 | `MT5_STALE_SECONDS` / `MT5_SYNC_CRON` / `MT5_HTTP_TIMEOUT` | `90` / `* * * * *` / `5` | Bot stale window, sync job, HTTP timeout. |
 | `RESEARCH_*` / `RISK_*` / `BACKTEST_*` | see .env.example | Research worker cadence, queues, indicators; risk assumptions; backtest limits. |
 | `RESEARCH_AI_MODEL` | unset | Local Ollama model for explanations; unset = explanations off. |
+| `TRADING_STREAM_POLL_SECONDS` / `_HEARTBEAT_SECONDS` / `_MAX_SECONDS` | `2` / `15` / `1800` | Trading SSE stream cadence and lifetime. |
 | `PRIVATE_AI_NETWORK` | required (compose) | Existing Docker network shared with Postgres/Ollama. |
 
 ## Development
