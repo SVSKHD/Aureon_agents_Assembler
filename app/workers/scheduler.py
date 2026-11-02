@@ -25,17 +25,22 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
+from redis.asyncio import Redis
 from sqlalchemy import delete, exists, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.ollama.client import OllamaClient
 from app.agents.registry import SCHEDULER, AgentRegistry, Heartbeat
+from app.agents.trading.dhan import build_dhan_adapter
+from app.agents.trading.dhan.adapter import DhanAdapter
+from app.agents.trading.types import Timeframe
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging, get_logger
 from app.db.session import build_engine, build_sessionmaker
 from app.models.agents import Agent, AgentLog, AgentRun, ScheduledJob
 from app.models.auth import UserSession
+from app.services import dhan_sync
 
 log = get_logger("worker.scheduler")
 MAX_BACKOFF_SECONDS = 3600
@@ -46,6 +51,7 @@ class TaskContext:
     settings: Settings
     maker: async_sessionmaker[AsyncSession]
     ollama: OllamaClient | None
+    dhan: DhanAdapter | None = None
 
 
 TaskFn = Callable[[TaskContext], Awaitable[dict[str, Any]]]
@@ -87,10 +93,51 @@ async def refresh_model_inventory(ctx: TaskContext) -> dict[str, Any]:
     return {"models": len(models)}
 
 
+def _dhan(ctx: TaskContext) -> DhanAdapter:
+    if ctx.dhan is None:
+        raise RuntimeError("Dhan is not configured (DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN)")
+    return ctx.dhan
+
+
+async def dhan_refresh_instruments(ctx: TaskContext) -> dict[str, Any]:
+    return await dhan_sync.sync_instruments(ctx.maker, _dhan(ctx))
+
+
+async def dhan_reconcile(ctx: TaskContext) -> dict[str, Any]:
+    """Reconcile every active Dhan account for the configured client; warn on token expiry."""
+    adapter = _dhan(ctx)
+    health = await adapter.health()
+    out: dict[str, Any] = {"token_ok": health.ok}
+    if health.credentials_expire_at is not None:
+        left = health.credentials_expire_at - datetime.now(UTC)
+        out["token_hours_left"] = round(left.total_seconds() / 3600, 2)
+    if health.detail:
+        # The admin notification: visible in GET /api/agents/scheduler/logs and account health.
+        await AgentRegistry(ctx.maker).log(
+            SCHEDULER.id, "warning" if health.ok else "error", f"Dhan: {health.detail}"
+        )
+    if not health.ok:
+        raise RuntimeError(f"Dhan credentials unusable: {health.detail}")
+    accounts = await dhan_sync.dhan_accounts(ctx.maker, adapter.client.client_id)
+    out["accounts"] = [await dhan_sync.reconcile_account(ctx.maker, adapter, a) for a in accounts]
+    return out
+
+
+async def dhan_backfill_candles(ctx: TaskContext) -> dict[str, Any]:
+    s = ctx.settings
+    tfs = [Timeframe(t) for t in s.DHAN_BACKFILL_TIMEFRAMES]
+    return await dhan_sync.backfill_candles(
+        ctx.maker, _dhan(ctx), s.DHAN_BACKFILL_INSTRUMENTS, tfs, s.DHAN_BACKFILL_DAYS
+    )
+
+
 TASKS: dict[str, TaskFn] = {
     "purge_agent_history": purge_agent_history,
     "purge_expired_sessions": purge_expired_sessions,
     "refresh_model_inventory": refresh_model_inventory,
+    "dhan_refresh_instruments": dhan_refresh_instruments,
+    "dhan_reconcile": dhan_reconcile,
+    "dhan_backfill_candles": dhan_backfill_candles,
 }
 
 # (id, task, cron) — created if missing; an admin's later edits (pause etc.) are kept.
@@ -99,6 +146,25 @@ DEFAULT_JOBS: list[tuple[str, str, str]] = [
     ("purge-expired-sessions", "purge_expired_sessions", "29 3 * * *"),
     ("refresh-model-inventory", "refresh_model_inventory", "*/30 * * * *"),
 ]
+
+
+def default_jobs(settings: Settings) -> list[tuple[str, str, str]]:
+    """Built-in jobs, plus the Dhan jobs when Dhan credentials are configured."""
+    jobs = list(DEFAULT_JOBS)
+    if settings.dhan_configured:
+        jobs += [
+            (
+                "dhan-refresh-instruments",
+                "dhan_refresh_instruments",
+                settings.DHAN_INSTRUMENTS_CRON,
+            ),
+            ("dhan-reconcile", "dhan_reconcile", settings.DHAN_RECONCILE_CRON),
+        ]
+        if settings.DHAN_BACKFILL_INSTRUMENTS:
+            jobs.append(
+                ("dhan-backfill-candles", "dhan_backfill_candles", settings.DHAN_BACKFILL_CRON)
+            )
+    return jobs
 
 
 # --- scheduling -----------------------------------------------------------------------------
@@ -121,19 +187,20 @@ class Scheduler:
         maker: async_sessionmaker[AsyncSession],
         tasks: dict[str, TaskFn] | None = None,
         ollama: OllamaClient | None = None,
+        dhan: DhanAdapter | None = None,
     ) -> None:
         self.settings = settings
         self.maker = maker
         self.tasks = TASKS if tasks is None else tasks
         self.registry = AgentRegistry(maker)
-        self.ctx = TaskContext(settings, maker, ollama)
+        self.ctx = TaskContext(settings, maker, ollama, dhan)
         self.paused = False
         self.running_job: str | None = None
 
     async def ensure_default_jobs(self, now: datetime | None = None) -> None:
         now = now or datetime.now(UTC)
         async with self.maker() as db, db.begin():
-            for job_id, task, cron in DEFAULT_JOBS:
+            for job_id, task, cron in default_jobs(self.settings):
                 await db.execute(
                     insert(ScheduledJob)
                     .values(
@@ -265,7 +332,9 @@ async def main() -> int:
         read_timeout=60,
         cache_ttl=0,
     )
-    scheduler = Scheduler(settings, maker, ollama=ollama)
+    redis = Redis.from_url(settings.REDIS_URL)
+    dhan = build_dhan_adapter(settings, redis, maker)
+    scheduler = Scheduler(settings, maker, ollama=ollama, dhan=dhan)
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -287,11 +356,14 @@ async def main() -> int:
     hb.start()
     try:
         await scheduler.ensure_default_jobs()
-        log.info("scheduler_started", jobs=[j[0] for j in DEFAULT_JOBS])
+        log.info("scheduler_started", jobs=[j[0] for j in default_jobs(settings)])
         await scheduler.serve(stopping)
     finally:
         await hb.stop()
         await ollama.aclose()
+        if dhan is not None:
+            await dhan.aclose()
+        await redis.aclose()
         await engine.dispose()
         log.info("scheduler_stopped")
     return 0
