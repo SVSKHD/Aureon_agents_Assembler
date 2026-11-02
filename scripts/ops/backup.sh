@@ -6,13 +6,15 @@
 #
 # Writes ${BACKUP_DIR}/aureon-<UTC stamp>/ on the HDD:
 #   db-schemas.dump       pg_dump -Fc of the schemas this app owns (core audit ai agents
-#                         trading dhan mt5)
+#                         trading dhan mt5 github spasta)
 #   db-public.dump        pg_dump -Fc of the public finance tables + aureon_alembic_version
 #   public-functions.sql  definitions of the functions those tables use as defaults
 #   data.tar              DATA_ROOT subdirs (BACKUP_DATA_DIRS: images finance-attachments)
 #   MANIFEST.json         row counts, alembic revision, sizes, checksums
 #   SHA256SUMS            sha256 of every file above
 # pg_dump runs inside the Postgres container (`docker compose exec -T`), so no port is needed.
+# Status: BACKUP_STATUS_FILE (default $DATA_ROOT/ops-status/backup.json, mode 644, no
+# secrets) records ok/failed and the last success, for the scheduler's backup alert.
 # Retention: backup folders older than BACKUP_RETENTION_DAYS are removed. Nothing else is
 # ever deleted, and only folders named aureon-<stamp> with a MANIFEST.json, strictly inside
 # BACKUP_DIR.
@@ -60,13 +62,54 @@ if [[ "$DRY_RUN" == 1 ]]; then
   exit 0
 fi
 
+# Status file for alerts (Phase 22). Best effort: a status write never fails the backup.
+write_status() {
+  local status="$1" dir tmp
+  path_is_under "$BACKUP_STATUS_FILE" "$DATA_ROOT" || {
+    log "WARNING: BACKUP_STATUS_FILE is not under DATA_ROOT; status not written"
+    return 0
+  }
+  dir="$(dirname -- "$BACKUP_STATUS_FILE")"
+  tmp="$BACKUP_STATUS_FILE.tmp.$$"
+  { mkdir -p -- "$dir" && chmod 755 -- "$dir"; } || return 0
+  STATUS="$status" STAMP="$STAMP" PG_DB="$PG_DB" python3 - "$BACKUP_STATUS_FILE" "$tmp" <<'PY' ||
+import json, os, sys
+from datetime import datetime, timezone
+
+prev = {}
+try:
+    prev = json.loads(open(sys.argv[1]).read())
+except Exception:
+    pass
+now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+ok = os.environ["STATUS"] == "ok"
+doc = {
+    "format": 1,
+    "status": os.environ["STATUS"],
+    "database": os.environ["PG_DB"],
+    "stamp": os.environ["STAMP"],
+    "finished_at": now,
+    "last_success_at": now if ok else prev.get("last_success_at"),
+    "last_success_backup": ("aureon-" + os.environ["STAMP"]) if ok else prev.get("last_success_backup"),
+}
+open(sys.argv[2], "w").write(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+PY
+    return 0
+  if ! { chmod 644 -- "$tmp" && mv -f -- "$tmp" "$BACKUP_STATUS_FILE"; }; then
+    rm -f -- "$tmp"
+  fi
+}
+
 mkdir -p "$BACKUP_DIR"
 mkdir "$PARTIAL"
 cleanup_partial() {
+  local rc=$?
   # Only the half-written folder of THIS run; its name is fixed above.
   if [[ -d "$PARTIAL" ]] && path_is_under "$PARTIAL" "$BACKUP_DIR"; then
     rm -rf -- "$PARTIAL"
   fi
+  if [[ "$rc" != 0 ]]; then write_status failed; fi
+  exit "$rc"
 }
 trap cleanup_partial EXIT
 
@@ -135,6 +178,7 @@ PY
 
 mv -- "$PARTIAL" "$DEST"
 trap - EXIT
+write_status ok
 log "backup $STAMP: done -> $DEST"
 
 # --- retention ---------------------------------------------------------------------------

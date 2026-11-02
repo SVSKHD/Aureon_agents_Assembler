@@ -34,8 +34,12 @@ PG_USER="${PG_USER:-postgres}"
 PG_DB="${PG_DB:-spasta}"
 
 # Schemas this app owns (alembic/versions) and the public tables it reads or writes.
-OWNED_SCHEMAS=(core audit ai agents trading dhan mt5)
+# Phase 22: + github (Phase 15 tables) and spasta (reserved, created by deploy/sql/roles.sql).
+OWNED_SCHEMAS=(core audit ai agents trading dhan mt5 github spasta)
 PUBLIC_TABLES=(trades expenses secured astra_documents portfolio_profiles aureon_alembic_version)
+
+# Status of the last backup run (read by the scheduler's alerts_dispatch task; no secrets).
+BACKUP_STATUS_FILE="${BACKUP_STATUS_FILE:-$DATA_ROOT/ops-status/backup.json}"
 
 # shellcheck disable=SC2034  # used by backup.sh
 BACKUP_NAME_RE='^aureon-[0-9]{8}T[0-9]{6}Z$'

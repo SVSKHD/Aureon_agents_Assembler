@@ -119,6 +119,35 @@ async def post(
     return False
 
 
+ALERT_COLORS = {"warning": 0xF5A623, "error": 0xE74C3C, "critical": 0x8E0000}
+
+
+def build_alert_payload(alert: Mapping[str, Any], public_app_url: str) -> dict[str, Any]:
+    """An operational alert (docs/24): severity, kind, title, a short redacted detail and a
+    deep link into the app. No payloads, no stack traces, no buttons."""
+    severity = str(alert.get("severity") or "warning")
+    path = str(alert.get("path") or "/dev")
+    if not path.startswith("/"):
+        path = "/" + path
+    return {
+        "username": "Spasta alerts",
+        "allowed_mentions": {"parse": []},
+        "embeds": [
+            {
+                "title": _clean(f"[{severity.upper()}] {alert.get('title') or ''}", 200),
+                "description": _clean(alert.get("detail"), MAX_DESCRIPTION),
+                "url": f"{public_app_url.rstrip('/')}{path}",
+                "color": ALERT_COLORS.get(severity, 0x7F8C8D),
+                "fields": [
+                    {"name": "Kind", "value": _clean(alert.get("kind"), 64), "inline": True},
+                    {"name": "Severity", "value": _clean(severity, 32), "inline": True},
+                ],
+                "footer": {"text": "Aureon alerts. Open the app for details."},
+            }
+        ],
+    }
+
+
 async def send_notices(settings: Settings, notices: list[Mapping[str, Any]]) -> list[bool]:
     url = settings.discord_webhook_url
     if not url:
@@ -166,4 +195,12 @@ async def drain(timeout_s: float = 5.0) -> None:
         await asyncio.wait(list(_TASKS), timeout=timeout_s)
 
 
-__all__ = ["build_payload", "deep_link", "drain", "notify_background", "post", "send_notices"]
+__all__ = [
+    "build_alert_payload",
+    "build_payload",
+    "deep_link",
+    "drain",
+    "notify_background",
+    "post",
+    "send_notices",
+]

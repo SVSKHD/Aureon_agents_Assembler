@@ -198,6 +198,8 @@ def test_backup_writes_dumps_manifest_and_checksums(ops: Ops) -> None:
         "trading",
         "dhan",
         "mt5",
+        "github",
+        "spasta",
     ]
     tables = _inner(dumps[1])
     assert [tables[i + 1] for i, a in enumerate(tables) if a == "-t"] == [
@@ -208,6 +210,24 @@ def test_backup_writes_dumps_manifest_and_checksums(ops: Ops) -> None:
         "public.portfolio_profiles",
         "public.aureon_alembic_version",
     ]
+
+
+def test_backup_writes_a_readable_status_file(ops: Ops) -> None:
+    dest = ops.backup()
+    status = ops.data / "ops-status" / "backup.json"
+    assert status.stat().st_mode & 0o777 == 0o644  # the scheduler (another uid) reads it
+    assert (status.parent.stat().st_mode & 0o777) == 0o755
+    doc = json.loads(status.read_text())
+    assert doc["status"] == "ok" and doc["last_success_backup"] == dest.name
+    assert doc["last_success_at"] == doc["finished_at"]
+    # A failed run records the failure and keeps the last success.
+    r = ops.run("backup.sh", SHIM_EXIT_pg_dump="1")
+    assert r.returncode != 0
+    failed = json.loads(status.read_text())
+    assert failed["status"] == "failed"
+    assert failed["last_success_backup"] == dest.name
+    assert failed["last_success_at"] == doc["last_success_at"]
+    assert SECRET not in status.read_text()
 
 
 def test_backup_uses_docker_exec_when_a_container_is_named(ops: Ops) -> None:

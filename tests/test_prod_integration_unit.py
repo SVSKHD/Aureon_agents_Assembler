@@ -1,0 +1,235 @@
+"""Phase 22 static and concurrency checks (no DB): the MT5 feed has no write path, and the
+one-heavy-model-at-a-time rule holds for the coding/repair lock, the research AI lane, the
+image worker and the Claude review runner."""
+
+from __future__ import annotations
+
+import ast
+import asyncio
+import re
+import uuid
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from app.core.config import Settings
+from app.main import create_app
+from tests.routes import api_routes
+
+ROOT = Path(__file__).resolve().parents[1]
+ORDER_NAME = re.compile(
+    r"(place|send|submit|modify|amend|cancel|close)_?(order|position|trade)|order_(send|check)",
+    re.I,
+)
+
+
+def _py(*parts: str) -> list[Path]:
+    base = ROOT.joinpath(*parts)
+    return [base] if base.suffix == ".py" else sorted(base.rglob("*.py"))
+
+
+# --- MT5: read-only ----------------------------------------------------------------------
+
+
+def test_mt5_adapter_and_broker_interface_have_no_order_methods() -> None:
+    files = _py("app", "agents", "trading", "mt5") + _py("app", "agents", "trading", "base.py")
+    for f in files:
+        tree = ast.parse(f.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                assert not ORDER_NAME.search(node.name), f"{f}: {node.name}"
+            if isinstance(node, ast.Attribute):
+                # HTTP writes from the status source: only GET is allowed.
+                assert node.attr not in ("post", "put", "patch", "delete"), f"{f}: .{node.attr}"
+    from app.agents.trading.base import BrokerAdapter
+    from app.agents.trading.mt5.adapter import MT5Adapter
+
+    for cls in (BrokerAdapter, MT5Adapter):
+        assert not [m for m in dir(cls) if ORDER_NAME.search(m)], cls
+
+
+def test_no_order_send_and_no_metatrader_import_anywhere() -> None:
+    hits = []
+    for top in ("app", "scripts", "deploy", "alembic"):
+        for f in ROOT.joinpath(top).rglob("*"):
+            if f.is_file() and f.suffix in (".py", ".sh", ".sql", ".conf", ".yml", ".yaml"):
+                text = f.read_text(errors="replace")
+                mt5_import = re.search(r"^\s*(import|from)\s+MetaTrader5", text, re.M)
+                if "order_send" in text or mt5_import:
+                    hits.append(str(f.relative_to(ROOT)))
+    assert hits == []
+
+
+def test_mt5_routes_are_read_only(settings: Settings) -> None:
+    routes = {
+        (m, r.path) for r in api_routes(create_app(settings)) if "/mt5" in r.path for m in r.methods
+    }
+    # GET the status; PUT registers a contract spec in OUR database (admin + CSRF).
+    assert routes == {
+        ("GET", "/api/trading/mt5/status"),
+        ("PUT", "/api/trading/mt5/instruments/{symbol}"),
+    }
+
+
+# --- one heavy model at a time -----------------------------------------------------------
+
+
+def _inside_lock(tree: ast.AST, call_name: str, lock: str) -> list[bool]:
+    """For each call to `call_name`, is it lexically inside `async with <lock>:`?"""
+    out: list[bool] = []
+
+    def visit(node: ast.AST, locked: bool) -> None:
+        if isinstance(node, ast.AsyncWith):
+            here = any(
+                isinstance(i.context_expr, ast.Name) and i.context_expr.id == lock
+                for i in node.items
+            )
+            for child in node.body:
+                visit(child, locked or here)
+            return
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == call_name:
+            out.append(locked)
+        for child in ast.iter_child_nodes(node):
+            visit(child, locked)
+
+    visit(tree, False)
+    return out
+
+
+def test_code_tasks_and_repairs_run_under_the_heavy_model_lock() -> None:
+    tree = ast.parse((ROOT / "app" / "workers" / "coding.py").read_text())
+    assert _inside_lock(tree, "coding.run_task", "HEAVY_MODEL_LOCK") == [True]
+    assert _inside_lock(tree, "repairs.run_repair", "HEAVY_MODEL_LOCK") == [True]
+
+
+async def test_repair_loop_holds_the_lock_while_it_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.agents.ollama.heavy import HEAVY_MODEL_LOCK
+    from app.services import repairs
+    from app.workers import coding as worker
+
+    stop = asyncio.Event()
+    ids = [uuid.uuid4(), uuid.uuid4()]
+    seen: list[bool] = []
+
+    async def claim(maker: Any, settings: Any) -> uuid.UUID | None:
+        if not ids:
+            stop.set()
+            return None
+        return ids.pop()
+
+    async def run_repair(*a: Any) -> str:
+        seen.append(HEAVY_MODEL_LOCK.locked())
+        await asyncio.sleep(0)
+        return "pr_opened"
+
+    class Reg:
+        async def record_run(self, *a: Any, **k: Any) -> None:
+            return None
+
+    monkeypatch.setattr(repairs, "claim", claim)
+    monkeypatch.setattr(repairs, "run_repair", run_repair)
+    s = type("S", (), {"REPAIR_POLL_SECONDS": 0.01})()
+
+    # A "code task" holds the lock first: the repair must wait for it.
+    order: list[str] = []
+    async with HEAVY_MODEL_LOCK:
+        task = asyncio.create_task(
+            worker.repair_loop(None, s, None, None, None, Reg(), stop, {})  # type: ignore[arg-type]
+        )
+        await asyncio.sleep(0.05)
+        order.append("code-task-done")
+        assert seen == []  # blocked behind the code task
+    await asyncio.wait_for(task, 5)
+    assert seen == [True, True]
+    assert order == ["code-task-done"]
+
+
+async def _max_concurrency(run: Any, n: int) -> int:
+    active = peak = 0
+    done = asyncio.Event()
+    count = 0
+
+    async def job() -> None:
+        nonlocal active, peak, count
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        count += 1
+        if count == n:
+            done.set()
+
+    await run(job, n)
+    await asyncio.wait_for(done.wait(), 5)
+    return peak
+
+
+async def test_claude_reviews_run_one_at_a_time_with_a_bounded_queue() -> None:
+    from app.services.claude_review import ReviewQueueFull, ReviewRunner
+
+    runner = ReviewRunner(max_queue=3)
+
+    async def run(job: Any, n: int) -> None:
+        for _ in range(n):
+            runner.submit(job)
+
+    assert await _max_concurrency(run, 4) == 1
+    await runner.drain()
+    blocker = asyncio.Event()
+
+    async def wait() -> None:
+        await blocker.wait()
+
+    for _ in range(4):  # one running + max_queue waiting
+        runner.submit(wait)
+    with pytest.raises(ReviewQueueFull):
+        runner.submit(wait)
+    blocker.set()
+    await runner.drain()
+
+
+async def test_research_ai_lane_has_one_consumer_and_a_bounded_queue(settings: Settings) -> None:
+    from app.workers.research import AI_RESEARCH, ResearchWorker
+
+    s = settings.model_copy(update={"RESEARCH_QUEUE_MAX": 2})
+    w = ResearchWorker(s, None, {})  # type: ignore[arg-type]
+    lane = w.lane(AI_RESEARCH)
+    assert lane.queue.maxsize == 2
+    assert lane.offer(1) and lane.offer(2) and not lane.offer(3) and lane.dropped == 1
+    # main() starts exactly one consumer per lane (handlers() is one entry per agent).
+    assert list(w.handlers()).count(AI_RESEARCH.id) == 1
+    src = (ROOT / "app" / "workers" / "research.py").read_text()
+    assert "worker.consume(SPECS_BY_ID[k], h)) for k, h in worker.handlers().items()" in src
+
+    while not lane.queue.empty():
+        lane.queue.get_nowait()
+        lane.queue.task_done()
+
+    async def run(job: Any, n: int) -> None:
+        async def handler(_: Any) -> None:
+            await job()
+
+        consumer = asyncio.create_task(w.consume(AI_RESEARCH, handler))
+        for i in range(n):
+            await lane.queue.put(i)
+        await lane.queue.join()
+        consumer.cancel()
+
+    assert await _max_concurrency(run, 3) == 1
+
+
+def test_image_worker_is_single_instance_single_job() -> None:
+    from app.workers import imaging
+
+    src = (ROOT / "app" / "workers" / "imaging.py").read_text()
+    # A Redis NX lock: a second worker refuses to start.
+    assert "redis.set(LOCK_KEY, token, nx=True, ex=LOCK_TTL)" in src
+    assert imaging.LOCK_KEY == "aureon:imaging:worker-lock"
+    # One `current_job` slot; the serve loop awaits each job before claiming the next.
+    assert src.count("self.current_job =") >= 1 and "asyncio.gather" not in src
+
+
+def test_chat_generations_are_serialised_by_default(settings: Settings) -> None:
+    assert Settings.model_fields["OLLAMA_MAX_CONCURRENT"].default == 1
+    assert settings.OLLAMA_MAX_CONCURRENT == 1

@@ -129,6 +129,9 @@ class ReviewRunner:
     async def drain(self) -> None:
         while self._tasks:
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
+            # Let the done-callbacks (`discard`) run: gathering tasks that are already done
+            # does not yield, so without this a finished task could keep the loop spinning.
+            await asyncio.sleep(0)
 
     async def aclose(self) -> None:
         for t in list(self._tasks):
