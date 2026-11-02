@@ -251,6 +251,28 @@ services:
     profiles: [coding]
     restart: unless-stopped
 
+  # GitHub webhook worker (Phase 17, docs/20-github-actions-webhooks.md): processes the
+  # deliveries POST /api/v1/github/webhooks stored and queued on Redis. Same image as the
+  # scheduler. Opt-in: `docker compose --profile github up -d`.
+  github-webhook-worker:
+    image: aureon-agentic:${IMAGE_TAG:-dev}
+    container_name: aureon-github-webhooks
+    env_file: .env
+    environment:
+      ENV: ${ENV:-prod}
+    command: ["python", "-m", "app.workers.github_webhooks"]
+    networks: [aureon, private-ai]   # Redis + Postgres
+    # NO ports.
+    <<: *hardened
+    tmpfs: ["/tmp:size=32m"]
+    mem_limit: 256m
+    cpus: "0.5"
+    healthcheck: *worker-health
+    stop_grace_period: 15s
+    depends_on: *after-api
+    profiles: [github]
+    restart: unless-stopped
+
   # Read-only Docker API for GET /api/system/status. The API never mounts docker.sock
   # (any socket mount, even :ro, is root-equivalent). This proxy allows only GET
   # /containers/*; every write (POST/DELETE) and every other endpoint is refused.

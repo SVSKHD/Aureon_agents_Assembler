@@ -19,6 +19,10 @@
   PUT/PATCH/DELETE set state and are retried like GETs.
 - `request(..., accept=..., raw=True)` returns the body as bytes (e.g. a unified diff),
   read at most `max_bytes` (+1, so the caller can tell it was cut).
+- Actions logs (docs/20-github-actions-webhooks.md): `request(..., return_redirect=True)`
+  hands back an off-host redirect's Location instead of refusing it, and `fetch_log_blob`
+  downloads that URL with a separate, credential-less HTTP client, only from the log hosts
+  (GITHUB_LOG_HOSTS), streaming at most `max_bytes` + 1 bytes. The token never goes there.
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ import asyncio
 import hashlib
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -36,6 +40,7 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 
 from app.core.logging import get_logger
+from app.integrations.github.logs import log_host_allowed
 from app.integrations.github.redact import redact, redact_obj
 
 log = get_logger("integrations.github")
@@ -47,6 +52,7 @@ CACHE_MAX_ENTRIES = 256
 WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # Methods that may be re-sent after a 5xx / network failure.
 RETRYABLE_METHODS = frozenset({"GET", "HEAD", "PUT", "PATCH", "DELETE"})
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 
 def fingerprint(token: str) -> str:
@@ -222,9 +228,18 @@ class GitHubClient:
             follow_redirects=False,
             transport=transport,
         )
+        # Log blobs: pre-signed URLs on another host. No Authorization, no default headers
+        # beyond the user agent, redirects followed by hand (log hosts only).
+        self._blob_http = httpx.AsyncClient(
+            headers={"User-Agent": USER_AGENT},
+            timeout=httpx.Timeout(max(read_timeout, 60.0), connect=connect_timeout),
+            follow_redirects=False,
+            transport=transport,
+        )
 
     async def aclose(self) -> None:
         await self._http.aclose()
+        await self._blob_http.aclose()
 
     def redact(self, text: str) -> str:
         return redact(text, (self._token,))
@@ -257,10 +272,12 @@ class GitHubClient:
         json: Any,
         accept: str | None = None,
         max_bytes: int | None = None,
+        return_redirect: bool = False,
     ) -> httpx.Response:
         """One logical request: same-host redirects only, Authorization added here.
 
         With `max_bytes`, a successful body is streamed and cut after max_bytes + 1 bytes.
+        With `return_redirect`, an off-host redirect is returned as is (never followed).
         """
         headers = {"Authorization": f"Bearer {self._token}"}
         if accept:
@@ -272,10 +289,12 @@ class GitHubClient:
                 )
             else:
                 resp = await self._send_capped(method, url, params, json, headers, max_bytes)
-            if resp.status_code not in (301, 302, 303, 307, 308):
+            if resp.status_code not in REDIRECT_STATUSES:
                 return resp
             target = urljoin(str(resp.url), resp.headers.get("location", ""))
             if not self._same_host(target):
+                if return_redirect:
+                    return resp
                 raise GitHubError(
                     "GitHub redirected to another host; not followed", code="github_redirect"
                 )
@@ -363,10 +382,13 @@ class GitHubClient:
         accept: str | None = None,
         raw: bool = False,
         max_bytes: int | None = None,
+        return_redirect: bool = False,
     ) -> GitHubResponse:
         """Send with retry/backoff/rate-limit handling. Raises a GitHubError on failure.
 
         `raw=True` returns the body as bytes in `data` instead of decoding JSON.
+        `return_redirect=True` answers an off-host redirect with its absolute Location as
+        `data` (a str) and the 3xx status, without following it.
         """
         method = method.upper()
         retryable = method in RETRYABLE_METHODS
@@ -377,7 +399,9 @@ class GitHubClient:
             attempt += 1
             self._check_floor()
             try:
-                resp = await self._send(method, path, params, json, accept, max_bytes)
+                resp = await self._send(
+                    method, path, params, json, accept, max_bytes, return_redirect
+                )
             except httpx.TransportError as exc:
                 detail = self.redact(f"{type(exc).__name__}: {exc}")
                 if attempt >= self.max_attempts or not retryable:
@@ -400,6 +424,9 @@ class GitHubClient:
                     except ValueError:
                         data = resp.text
                 return GitHubResponse(resp.status_code, data, resp.headers)
+            if return_redirect and resp.status_code in REDIRECT_STATUSES:
+                location = urljoin(str(resp.url), resp.headers.get("location", ""))
+                return GitHubResponse(resp.status_code, location, resp.headers)
 
             wait = self._rate_limit_wait(resp)
             if wait is not None:
@@ -428,6 +455,68 @@ class GitHubClient:
         delay = self.backoff_base * 2 ** (attempt - 1)
         log.info("github_retry", path=self.redact(path), attempt=attempt, delay=delay, error=detail)
         await self._sleep(delay)
+
+    async def fetch_log_blob(
+        self,
+        url: str,
+        *,
+        allowed_hosts: Sequence[str],
+        max_bytes: int,
+        tail_bytes: int | None = None,
+    ) -> tuple[bytes, bool]:
+        """GET a pre-signed log URL -> (body, truncated). Only https URLs on `allowed_hosts`
+        are fetched (each redirect hop is checked too); no credentials are sent. The URL
+        carries a signature, so it is never logged or put in an error, only its host.
+
+        At most `max_bytes` are downloaded. With `tail_bytes`, only the last `tail_bytes` of
+        what was downloaded are kept in memory and returned (logs are read tail-first)."""
+        for _ in range(MAX_REDIRECTS + 1):
+            host = (urlsplit(url).hostname or "?").lower()
+            if not log_host_allowed(url, allowed_hosts):
+                log.warning("github_log_host_refused", host=host)
+                raise GitHubError(
+                    f"log download refused: host {host} is not an allowed log host",
+                    code="github_log_host_refused",
+                )
+            try:
+                req = self._blob_http.build_request("GET", url)
+                resp = await self._blob_http.send(req, stream=True)
+            except httpx.TransportError as exc:
+                log.warning("github_log_fetch_failed", host=host, error=type(exc).__name__)
+                raise GitHubUnavailable(
+                    f"log host {host} unreachable: {type(exc).__name__}"
+                ) from None
+            try:
+                if resp.status_code in REDIRECT_STATUSES:
+                    url = urljoin(url, resp.headers.get("location", ""))
+                    continue
+                if resp.status_code >= 300:
+                    code = resp.status_code
+                    log.warning("github_log_fetch_error", host=host, status=code)
+                    if code in (403, 404, 410):  # expired / deleted logs
+                        raise GitHubNotFound("the log is no longer available", upstream_status=code)
+                    raise GitHubUnavailable(f"log host returned {code}", upstream_status=code)
+                buf = bytearray()
+                seen = 0
+                async for chunk in resp.aiter_bytes():
+                    seen += len(chunk)
+                    buf.extend(chunk)
+                    if tail_bytes is not None and len(buf) > 2 * tail_bytes:
+                        del buf[: len(buf) - tail_bytes]
+                    if seen > max_bytes:
+                        if tail_bytes is not None:
+                            return bytes(buf[-tail_bytes:]), True
+                        return bytes(buf[:max_bytes]), True
+                if tail_bytes is not None and len(buf) > tail_bytes:
+                    return bytes(buf[-tail_bytes:]), True
+                return bytes(buf), False
+            except httpx.TransportError as exc:
+                raise GitHubUnavailable(
+                    f"log download from {host} failed: {type(exc).__name__}"
+                ) from None
+            finally:
+                await resp.aclose()
+        raise GitHubError("too many redirects from the log host", code="github_redirect")
 
     # --- helpers --------------------------------------------------------------------------
 

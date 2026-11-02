@@ -47,7 +47,7 @@ from app.models.agents import Agent, AgentLog, AgentRun, ScheduledJob
 from app.models.auth import UserSession
 from app.models.finance import FinanceTombstone
 from app.models.trading import BrokerAccount
-from app.services import dhan_sync, github, mt5_sync, news, paper
+from app.services import dhan_sync, github, github_actions, mt5_sync, news, paper
 
 log = get_logger("worker.scheduler")
 MAX_BACKOFF_SECONDS = 3600
@@ -245,6 +245,21 @@ async def github_sync(ctx: TaskContext) -> dict[str, Any]:
     return out
 
 
+async def github_actions_sync(ctx: TaskContext) -> dict[str, Any]:
+    """Recent workflow runs of the allowlisted repos -> github.workflow_runs
+    (docs/20-github-actions-webhooks.md). Webhooks keep the table current; this fills gaps."""
+    client = ctx.github
+    if client is None:
+        raise RuntimeError("GitHub is not configured (GITHUB_TOKEN)")
+    # Read the pause flag only: github_sync owns the `github` agent's heartbeat details.
+    if await AgentRegistry(ctx.maker).is_paused(GITHUB.id):
+        return {"skipped": "github agent is paused"}
+    out = await github_actions.sync_actions(ctx.maker, client, ctx.settings)
+    if out["errors"] and not out["runs_upserted"]:
+        raise RuntimeError(f"GitHub Actions sync failed: {'; '.join(out['errors'][:5])}")
+    return out
+
+
 TASKS: dict[str, TaskFn] = {
     "purge_agent_history": purge_agent_history,
     "purge_expired_sessions": purge_expired_sessions,
@@ -257,6 +272,7 @@ TASKS: dict[str, TaskFn] = {
     "paper_reconcile": paper_reconcile,
     "news_pull": news_pull,
     "github_sync": github_sync,
+    "github_actions_sync": github_actions_sync,
 }
 
 # (id, task, cron) — created if missing; an admin's later edits (pause etc.) are kept.
@@ -291,6 +307,9 @@ def default_jobs(settings: Settings) -> list[tuple[str, str, str]]:
         jobs.append(("news-pull", "news_pull", settings.NEWS_PULL_CRON))
     if settings.github_configured:
         jobs.append(("github-sync", "github_sync", settings.GITHUB_SYNC_CRON))
+        jobs.append(
+            ("github-actions-sync", "github_actions_sync", settings.GITHUB_ACTIONS_SYNC_CRON)
+        )
     return jobs
 
 

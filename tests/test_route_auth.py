@@ -23,7 +23,11 @@ PUBLIC = {
     # Read-only public data for the frontend, rate-limited per IP (docs/02, D-backend).
     ("GET", "/api/public/shares/{doc_id}"),
     ("GET", "/api/public/forex"),
+    # GitHub webhook receiver: authenticated by its HMAC signature instead (docs/20).
+    ("POST", "/api/v1/github/webhooks"),
 }
+# Public routes that change state, each with its own authentication.
+PUBLIC_UNSAFE = {"/api/auth/login", "/api/v1/github/webhooks"}
 # Public routes that must carry the per-IP limiter dependency.
 PUBLIC_RATE_LIMITED = {p for m, p in PUBLIC if p.startswith("/api/public/")}
 
@@ -111,6 +115,17 @@ ADMIN = {
     ("GET", "/api/v1/approvals/{approval_id}"),
     ("POST", "/api/v1/approvals/{approval_id}/approve"),
     ("POST", "/api/v1/approvals/{approval_id}/deny"),
+    # Phase 17 Actions: admin only (docs/20-github-actions-webhooks.md).
+    ("GET", "/api/v1/github/repositories/{owner}/{repo}/actions/workflows"),
+    ("GET", "/api/v1/github/repositories/{owner}/{repo}/actions/runs"),
+    ("GET", "/api/v1/github/repositories/{owner}/{repo}/actions/runs/{run_id}"),
+    ("GET", "/api/v1/github/repositories/{owner}/{repo}/actions/runs/{run_id}/jobs"),
+    ("GET", "/api/v1/github/repositories/{owner}/{repo}/actions/runs/{run_id}/logs"),
+    ("GET", "/api/v1/github/repositories/{owner}/{repo}/actions/jobs/{job_id}/logs"),
+    ("POST", "/api/v1/github/repositories/{owner}/{repo}/actions/workflows/{workflow}/dispatch"),
+    ("POST", "/api/v1/github/repositories/{owner}/{repo}/actions/runs/{run_id}/rerun"),
+    ("POST", "/api/v1/github/repositories/{owner}/{repo}/actions/runs/{run_id}/rerun-failed"),
+    ("POST", "/api/v1/github/repositories/{owner}/{repo}/actions/runs/{run_id}/cancel"),
 }
 
 SAFE = {"GET", "HEAD", "OPTIONS"}
@@ -135,7 +150,7 @@ def test_every_route_requires_auth_except_the_public_allowlist(settings: Setting
     for m, p, deps in pairs:
         if (m, p) in PUBLIC:
             assert "get_current" not in deps, (m, p)
-            assert m in SAFE or p == "/api/auth/login", (m, p)
+            assert m in SAFE or p in PUBLIC_UNSAFE, (m, p)
         if p in PUBLIC_RATE_LIMITED:
             assert "rate_limited" in deps, (m, p)
 

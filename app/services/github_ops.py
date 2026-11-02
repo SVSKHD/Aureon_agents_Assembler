@@ -804,13 +804,19 @@ async def file_gated(
     kind: str,
     payload: dict[str, Any],
     artifact: dict[str, Any] | None = None,
+    op: str | None = None,
+    target: str | None = None,
 ) -> GatedOut:
     """Store a pending approval request + a `pending_approval` tracked operation. Nothing is
-    written to GitHub here (only GETs, to compute the artifact)."""
+    written to GitHub here (only GETs, to compute the artifact).
+
+    Kinds registered outside this module (e.g. github.workflow_dispatch_prod) pass their own
+    `artifact`, `op` and `target`."""
     if artifact is None:
         artifact = await artifact_for(client, kind, payload)
     full = str(payload["repo"])
-    target = _target(kind, payload)
+    target = target or _target(kind, payload)
+    op_name = op or KIND_OPS[kind]
     # The approval keeps the exact payload (it is what gets executed); the tracked operation
     # keeps the redacted, size-capped copy.
     exact = payload | {"artifact": artifact}
@@ -825,8 +831,8 @@ async def file_gated(
             client=actor.client,
             db=db,
         )
-        op = GitHubTrackedOperation(
-            op=KIND_OPS[kind],
+        row = GitHubTrackedOperation(
+            op=op_name,
             repo=full,
             target=target,
             request_payload=stored,
@@ -834,14 +840,14 @@ async def file_gated(
             approval_request_id=req.id,
             actor=actor.user_id,
         )
-        db.add(op)
+        db.add(row)
         await db.flush()
         audit.record(
             db,
-            "github_" + KIND_OPS[kind].replace(".", "_") + "_requested",
+            "github_" + op_name.replace(".", "_") + "_requested",
             actor.client,
             actor_user_id=actor.user_id,
-            details={"repo": full, "target": target, "approval_id": str(req.id), "op_id": op.id},
+            details={"repo": full, "target": target, "approval_id": str(req.id), "op_id": row.id},
         )
         return GatedOut(
             approval_id=req.id,
@@ -850,7 +856,7 @@ async def file_gated(
             target=req.target,
             artifact_sha256=req.artifact_sha256,
             expires_at=req.expires_at,
-            operation_id=op.id,
+            operation_id=row.id,
             artifact=artifact,
         )
 
