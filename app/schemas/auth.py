@@ -36,3 +36,12 @@ class LoginResponse(BaseModel):
 
 class RevokeAllResponse(BaseModel):
     revoked: int
+
+
+class SessionOut(BaseModel):
+    id: uuid.UUID
+    created_at: datetime
+    expires_at: datetime
+    ip: str | None
+    user_agent: str | None
+    current: bool

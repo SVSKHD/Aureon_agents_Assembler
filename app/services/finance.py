@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -22,7 +22,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.finance import (
     LEGACY,
     OWNED_TABLES,
+    FinanceAttachment,
     FinanceIdentity,
+    FinanceTombstone,
     astra_documents,
     expenses,
     portfolio_profiles,
@@ -100,9 +102,12 @@ async def list_rows(
     match: dict[str, str],
     limit: int,
     offset: int,
+    updated_since: datetime | None = None,
 ) -> tuple[list[BaseModel], int]:
     t = res.table
     conds = [_mine(res, user_id)]
+    if updated_since is not None:
+        conds.append(t.c.updated_at > updated_since)
     if date_from:
         conds.append(t.c[res.date_col] >= date_from)
     if date_to:
@@ -187,9 +192,24 @@ async def patch_row(
     return await get_row(db, res, user_id, row_id)
 
 
-async def delete_row(db: AsyncSession, res: Resource, user_id: uuid.UUID, row_id: str) -> None:
+async def delete_row(db: AsyncSession, res: Resource, user_id: uuid.UUID, row_id: str) -> list[str]:
+    """Delete the row, its attachment records and write a tombstone. Returns the attachment
+    storage paths (relative to DATA_ROOT) for the caller to unlink after commit."""
     await _row(db, res, user_id, row_id)
     await db.execute(delete(res.table).where(_mine(res, user_id), res.table.c.id == row_id))
+    paths = (
+        await db.scalars(
+            delete(FinanceAttachment)
+            .where(
+                FinanceAttachment.aureon_user_id == user_id,
+                FinanceAttachment.kind == res.name,
+                FinanceAttachment.ref == row_id,
+            )
+            .returning(FinanceAttachment.storage_path)
+        )
+    ).all()
+    db.add(FinanceTombstone(aureon_user_id=user_id, kind=res.name, ref=row_id))
+    return list(paths)
 
 
 async def totals(
@@ -236,10 +256,17 @@ def _doc_out(row: Any) -> s.DocumentOut:
 
 
 async def list_documents(
-    db: AsyncSession, user_id: uuid.UUID, namespace: str, limit: int, offset: int
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    namespace: str,
+    limit: int,
+    offset: int,
+    updated_since: datetime | None = None,
 ) -> tuple[list[s.DocumentOut], int]:
     t = astra_documents
     where = and_(t.c.aureon_user_id == user_id, t.c.namespace == namespace)
+    if updated_since is not None:
+        where = and_(where, t.c.updated_at > updated_since)
     total = int(await db.scalar(select(func.count()).select_from(t).where(where)) or 0)
     rows = (
         await db.execute(
@@ -308,6 +335,68 @@ async def delete_document(
         delete(t).where(
             t.c.namespace == namespace, t.c.doc_id == doc_id, t.c.aureon_user_id == user_id
         )
+    )
+    db.add(FinanceTombstone(aureon_user_id=user_id, kind="document", ref=f"{namespace}/{doc_id}"))
+
+
+# --- change sync ------------------------------------------------------------------------------
+
+
+async def changes(
+    db: AsyncSession, user_id: uuid.UUID, since: datetime, max_rows: int
+) -> s.ChangesOut:
+    """Everything of this user's that changed after `since`, oldest change first.
+
+    The cursor is taken before reading, so a write racing this call is sent again next
+    time rather than lost. When any list hits `max_rows`, `truncated` is set and the
+    cursor is the oldest "last change" among the truncated lists: call again with it."""
+    cursor = _now()
+    out: dict[str, Any] = {}
+    truncated_at: list[datetime] = []
+    for res in RESOURCES.values():
+        t = res.table
+        rows = (
+            await db.execute(
+                select(t)
+                .where(_mine(res, user_id), t.c.updated_at > since)
+                .order_by(t.c.updated_at, t.c.id)
+                .limit(max_rows)
+            )
+        ).all()
+        out[res.name] = [_out(res, r) for r in rows]
+        if len(rows) == max_rows:
+            truncated_at.append(rows[-1].updated_at)
+    d = astra_documents
+    docs = (
+        await db.execute(
+            select(d)
+            .where(d.c.aureon_user_id == user_id, d.c.updated_at > since)
+            .order_by(d.c.updated_at, d.c.namespace, d.c.doc_id)
+            .limit(max_rows)
+        )
+    ).all()
+    if len(docs) == max_rows:
+        truncated_at.append(docs[-1].updated_at)
+    tombs = (
+        await db.scalars(
+            select(FinanceTombstone)
+            .where(FinanceTombstone.aureon_user_id == user_id, FinanceTombstone.deleted_at > since)
+            .order_by(FinanceTombstone.deleted_at, FinanceTombstone.id)
+            .limit(max_rows)
+        )
+    ).all()
+    if len(tombs) == max_rows:
+        truncated_at.append(tombs[-1].deleted_at)
+    return s.ChangesOut(
+        # Rows at exactly the returned cursor are resent next time (filter is strictly >),
+        # so step back a microsecond: duplicates are harmless, gaps are not.
+        cursor=min(truncated_at) - timedelta(microseconds=1) if truncated_at else cursor,
+        truncated=bool(truncated_at),
+        trades=out["trades"],
+        expenses=out["expenses"],
+        secured=out["secured"],
+        documents=[_doc_out(r) for r in docs],
+        deleted=[s.TombstoneOut(kind=x.kind, ref=x.ref, deleted_at=x.deleted_at) for x in tombs],
     )
 
 

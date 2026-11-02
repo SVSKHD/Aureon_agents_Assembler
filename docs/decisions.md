@@ -36,3 +36,39 @@ what would change it. Newest phase last.
 - **D-A7: Supabase RLS stays.** The policies, the `astra_uid()` defaults and the Realtime
   publication on the live tables are left untouched. Aureon connects as the table owner, so RLS
   does not apply to it, and the scoping is enforced in `app/services/finance.py`.
+
+## D-backend — Frontend support APIs
+
+- **D-Dbe-1: tombstone pruning.** Tombstones are pruned inside the existing
+  `purge_agent_history` task, not a new job. The default job set (and its test) stays the
+  same. Retention is `FINANCE_TOMBSTONE_RETENTION_DAYS`, default 30.
+- **D-Dbe-2: the changes cursor.** The cursor is the server time taken *before* reading, so a
+  racing write is resent rather than lost. Lists are capped (`FINANCE_CHANGES_MAX_ROWS`). On a
+  cap, `truncated: true` is returned, and the cursor steps back to just before the oldest
+  truncated item. Duplicates are harmless; gaps are not. A naive `since` (no UTC offset) is
+  422.
+- **D-Dbe-3: deleting a row deletes its attachments.** Records go in the same transaction, and
+  files are unlinked after commit. A leftover file is harmless; a dangling record is not.
+  Tombstones are not cleared when an id is re-created. Clients compare `deleted_at` with
+  `updated_at`.
+- **D-Dbe-4: the content type comes from magic bytes only.** The stored and served type is the
+  sniffed one. The file is served with `Content-Disposition: attachment`, `nosniff` and
+  `Cache-Control: private, no-store`. The client filename is cleaned to a display name and
+  never touches the filesystem.
+- **D-Dbe-5: the per-user cap is 409, not 413.** 409 `attachment_limit` keeps 413 to mean "this
+  file is too big".
+- **D-Dbe-6: the public rate limit fails open.** It reuses the Redis fixed-window limiter
+  (`app/agents/trading/ratelimit.py`), keyed by a hash of the client IP. If Redis is down, the
+  public read-only endpoints still answer, with a warning logged, rather than going dark.
+- **D-Dbe-7: public forex shows only ownerless rows.** A user can write their own `forex`
+  documents through the documents API, and those must not become public. The news job also
+  never overwrites a user-owned row with the same id.
+- **D-Dbe-8: owner ids are stripped at every depth.** `ownerId` and `userId` are removed from
+  public share data recursively, including inside nested objects and lists.
+- **D-Dbe-9: defusedxml is optional.** It is not added as a dependency. Any DOCTYPE or ENTITY
+  declaration is refused before parsing, which blocks XXE and entity-expansion attacks with
+  the stdlib parser. defusedxml is used if it is installed.
+- **D-Dbe-10: revoking a session.** Revoking the current session through
+  `DELETE /api/auth/sessions/{id}` also clears its cookies. An already revoked or expired own
+  session is 404, like an unknown one.
+- **D-Dbe-11: new dependency `python-multipart`.** FastAPI needs it for the multipart upload.
