@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -67,7 +68,42 @@ class Settings(BaseSettings):
     CHAT_DEFAULT_NUM_CTX: int = Field(default=4096, ge=256)
     CHAT_MAX_NUM_CTX: int = Field(default=8192, ge=256)
 
-    @field_validator("CORS_ORIGINS", mode="before")
+    # --- imaging (docs/04-imaging.md) ---
+    # "subprocess" runs IMAGE_AGENT_COMMAND; "stub" writes a placeholder PNG (tests/dev only).
+    IMAGE_GENERATOR: Literal["subprocess", "stub"] = "subprocess"
+    # JSON argv template for the existing /opt/image-agent entrypoint, run WITHOUT a shell.
+    # Placeholders: {prompt} {negative_prompt} {seed} {steps} {width} {height} {output}.
+    IMAGE_AGENT_COMMAND: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # Extra env var NAMES copied into the entrypoint's environment (secrets are never passed).
+    IMAGE_AGENT_ENV_PASSTHROUGH: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    IMAGE_THREADS: int = Field(default=3, ge=1)
+    IMAGE_MODEL_NAME: str = "sd-1.5"
+    IMAGE_ALLOWED_SIZES: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["512x512", "512x768", "768x512"]
+    )
+    IMAGE_DEFAULT_STEPS: int = Field(default=25, ge=1)
+    IMAGE_MAX_STEPS: int = Field(default=50, ge=1)
+    # Jobs allowed to wait (status=queued) across all users; beyond that POST returns 429.
+    IMAGE_QUEUE_MAX: int = Field(default=5, ge=1)
+    IMAGE_RETRY_AFTER: int = Field(default=600, ge=1)
+    IMAGE_JOB_TIMEOUT_SECONDS: float = Field(default=1800.0, gt=0)
+    # A job interrupted by a worker stop is retried until it has started this many times.
+    IMAGE_MAX_ATTEMPTS: int = Field(default=2, ge=1)
+    # How often the worker checks for cancel requests and saves progress.
+    IMAGE_POLL_SECONDS: float = Field(default=2.0, gt=0)
+    IMAGE_QUEUE_KEY: str = "aureon:imaging:wake"
+    IMAGE_STUB_DELAY: float = Field(default=0.0, ge=0)
+
+    @field_validator("IMAGE_AGENT_COMMAND", mode="before")
+    @classmethod
+    def _parse_command(cls, v: object) -> object:
+        if isinstance(v, str):
+            return json.loads(v) if v.strip() else []
+        return v
+
+    @field_validator(
+        "CORS_ORIGINS", "IMAGE_AGENT_ENV_PASSTHROUGH", "IMAGE_ALLOWED_SIZES", mode="before"
+    )
     @classmethod
     def _split_origins(cls, v: object) -> object:
         if isinstance(v, str):
