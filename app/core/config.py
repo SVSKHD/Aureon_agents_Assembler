@@ -7,9 +7,9 @@ from decimal import Decimal
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -195,11 +195,40 @@ class Settings(BaseSettings):
     RESEARCH_AI_QUEUE_MAX: int = Field(default=20, ge=1, le=1000)
     RESEARCH_AI_TIMEOUT_SECONDS: float = Field(default=600.0, gt=0)
 
+    # --- coding agent (docs/05-agents.md, "Coding agent") ---
+    # JSON: {"name": {"path": "/abs/checkout", "base": "dev01", "tests": [["npm","test"]],
+    #                 "link": ["node_modules"]}}. Nothing outside these repos is readable.
+    CODE_REPOS: Annotated[dict[str, Any], NoDecode] = Field(default_factory=dict)
+    # Exact argv lists the agent may run (empty = the built-in safe list).
+    CODE_ALLOWED_COMMANDS: Annotated[list[list[str]], NoDecode] = Field(default_factory=list)
+    # Branches the agent may never write, merge into or approve onto.
+    CODE_PROTECTED_BRANCHES: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["main", "master", "dev01", "dev", "develop", "production"]
+    )
+    CODE_WORKTREE_ROOT: Path = Path("/mnt/spasta-data/code-worktrees")
+    # Local Ollama coding model (e.g. qwen2.5-coder:7b); empty = tasks fail "not configured".
+    CODE_MODEL: str | None = None
+    CODE_MODEL_TIMEOUT_SECONDS: float = Field(default=900.0, gt=0)
+    CODE_TEST_TIMEOUT_SECONDS: float = Field(default=900.0, gt=0)
+    CODE_MAX_CONTEXT_BYTES: int = Field(default=120_000, ge=1000)
+    CODE_MAX_FILE_BYTES: int = Field(default=400_000, ge=1000)
+    CODE_MAX_PATCH_BYTES: int = Field(default=200_000, ge=1000)
+    CODE_POLL_SECONDS: float = Field(default=3.0, gt=0)
+
     # --- real-time trading stream for the frontend (GET /api/trading/stream) ---
     TRADING_STREAM_POLL_SECONDS: float = Field(default=2.0, gt=0)
     TRADING_STREAM_HEARTBEAT_SECONDS: float = Field(default=15.0, gt=0)
     # The stream ends after this long; the browser's EventSource reconnects with its cursor.
     TRADING_STREAM_MAX_SECONDS: float = Field(default=1800.0, gt=0)
+
+    @field_validator("CODE_REPOS", "CODE_ALLOWED_COMMANDS", mode="before")
+    @classmethod
+    def _parse_json(cls, v: object, info: ValidationInfo) -> object:
+        if isinstance(v, str):
+            if v.strip():
+                return json.loads(v)
+            return {} if info.field_name == "CODE_REPOS" else []
+        return v
 
     @field_validator("IMAGE_AGENT_COMMAND", mode="before")
     @classmethod
@@ -216,6 +245,7 @@ class Settings(BaseSettings):
         "DHAN_BACKFILL_INSTRUMENTS",
         "DHAN_BACKFILL_TIMEFRAMES",
         "RESEARCH_EMA_PERIODS",
+        "CODE_PROTECTED_BRANCHES",
         mode="before",
     )
     @classmethod

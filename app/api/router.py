@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.api.v1 import agents, ai, auth, health, images, trading
+from app.api.v1 import agents, ai, auth, code, health, images, trading
 
 api_router = APIRouter(prefix="/api")
 api_router.include_router(health.router)
@@ -11,3 +11,4 @@ api_router.include_router(ai.router)
 api_router.include_router(images.router)
 api_router.include_router(agents.router)
 api_router.include_router(trading.router)
+api_router.include_router(code.router)
