@@ -36,6 +36,8 @@ class AgentSpec:
 OLLAMA = AgentSpec("ollama", "Ollama chat", "llm")
 IMAGING = AgentSpec("imaging", "Stable Diffusion worker", "imaging")
 SCHEDULER = AgentSpec("scheduler", "Scheduler", "scheduler")
+# Heartbeat comes from the scheduler's `github_sync` task (docs/18-github-foundation.md).
+GITHUB = AgentSpec("github", "GitHub integration", "integration")
 
 
 def effective_state(agent: Agent, stale_after: float, now: datetime | None = None) -> str:
