@@ -3,9 +3,60 @@
 from __future__ import annotations
 
 import logging
+import re
 import sys
+from collections.abc import Mapping
+from typing import Any
 
 import structlog
+
+REDACTED = "***"
+# Any key containing one of these (case-insensitive) has its value masked, at any depth.
+SENSITIVE_KEY = re.compile(
+    r"token|passw|secret|authorization|cookie|api[_-]?key|apikey|credential|private[_-]?key"
+    r"|session[_-]?id|dsn|database_url",
+    re.IGNORECASE,
+)
+# user:password@ in URLs/DSNs, and bearer tokens, inside free-text values.
+_URL_CREDS = re.compile(r"(?P<scheme>[a-z][a-z0-9+.-]*://)(?P<user>[^:/@\s]+):[^@/\s]+@", re.I)
+_BEARER = re.compile(r"(?P<p>\b(?:bearer|token)\s+)[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE)
+# GitHub credentials in free text (classic/OAuth/app tokens and fine-grained PATs).
+_GITHUB_TOKEN = re.compile(r"github_pat_[A-Za-z0-9_]{8,}|gh[pousr]_[A-Za-z0-9]{8,}")
+_MAX_DEPTH = 6
+
+
+def _scrub_text(value: str) -> str:
+    value = _URL_CREDS.sub(lambda m: f"{m['scheme']}{m['user']}:{REDACTED}@", value)
+    value = _BEARER.sub(lambda m: f"{m['p']}{REDACTED}", value)
+    return _GITHUB_TOKEN.sub(REDACTED, value)
+
+
+def _scrub(value: Any, depth: int = 0) -> Any:
+    if depth > _MAX_DEPTH:
+        return value
+    if isinstance(value, str):
+        return _scrub_text(value)
+    if isinstance(value, Mapping):
+        return {
+            k: REDACTED if isinstance(k, str) and SENSITIVE_KEY.search(k) else _scrub(v, depth + 1)
+            for k, v in value.items()
+        }
+    if isinstance(value, list | tuple):
+        return type(value)(_scrub(v, depth + 1) for v in value)
+    return value
+
+
+def redact_secrets(
+    _logger: Any, _method: str, event_dict: structlog.types.EventDict
+) -> structlog.types.EventDict:
+    """structlog processor: mask secret-looking keys and credentials embedded in strings."""
+    for key in list(event_dict):
+        value = event_dict[key]
+        if SENSITIVE_KEY.search(key):
+            event_dict[key] = REDACTED
+        elif key not in ("timestamp", "level", "logger"):
+            event_dict[key] = _scrub(value)
+    return event_dict
 
 
 def configure_logging(level: str = "INFO") -> None:
@@ -19,6 +70,7 @@ def configure_logging(level: str = "INFO") -> None:
             *shared,
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
+            redact_secrets,  # last before rendering, so tracebacks are scrubbed too
             structlog.processors.JSONRenderer(),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(logging.getLevelName(level.upper())),
@@ -33,6 +85,7 @@ def configure_logging(level: str = "INFO") -> None:
             foreign_pre_chain=shared,
             processors=[
                 structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+                redact_secrets,
                 structlog.processors.JSONRenderer(),
             ],
         )

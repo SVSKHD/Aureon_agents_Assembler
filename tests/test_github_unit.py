@@ -404,3 +404,19 @@ def test_no_token_means_no_client_and_no_job() -> None:
     assert not s.github_configured and build_github_client(s) is None
     assert s.GITHUB_ALLOWED_OWNERS == []
     assert all(j[1] != "github_sync" for j in default_jobs(s))
+
+
+def test_global_log_processor_masks_github_tokens_in_free_text() -> None:
+    from app.core.logging import redact_secrets
+
+    ev = redact_secrets(None, "info", {"event": f"lib said {TOKEN} / {CLASSIC}", "x": [CLASSIC]})
+    assert TOKEN not in repr(ev) and CLASSIC not in repr(ev)
+
+
+def test_prod_check_requires_https_github_api() -> None:
+    from app.core.prod_checks import production_problems
+
+    s = _settings(GITHUB_TOKEN=TOKEN, GITHUB_API_URL="http://plain.test")
+    assert any("GITHUB_API_URL" in p for p in production_problems(s))
+    s = _settings(GITHUB_TOKEN=TOKEN)
+    assert not any("GITHUB_API_URL" in p for p in production_problems(s))

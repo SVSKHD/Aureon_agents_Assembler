@@ -219,7 +219,7 @@ async def test_live_unreachable_with_feature_flag_off(make_env: EnvFactory) -> N
 
 
 async def test_live_gate_with_flag_on_still_blocked_until_phase_g(make_env: EnvFactory) -> None:
-    async with make_env(TRADING_LIVE_ENABLED=True) as env:
+    async with make_env(TRADING_LIVE_ENABLED=True, PHASE_G_APPROVED="yes") as env:
         acct = await env.account()
         url = f"/api/trading/accounts/{acct}/mode"
         no_token = await env.send("admin", "POST", url, json={"mode": "LIVE"})

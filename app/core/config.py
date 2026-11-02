@@ -9,7 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import Field, SecretStr, ValidationInfo, field_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -24,6 +24,10 @@ class Settings(BaseSettings):
 
     ENV: Environment = Environment.DEV
     LOG_LEVEL: str = "INFO"
+    # Never true in prod (startup refuses it; see app/core/prod_checks.py).
+    DEBUG: bool = False
+    # Swagger UI + /api/openapi.json. Unset = on outside prod, off in prod. True is refused in prod.
+    API_DOCS_ENABLED: bool | None = None
 
     # postgresql+asyncpg://user:pass@<postgres-container>:5432/spasta
     DATABASE_URL: SecretStr
@@ -114,6 +118,9 @@ class Settings(BaseSettings):
     # Feature flag for LIVE mode. Off: LIVE cannot be selected at all. On: LIVE still needs
     # an admin confirmation token AND the Phase G preconditions (not implemented yet).
     TRADING_LIVE_ENABLED: bool = False
+    # TRADING_LIVE_ENABLED=true is refused at load time unless this is exactly "yes" (the
+    # Phase G sign-off). Even then LIVE stays unreachable until Phase G ships its preconditions.
+    PHASE_G_APPROVED: str = ""
     TRADING_LIVE_TOKEN_TTL_SECONDS: int = Field(default=300, ge=30, le=3600)
     # Per-call timeout for read-only broker adapter calls.
     TRADING_ADAPTER_TIMEOUT: float = Field(default=10.0, gt=0)
@@ -338,6 +345,20 @@ class Settings(BaseSettings):
         if len(v.get_secret_value()) < 32:
             raise ValueError("SECRET_KEY must be at least 32 characters")
         return v
+
+    @model_validator(mode="after")
+    def _live_needs_phase_g(self) -> Settings:
+        if self.TRADING_LIVE_ENABLED and self.PHASE_G_APPROVED != "yes":
+            raise ValueError(
+                "TRADING_LIVE_ENABLED=true requires PHASE_G_APPROVED=yes (Phase G sign-off)"
+            )
+        return self
+
+    @property
+    def docs_enabled(self) -> bool:
+        if self.API_DOCS_ENABLED is None:
+            return self.ENV is not Environment.PROD
+        return self.API_DOCS_ENABLED
 
     @property
     def data_marker_path(self) -> Path:

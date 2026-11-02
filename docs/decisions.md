@@ -73,6 +73,54 @@ what would change it. Newest phase last.
   session is 404, like an unknown one.
 - **D-Dbe-11: new dependency `python-multipart`.** FastAPI needs it for the multipart upload.
 
+## E — Production hardening (Prompt 13)
+
+- **D-E1: migrate runs on every `up`.** The `migrate` one-shot left the `tools` profile. It
+  waits for the external Postgres (`MIGRATE_WAIT_SECONDS`) and then runs `alembic upgrade
+  head`, and the API starts only after it exits 0. Why: compose cannot order on a container in
+  another project, and every migration is additive and idempotent at head, so after a reboot
+  or upgrade the schema is right before traffic. To change it, put the profile back (docs/16,
+  Rollback).
+- **D-E2: the LIVE refusal lives in Settings, not just the API.** `TRADING_LIVE_ENABLED=true`
+  without `PHASE_G_APPROVED=yes` fails at settings load in every process and every ENV, so no
+  worker can start with it either. The Phase G gate in `services/trading.py` is unchanged:
+  LIVE still answers `preconditions_unmet`.
+- **D-E3: low-entropy SECRET_KEY counts as weak.** Prod requires ≥ 12 distinct characters on
+  top of the existing 32-char minimum, because `"k"*48` passed the old check.
+- **D-E4: OpenAPI is off in prod.** `/api/openapi.json` was public. The frontend's typed client
+  comes from `scripts/export_openapi.py`, which calls `app.openapi()` directly and is
+  unaffected. `API_DOCS_ENABLED` can re-enable docs outside prod only.
+- **D-E5: worker health = heartbeat file age.** Workers have no HTTP port. The registry
+  heartbeat touches `/tmp/aureon-heartbeat` (tmpfs, per container) after each successful DB
+  heartbeat. The healthcheck reads only that file, with no DB or network load. A worker that
+  cannot reach the DB turns unhealthy, which is the useful signal.
+- **D-E6: two dumps, not one.** `pg_dump` ignores `-n` once a `-t` is present, so the owned
+  schemas and the public finance tables are dumped separately. The legacy tables' default
+  function (`astra_uid`) is saved via `pg_get_functiondef`, so they restore into a fresh
+  database.
+- **D-E7: Postgres is reached inside its own container.** The scripts use `docker compose exec
+  -T` on the private-ai project (or `docker exec -i` with `PG_CONTAINER`) and the local socket.
+  No port, no password, and no secret is read by the scripts.
+- **D-E8: retention trusts names, not mtimes.** Deletion is by the UTC stamp in the folder
+  name, only for real directories with a `MANIFEST.json`, strictly inside `BACKUP_DIR`, and
+  only after a successful backup. A failed run never prunes.
+- **D-E9: restore never overwrites.** The default target is a new database. Data files unpack
+  into a new `DATA_ROOT/restore-<ts>/`. Overwriting the live DB needs both
+  `--into-live --yes-i-am-sure` and runs as one transaction.
+- **D-E10: boot = systemd oneshot around compose.** `aureon.service` has
+  `RequiresMountsFor=/mnt/spasta-data` and `Requires/After=docker.service`, runs
+  `docker compose up -d`, then `healthcheck.sh --wait 300` (report only). It does not use
+  `up --wait`, because some compose versions treat exited one-shots as failures.
+- **D-E11: Redis runs as uid 999** so every capability can be dropped (the entrypoint otherwise
+  needs CHOWN/SETUID to step down). This needs a one-time `chown` of the AOF dir (manual-setup
+  step 0).
+- **D-E12: isolate whatever runs model-written code.** The coding worker is non-dumpable and
+  left the `aureon` network. The Docker proxy, whose container-inspect output includes every
+  container's env, sits on an internal network with only the API.
+- **D-E13: readiness detail stays on the box.** Nginx answers 404 to `/api/health/ready` from
+  outside, and the endpoint itself is unchanged. Changing it would break the existing tests and
+  monitoring contract, and the leak is minor (Postgres version, model count).
+
 ## 15 — GitHub foundation
 
 - **D-15-1: the token comes from env only, and only its fingerprint is stored.**

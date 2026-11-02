@@ -16,12 +16,13 @@ from app.agents.registry import OLLAMA, AgentRegistry, Heartbeat
 from app.agents.trading.dhan import build_dhan_adapter
 from app.agents.trading.mt5 import build_mt5_adapter
 from app.api.router import api_router
-from app.core.config import Environment, Settings, get_settings
+from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging, get_logger
-from app.core.middleware import RequestIdMiddleware
+from app.core.middleware import RequestIdMiddleware, SecurityHeadersMiddleware
+from app.core.prod_checks import assert_production_ready
 from app.db.session import build_engine, build_sessionmaker
 from app.integrations.github import build_github_client
-from app.services.health import HealthService, check_data_root
+from app.services.health import HealthService
 
 log = get_logger(__name__)
 
@@ -32,9 +33,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        # Refuse to start in prod if the 2 TB HDD is not mounted.
-        if settings.ENV is Environment.PROD:
-            check_data_root(settings)
+        # ENV=prod checklist: refuse to start on a weak SECRET_KEY, DEBUG/docs on, insecure
+        # cookies, a missing HDD or an unapproved LIVE flag (app/core/prod_checks.py).
+        assert_production_ready(settings)
 
         engine = build_engine(settings)
         redis = Redis.from_url(settings.REDIS_URL, socket_timeout=settings.HEALTH_CHECK_TIMEOUT)
@@ -109,9 +110,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title="Aureon_Agentic",
         version="0.1.0",
         lifespan=lifespan,
-        docs_url=None if settings.ENV is Environment.PROD else "/api/docs",
+        docs_url="/api/docs" if settings.docs_enabled else None,
         redoc_url=None,
-        openapi_url="/api/openapi.json",
+        openapi_url="/api/openapi.json" if settings.docs_enabled else None,
     )
     if settings.CORS_ORIGINS:
         app.add_middleware(
@@ -121,6 +122,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
             allow_headers=["content-type", "x-csrf-token", "x-request-id"],
         )
+    app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(RequestIdMiddleware)
     app.include_router(api_router)
     return app
