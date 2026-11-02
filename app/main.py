@@ -10,6 +10,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from redis.asyncio import Redis
 
+from app.agents.ollama.client import OllamaClient
+from app.agents.ollama.limiter import GenerationLimiter
 from app.api.router import api_router
 from app.core.config import Environment, Settings, get_settings
 from app.core.logging import configure_logging, get_logger
@@ -39,11 +41,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.redis = redis
         app.state.http = http
         app.state.health = HealthService(settings, engine, redis, http)
+        ollama = OllamaClient(
+            settings.OLLAMA_BASE_URL,
+            connect_timeout=settings.OLLAMA_CONNECT_TIMEOUT,
+            read_timeout=settings.OLLAMA_READ_TIMEOUT,
+            cache_ttl=settings.OLLAMA_MODEL_CACHE_SECONDS,
+        )
+        app.state.ollama = ollama
+        app.state.chat_limiter = GenerationLimiter(
+            settings.OLLAMA_MAX_CONCURRENT,
+            settings.OLLAMA_MAX_QUEUE,
+            settings.OLLAMA_QUEUE_RETRY_AFTER,
+        )
         log.info("startup", env=settings.ENV.value)
         try:
             yield
         finally:
             log.info("shutdown")
+            await ollama.aclose()
             await http.aclose()
             await redis.aclose()
             await engine.dispose()
