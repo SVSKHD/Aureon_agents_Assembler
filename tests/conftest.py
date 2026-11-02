@@ -80,7 +80,10 @@ async def db_clean(migrated: str) -> AsyncIterator[str]:
     engine = create_async_engine(migrated)
     async with engine.begin() as conn:
         await conn.execute(
-            text("TRUNCATE audit.audit_events, core.sessions, core.users RESTART IDENTITY")
+            text(
+                "TRUNCATE ai.messages, ai.conversations, ai.model_inventory, "
+                "audit.audit_events, core.sessions, core.users RESTART IDENTITY"
+            )
         )
     await engine.dispose()
     redis = Redis.from_url(TEST_REDIS_URL)

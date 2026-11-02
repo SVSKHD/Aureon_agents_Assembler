@@ -3,9 +3,10 @@
 Self-hosted backend for Spasta: a FastAPI modular monolith on PostgreSQL 17, Redis and a local
 Ollama. It is offline-first, has no external AI APIs and does no live trading.
 
-**Status: Phase 2 auth is done; finance is blocked on the live schema.** Phase 1 provides
+**Status: Phases 1, 2 (auth) and 3 are done; finance is blocked on the live schema.** Phase 1 provides
 health, config, logging, async DB and Alembic. Phase 2 adds cookie-session auth with CSRF,
 rate limiting and an audit log ([docs/02-auth-and-finance.md](docs/02-auth-and-finance.md)).
+Phase 3 adds local-Ollama chat over SSE with stored conversations ([docs/03-ollama.md](docs/03-ollama.md)).
 
 ## Layout
 
@@ -13,11 +14,13 @@ rate limiting and an audit log ([docs/02-auth-and-finance.md](docs/02-auth-and-f
 app/
   main.py            app factory + lifespan
   core/              settings, JSON logging, request-ID middleware
-  api/v1/            routers (health, auth)
+  api/v1/            routers (health, auth, models/chat/conversations)
   auth/              password hashing, sessions, CSRF, rate limit, admin bootstrap
   db/                async engine/session, declarative base
-  services/          health checks
-  models/ schemas/ agents/{ollama,imaging,coding,trading}/ workers/   (later phases)
+  agents/ollama/     Ollama HTTP client + generation limiter
+  services/          health checks, audit log, chat streaming + conversation storage
+  models/ schemas/   SQLAlchemy models (core, audit, ai) and Pydantic schemas
+  agents/{imaging,coding,trading}/ workers/   (later phases)
 alembic/             async migrations (version table: public.aureon_alembic_version)
 tests/  scripts/  deploy/  docs/
 ```
@@ -32,6 +35,11 @@ tests/  scripts/  deploy/  docs/
 | POST | `/api/auth/logout` | Revokes this session (needs `X-CSRF-Token`). |
 | GET | `/api/auth/me` | Current user. |
 | POST | `/api/auth/sessions/revoke-all` | Signs out every session of the user (needs `X-CSRF-Token`). |
+| GET | `/api/models` | Installed Ollama models (cached 60 s). |
+| GET | `/api/models/status` | Reachability, loaded models, last use. |
+| POST | `/api/chat` | Streaming chat (SSE); stores both turns. |
+| GET | `/api/conversations` | Your conversations, paginated. |
+| GET / DELETE | `/api/conversations/{id}` | One conversation with messages / delete it. |
 | GET | `/api/docs` | Swagger UI (disabled when `ENV=prod`). |
 
 ## Configuration
@@ -57,6 +65,13 @@ Every variable is listed in [.env.example](.env.example).
 | `LOGIN_MAX_FAILURES_PER_IP` | `20` | Failed logins per IP per window. |
 | `LOGIN_WINDOW_SECONDS` | `900` | Rate-limit window. |
 | `FORWARDED_ALLOW_IPS` | `127.0.0.1` | Proxy IPs whose `X-Forwarded-For` uvicorn trusts. |
+| `OLLAMA_MAX_CONCURRENT` / `OLLAMA_MAX_QUEUE` | `1` / `3` | Running / waiting generations; beyond that `POST /api/chat` returns 429. |
+| `OLLAMA_QUEUE_RETRY_AFTER` | `15` | `Retry-After` seconds on 429. |
+| `OLLAMA_CONNECT_TIMEOUT` / `OLLAMA_READ_TIMEOUT` | `5` / `300` | Connect timeout; longest silence between chunks. |
+| `OLLAMA_MODEL_CACHE_SECONDS` | `60` | `/api/tags` cache. |
+| `CHAT_TIMEOUT_SECONDS` | `900` | Whole chat request, including queue time. |
+| `CHAT_HEARTBEAT_SECONDS` | `15` | SSE keep-alive interval. |
+| `CHAT_DEFAULT_NUM_CTX` / `CHAT_MAX_NUM_CTX` | `4096` / `8192` | Context window default / cap. |
 | `PRIVATE_AI_NETWORK` | required (compose) | Existing Docker network shared with Postgres/Ollama. |
 
 ## Development
