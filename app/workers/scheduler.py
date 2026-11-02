@@ -24,6 +24,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import httpx
 from croniter import croniter
 from redis.asyncio import Redis
 from sqlalchemy import delete, exists, func, select, update
@@ -47,7 +48,16 @@ from app.models.agents import Agent, AgentLog, AgentRun, ScheduledJob
 from app.models.auth import UserSession
 from app.models.finance import FinanceTombstone
 from app.models.trading import BrokerAccount
-from app.services import dhan_sync, github, github_actions, mt5_sync, news, paper
+from app.services import (
+    dhan_sync,
+    github,
+    github_actions,
+    incidents,
+    mt5_sync,
+    news,
+    paper,
+    repair_recovery,
+)
 
 log = get_logger("worker.scheduler")
 MAX_BACKOFF_SECONDS = 3600
@@ -62,6 +72,8 @@ class TaskContext:
     mt5: MT5Adapter | None = None
     redis: Redis | None = None
     github: GitHubClient | None = None
+    http: httpx.AsyncClient | None = None
+    docker_probe: incidents.DockerProbe | None = None
 
 
 TaskFn = Callable[[TaskContext], Awaitable[dict[str, Any]]]
@@ -260,6 +272,43 @@ async def github_actions_sync(ctx: TaskContext) -> dict[str, Any]:
     return out
 
 
+async def incident_scan(ctx: TaskContext) -> dict[str, Any]:
+    """Incident detection + safe recovery / escalation (docs/21-self-repair.md). Each probe
+    runs even when another fails; a failing probe fails the run after the rest are done."""
+    out: dict[str, Any] = {}
+    errors: list[str] = []
+    probes: list[tuple[str, Callable[[], Awaitable[dict[str, Any]]]]] = [
+        ("db", lambda: incidents.scan_db(ctx.maker, ctx.settings)),
+        ("heartbeats", lambda: incidents.scan_heartbeats(ctx.maker, ctx.settings)),
+        ("actions", lambda: incidents.scan_actions(ctx.maker)),
+        (
+            "docker",
+            lambda: incidents.scan_docker(
+                ctx.maker, ctx.docker_probe or incidents.unknown_docker_probe
+            ),
+        ),
+    ]
+    if ctx.http is not None:
+        http = ctx.http
+        probes.append(("api", lambda: incidents.scan_api(ctx.maker, ctx.settings, http)))
+    for name, probe in probes:
+        try:
+            out |= await probe()
+        except Exception as exc:
+            errors.append(f"{name}: {type(exc).__name__}: {exc}"[:300])
+    deps = repair_recovery.Deps(ctx.maker, ctx.settings, ctx.redis, ctx.github, ctx.http)
+    try:
+        out["recovery"] = await repair_recovery.process_incidents(deps)
+    except Exception as exc:
+        errors.append(f"recovery: {type(exc).__name__}"[:300])
+    out["exceptions_flushed"] = await incidents.flush_exceptions(
+        ctx.maker, ctx.settings, "scheduler"
+    )
+    if errors:
+        raise RuntimeError("; ".join(errors))
+    return out
+
+
 TASKS: dict[str, TaskFn] = {
     "purge_agent_history": purge_agent_history,
     "purge_expired_sessions": purge_expired_sessions,
@@ -273,6 +322,7 @@ TASKS: dict[str, TaskFn] = {
     "news_pull": news_pull,
     "github_sync": github_sync,
     "github_actions_sync": github_actions_sync,
+    "incident_scan": incident_scan,
 }
 
 # (id, task, cron) — created if missing; an admin's later edits (pause etc.) are kept.
@@ -288,6 +338,8 @@ DEFAULT_JOBS: list[tuple[str, str, str]] = [
 def default_jobs(settings: Settings) -> list[tuple[str, str, str]]:
     """Built-in jobs, plus the Dhan / MT5 jobs when those are configured."""
     jobs = list(DEFAULT_JOBS)
+    if settings.INCIDENT_SCAN_CRON:
+        jobs.append(("incident-scan", "incident_scan", settings.INCIDENT_SCAN_CRON))
     if settings.dhan_configured:
         jobs += [
             (
@@ -337,12 +389,13 @@ class Scheduler:
         mt5: MT5Adapter | None = None,
         redis: Redis | None = None,
         github: GitHubClient | None = None,
+        http: httpx.AsyncClient | None = None,
     ) -> None:
         self.settings = settings
         self.maker = maker
         self.tasks = TASKS if tasks is None else tasks
         self.registry = AgentRegistry(maker)
-        self.ctx = TaskContext(settings, maker, ollama, dhan, mt5, redis, github)
+        self.ctx = TaskContext(settings, maker, ollama, dhan, mt5, redis, github, http)
         self.paused = False
         self.running_job: str | None = None
 
@@ -485,9 +538,11 @@ async def main() -> int:
     dhan = build_dhan_adapter(settings, redis, maker)
     mt5 = build_mt5_adapter(settings)
     gh_client = build_github_client(settings)
+    http = httpx.AsyncClient(timeout=10.0)
     scheduler = Scheduler(
-        settings, maker, ollama=ollama, dhan=dhan, mt5=mt5, redis=redis, github=gh_client
-    )
+        settings, maker, ollama=ollama, dhan=dhan, mt5=mt5, redis=redis, github=gh_client,
+        http=http,
+    )  # fmt: skip
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -520,6 +575,7 @@ async def main() -> int:
             await mt5.aclose()
         if gh_client is not None:
             await gh_client.aclose()
+        await http.aclose()
         await redis.aclose()
         await engine.dispose()
         log.info("scheduler_stopped")

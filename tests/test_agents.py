@@ -447,8 +447,11 @@ async def test_default_jobs_and_builtin_tasks(make_env: EnvFactory) -> None:
             "refresh-model-inventory",
             "paper-process",
             "paper-reconcile",
+            "incident-scan",
         }
         assert all(j["next_run_at"] for j in jobs)
+        # Keep the every-minute incident scan out of the ticks below.
+        assert (await env.post("admin", "/api/scheduler/jobs/incident-scan/pause")).status_code == 200
 
         # Old logs + sessions get purged.
         reg = AgentRegistry(env.maker)

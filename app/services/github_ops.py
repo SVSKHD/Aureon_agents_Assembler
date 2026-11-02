@@ -111,7 +111,8 @@ _OP_STATUS = {
 
 @dataclass(frozen=True, slots=True)
 class Actor:
-    user_id: uuid.UUID
+    # None = the system (e.g. the self-repair agent opening its PR).
+    user_id: uuid.UUID | None
     client: ClientInfo
 
 

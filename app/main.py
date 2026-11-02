@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -22,6 +24,7 @@ from app.core.middleware import RequestIdMiddleware, SecurityHeadersMiddleware
 from app.core.prod_checks import assert_production_ready
 from app.db.session import build_engine, build_sessionmaker
 from app.integrations.github import build_github_client
+from app.services import incidents
 from app.services.health import HealthService
 
 log = get_logger(__name__)
@@ -89,11 +92,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             registry, OLLAMA, settings.AGENT_HEARTBEAT_SECONDS, ollama_state, ollama_paused
         )
         heartbeat.start()  # registers in the background; a DB outage doesn't block startup
+        # Incidents (docs/21-self-repair.md): captured exceptions are written in the
+        # background, and Docker health is probed here (only the API reaches the proxy).
+        flusher = incidents.start_exception_flusher(app.state.sessionmaker, settings, "api")
+        docker_stop = asyncio.Event()
+        docker_task = None
+        if settings.INCIDENT_DOCKER_PROBE_SECONDS > 0 and settings.DOCKER_API_URL:
+            docker_task = asyncio.create_task(
+                incidents.docker_monitor(
+                    app.state.sessionmaker,
+                    incidents.proxy_docker_probe(http, settings),
+                    settings.INCIDENT_DOCKER_PROBE_SECONDS,
+                    docker_stop,
+                ),
+                name="incident-docker-monitor",
+            )
         log.info("startup", env=settings.ENV.value)
         try:
             yield
         finally:
             log.info("shutdown")
+            docker_stop.set()
+            if docker_task is not None:
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.wait_for(docker_task, 5)
+            await incidents.stop_exception_flusher(flusher)
             await heartbeat.stop()
             if dhan is not None:
                 await dhan.aclose()
