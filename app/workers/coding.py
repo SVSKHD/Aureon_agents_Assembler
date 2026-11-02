@@ -25,6 +25,7 @@ from app.agents.ollama.client import OllamaClient
 from app.agents.registry import AgentRegistry, AgentSpec, Heartbeat
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
+from app.core.procsec import make_non_dumpable
 from app.db.session import build_engine, build_sessionmaker
 from app.models.agents import CodeTask
 from app.services import coding
@@ -56,6 +57,9 @@ async def recover(maker: Any, cfg: coding.CodingConfig) -> int:
 async def main() -> int:
     settings = get_settings()
     configure_logging(settings.LOG_LEVEL)
+    # Test commands run model-patched code as our children: keep our environ/memory unreadable.
+    if not make_non_dumpable():
+        log.warning("coding_worker_dumpable", hint="prctl(PR_SET_DUMPABLE, 0) unavailable")
     cfg = coding.CodingConfig.from_settings(settings)
     engine = build_engine(settings)
     maker = build_sessionmaker(engine)

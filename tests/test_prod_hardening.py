@@ -6,6 +6,9 @@ import io
 import json
 import logging
 import os
+import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -29,6 +32,7 @@ from app.main import create_app
 from app.workers import healthcheck
 from app.workers.migrate import url_for_database
 
+ROOT = Path(__file__).resolve().parents[1]
 GOOD_SECRET = "Zq8-vR2_kLm4Np7Xs1Tb9Wc3Yd6Fg0Hj5Ae"
 
 
@@ -263,3 +267,52 @@ def test_logging_stream_is_stdout() -> None:
     src = Path(applog.__file__).read_text()
     assert src.count("redact_secrets,") == 2
     assert isinstance(io.StringIO(), io.StringIO)
+
+
+# --- coding worker: children cannot read the worker's environment --------------------------
+
+
+CHILD = """import os
+try:
+    print(open(f"/proc/{os.getppid()}/environ", "rb").read().count(b"AUREON_CANARY"))
+except OSError:
+    print("denied")
+"""
+
+
+def _parent_script(guard: bool) -> str:
+    return (
+        "import os, subprocess, sys\n"
+        + (
+            "from app.core.procsec import make_non_dumpable\nassert make_non_dumpable()\n"
+            if guard
+            else ""
+        )
+        + f"child = {CHILD!r}\n"
+        + "print(subprocess.run([sys.executable, '-c', child], env={'PATH': os.environ['PATH']},"
+        + " capture_output=True, text=True).stdout.strip())\n"
+    )
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux /proc only")
+@pytest.mark.parametrize(("guard", "expected"), [(False, "1"), (True, "denied")])
+def test_non_dumpable_parent_hides_environ_from_children(guard: bool, expected: str) -> None:
+    prefix: list[str] = []
+    if os.geteuid() == 0:  # root reads any /proc/*/environ: drop to nobody like the worker uid
+        setpriv = shutil.which("setpriv")
+        if setpriv is None:
+            pytest.skip("running as root without setpriv")
+        prefix = [setpriv, "--reuid=65534", "--regid=65534", "--clear-groups"]
+    r = subprocess.run(
+        [*prefix, sys.executable, "-"],
+        input=_parent_script(guard),
+        env={"PATH": os.environ["PATH"], "AUREON_CANARY": "s3cret", "PYTHONPATH": str(ROOT)},
+        capture_output=True,
+        text=True,
+        cwd="/",
+        timeout=60,
+    )
+    if r.returncode != 0 and "ModuleNotFoundError" in r.stderr + r.stdout:
+        pytest.skip("checkout not readable by the unprivileged user")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == expected

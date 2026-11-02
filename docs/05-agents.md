@@ -98,7 +98,7 @@ registering a task and a default row.
 - **Docker:** mounting `/var/run/docker.sock`, even `:ro`, lets a process create privileged
   containers, which makes it root on the host. Instead, compose runs
   `tecnativa/docker-socket-proxy` (`aureon-docker-proxy`). It holds the socket and exposes only
-  `GET /containers/*` on the internal `aureon` network. The API reads `DOCKER_API_URL`
+  `GET /containers/*` on its own internal `aureon-docker` network, shared only with the API (Phase E). The API reads `DOCKER_API_URL`
   (`http://aureon-docker-proxy:2375`). Set it empty to turn this section off.
 - **systemd units:** the API container can't, and shouldn't, run `systemctl`. A host-side helper,
   `deploy/host-status/aureon-host-status.sh`, runs every 30 s from a systemd timer as `svskhd8`.

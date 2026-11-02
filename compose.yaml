@@ -98,7 +98,7 @@ services:
     environment:
       ENV: ${ENV:-prod}
     volumes: [*data-root]
-    networks: [aureon, private-ai]
+    networks: [aureon, private-ai, aureon-docker]
     ports:
       - "127.0.0.1:8000:8000"   # loopback only; Nginx/cloudflared reach it locally
     <<: *hardened
@@ -237,7 +237,9 @@ services:
         source: ${CODE_REPOS_ROOT:-/opt/private-ai/repos}
         target: ${CODE_REPOS_ROOT:-/opt/private-ai/repos}
         bind: { create_host_path: false }
-    networks: [aureon, private-ai]      # Postgres + Ollama only
+    # Postgres + Ollama only. NOT on "aureon": the tests it runs execute model-patched code,
+    # which must not reach Redis or the Docker proxy (container env = every secret).
+    networks: [private-ai]
     # NO ports.
     <<: *hardened
     tmpfs: ["/tmp:size=1g"]
@@ -267,7 +269,9 @@ services:
       EVENTS: "0"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks: [aureon]   # internal only; NO ports
+    # Its own internal network shared ONLY with the API: GET /containers/{id}/json returns each
+    # container's env (every secret), so no worker may reach it. NO ports.
+    networks: [aureon-docker]
     <<: *hardened
     # HAProxy runs as root inside (to read the socket) and binds 2375 (> 1024): no caps needed.
     tmpfs: [/run, /tmp]
@@ -304,6 +308,9 @@ services:
 networks:
   aureon:
     name: aureon
+  aureon-docker:
+    name: aureon-docker
+    internal: true   # no route out; only the API and the read-only Docker proxy are on it
   private-ai:
     external: true
     name: ${PRIVATE_AI_NETWORK:?set PRIVATE_AI_NETWORK in .env (see docs/00-inspection.md)}

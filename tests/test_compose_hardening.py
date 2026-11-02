@@ -123,3 +123,17 @@ def test_docker_compose_config_validates(tmp_path: Path) -> None:
     if r.returncode != 0 and "Cannot connect" in r.stderr:
         pytest.skip("docker daemon required for config")
     assert r.returncode == 0, r.stderr
+
+
+def test_network_isolation(services: dict[str, dict[str, Any]]) -> None:
+    def nets(name: str) -> set[str]:
+        return set(services[name].get("networks", []))
+
+    # Only the API shares a network with the Docker proxy (container env holds every secret).
+    assert nets("docker-proxy") == {"aureon-docker"}
+    assert {n for n in services if "aureon-docker" in nets(n)} == {"api", "docker-proxy"}
+    net = yaml.safe_load(COMPOSE.read_text())["networks"]["aureon-docker"]
+    assert net["internal"] is True
+    # The coding worker runs model-patched test code: no Redis, no Docker proxy.
+    assert nets("coding-worker") == {"private-ai"}
+    assert services["mount-check"]["network_mode"] == "none"
