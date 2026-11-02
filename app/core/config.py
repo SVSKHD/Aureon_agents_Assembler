@@ -215,19 +215,37 @@ class Settings(BaseSettings):
     CODE_MAX_PATCH_BYTES: int = Field(default=200_000, ge=1000)
     CODE_POLL_SECONDS: float = Field(default=3.0, gt=0)
 
+    # --- paper trading (Trading Phase F, docs/15-paper-trading.md) ---
+    # Notional starting equity of every PAPER account, in its base currency.
+    PAPER_STARTING_CAPITAL: Decimal = Field(default=Decimal("1000000"), gt=0)
+    # A fill needs a reference price no older than this (Dhan tick, latest candle, MT5 bot).
+    PAPER_PRICE_MAX_AGE_SECONDS: float = Field(default=180.0, gt=0)
+    # Per broker: {"dhan": {"spread_bps": "2", "slippage_bps": "1"}, "mt5": {...}}.
+    PAPER_COSTS: Annotated[dict[str, Any], NoDecode] = Field(
+        default_factory=lambda: {
+            "dhan": {"spread_bps": "2", "slippage_bps": "1"},
+            "mt5": {"spread_bps": "1", "slippage_bps": "1"},
+        }
+    )
+    # Overrides of the built-in Indian charge schedule (keys as in accounting.py).
+    PAPER_DHAN_CHARGES: Annotated[dict[str, Any], NoDecode] = Field(default_factory=dict)
+    PAPER_MT5_COMMISSION_PER_LOT: Decimal = Field(default=Decimal(0), ge=0)
+
     # --- real-time trading stream for the frontend (GET /api/trading/stream) ---
     TRADING_STREAM_POLL_SECONDS: float = Field(default=2.0, gt=0)
     TRADING_STREAM_HEARTBEAT_SECONDS: float = Field(default=15.0, gt=0)
     # The stream ends after this long; the browser's EventSource reconnects with its cursor.
     TRADING_STREAM_MAX_SECONDS: float = Field(default=1800.0, gt=0)
 
-    @field_validator("CODE_REPOS", "CODE_ALLOWED_COMMANDS", mode="before")
+    @field_validator(
+        "CODE_REPOS", "CODE_ALLOWED_COMMANDS", "PAPER_COSTS", "PAPER_DHAN_CHARGES", mode="before"
+    )
     @classmethod
     def _parse_json(cls, v: object, info: ValidationInfo) -> object:
         if isinstance(v, str):
             if v.strip():
                 return json.loads(v)
-            return {} if info.field_name == "CODE_REPOS" else []
+            return [] if info.field_name == "CODE_ALLOWED_COMMANDS" else {}
         return v
 
     @field_validator("IMAGE_AGENT_COMMAND", mode="before")
