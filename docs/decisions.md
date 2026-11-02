@@ -345,3 +345,6 @@ See [22-claude-review.md](22-claude-review.md).
   separate worker without the CLI or the runner, and has only a workflow-failure callback
   registry. Auto-queueing (`CLAUDE_REVIEW_AUTO`) is left for later, so the reviewer only
   runs when an admin asks.
+- **D-19-10: migration id 0015.** Developed as 0016 beside Phase 18; Phase 18's 0015 was not
+  on main when this merged, so this migration took 0015 (down_revision 0014) and Phase 18
+  renumbers after it.

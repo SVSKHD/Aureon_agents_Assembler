@@ -310,7 +310,7 @@ REVIEW_UNAVAILABLE and nothing is sent anywhere.
    A real check: `echo 'Reply with {"ok":true}' | docker compose exec -T api claude -p
    --output-format json --tools ""` should print a JSON result.
 4. **Enable it:** `CLAUDE_REVIEW_ENABLED=true` in `.env`, then `docker compose run --rm migrate`
-   (0016) and `docker compose up -d api`. Availability is cached for 5 minutes, so restart
+   (0015) and `docker compose up -d api`. Availability is cached for 5 minutes, so restart
    the API after fixing the CLI to see the change at once.
 5. **Know the data-classification policy** before enabling it:
    - nothing is sent for a PR that touches secrets, infra, trading/risk/auth paths, or that

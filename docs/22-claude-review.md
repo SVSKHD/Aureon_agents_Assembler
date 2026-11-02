@@ -147,7 +147,7 @@ All are admin only, GETs included. POSTs need CSRF.
 | GET | `/api/v1/reviews/{id}` | One review: status, verdict, reason, summary, findings, classification, cli_version, duration_ms, published, `advisory: true`. |
 | POST | `/api/v1/reviews/{id}/publish` | Posts the GitHub review (event COMMENT). 200 `{review, github_review_id, event, inline_comments, body_findings}`. 404, 409 `review_not_publishable` or `already_published`, GitHub errors as in Phase 15. |
 
-## Table (migration 0016, additive)
+## Table (migration 0015, additive)
 
 `agents.reviews` has these columns:
 
@@ -180,7 +180,7 @@ It has an index on (repo, pr_number, created_at), and the partial unique index
 1. Install and authenticate the CLI, as in
    [manual-setup.md](manual-setup.md#19--claude-review). Check it with
    `claude --version` as the service user.
-2. `docker compose run --rm migrate` applies 0016, which adds one table.
+2. `docker compose run --rm migrate` applies 0015, which adds one table.
 3. Set `CLAUDE_REVIEW_ENABLED=true` (plus `CLAUDE_CLI_ENV_PASSTHROUGH` if the CLI
    authenticates through an env var), then run `docker compose up -d api`.
 4. As an admin (cookie jar plus CSRF header):
