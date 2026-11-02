@@ -42,6 +42,7 @@ ADMIN = {
     ("POST", "/api/scheduler/jobs/{job_id}/resume"),
     ("POST", "/api/scheduler/jobs/{job_id}/run"),
     ("GET", "/api/system/status"),
+    ("GET", "/api/v1/system/integrations"),
     ("POST", "/api/trading/accounts"),
     ("POST", "/api/trading/accounts/{account_id}/mode/live-token"),
     ("POST", "/api/trading/accounts/{account_id}/mode"),
