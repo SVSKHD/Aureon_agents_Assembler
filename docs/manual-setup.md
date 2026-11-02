@@ -227,3 +227,43 @@ Phase 15's token, except one extra permission for the gated repo-config operatio
 5. **Branch protection on GitHub stays the real backstop.** Keep the `main` protection rules
    enabled on GitHub itself. The approval gate controls what Aureon may do; it does not
    replace GitHub's own rules.
+
+## 17 — GitHub Actions and webhooks
+
+See [20-github-actions-webhooks.md](20-github-actions-webhooks.md).
+
+1. **PAT permissions:** add **Actions: Read and write** to the fine-grained PAT (GitHub →
+   Settings → Developer settings → Fine-grained tokens → the token → Edit → Repository
+   permissions). Read covers workflows, runs, jobs and logs; write covers dispatch, re-run
+   and cancel. Without write, those answer 403 `github_forbidden` and are tracked `failed`.
+2. **Webhook secret:** `openssl rand -hex 32`, then put it in the server's `.env` as
+   `GITHUB_WEBHOOK_SECRET=…`. Never commit it. Restart the API (`docker compose up -d api`).
+3. **Create the repo webhook** (repo → Settings → Webhooks → Add webhook), for each
+   allowlisted repo (or once at the org level):
+   - Payload URL: `https://api.spasta.online/api/v1/github/webhooks` (through nginx's
+     `/api/` location; its 2 MB `client_max_body_size` is above the 1 MB app cap)
+   - Content type: **application/json** (form-encoded is refused with 415)
+   - Secret: the value from step 2
+   - SSL verification: enabled
+   - Events: "Let me select individual events": **Workflow runs, Workflow jobs, Pull
+     requests, Issues, Pushes**
+   - Active: yes. GitHub sends a `ping`; Recent Deliveries should show **202**.
+4. **Cloudflare Access bypass for exactly that path.** GitHub cannot do Access auth. Zero
+   Trust → Access → Applications → the `api.spasta.online` application → add a policy, or a
+   separate self-hosted application for `api.spasta.online/api/v1/github/webhooks`, with
+   action **Bypass** and include **Everyone**. Scope it to that single path, nothing
+   broader (not `/api/v1/github/*`). Optionally narrow it with GitHub's hook IP ranges from
+   `https://api.github.com/meta` (`hooks`), and add a Cloudflare rate-limiting rule for
+   that path.
+5. **Allowlists in `.env`:**
+   - `GITHUB_DISPATCH_ALLOWLIST=["OWNER/REPO:ci.yml", …]` for the workflows Aureon may
+     dispatch or re-run (empty = none).
+   - `GITHUB_PROD_WORKFLOWS=["Deploy", "release.yml"]` for production workflows whose name
+     or file does not already contain `deploy` / `prod`. Those need an approval.
+6. **Apply migration 0014 and start the worker:** `docker compose run --rm migrate`,
+   `docker compose up -d api scheduler`, then
+   `docker compose --profile github up -d github-webhook-worker`. Check
+   `docker compose ps github-webhook-worker` is healthy and `GET /api/agents` lists
+   `github-webhooks`.
+7. **Secret rotation:** change `.env` and the GitHub webhook secret together, restart the
+   API, and redeliver any 401 deliveries from GitHub's Recent Deliveries page.

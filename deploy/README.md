@@ -113,6 +113,12 @@ GitHub issues, PRs and the approval gate (migration 0013; the extra PAT permissi
 [docs/manual-setup.md](../docs/manual-setup.md#16--github-issues-and-prs)): see
 [docs/19-github-issues-prs.md](../docs/19-github-issues-prs.md#deploy-and-validate).
 
+GitHub Actions and webhooks (migration 0014; the `github-actions-sync` job only with
+`GITHUB_TOKEN`; the webhook worker is opt-in: `docker compose --profile github up -d
+github-webhook-worker`; the webhook, its secret and the Cloudflare Access bypass are in
+[docs/manual-setup.md](../docs/manual-setup.md#17--github-actions-and-webhooks)): see
+[docs/20-github-actions-webhooks.md](../docs/20-github-actions-webhooks.md#deploy-and-validate).
+
 Agents, scheduler, system status and the host-status helper: see
 [docs/05-agents.md](../docs/05-agents.md#deploy-and-validate).
 

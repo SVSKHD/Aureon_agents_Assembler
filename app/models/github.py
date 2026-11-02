@@ -171,3 +171,96 @@ class GitHubTrackedOperation(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+# --- Phase 17: Actions + webhooks (docs/20-github-actions-webhooks.md) --------------------
+
+WEBHOOK_STATUSES = ("pending", "processed", "failed", "ignored")
+_WEBHOOK_STATUS_CHECK = "status IN (" + ",".join(f"'{s}'" for s in WEBHOOK_STATUSES) + ")"
+
+
+class GitHubWorkflowRun(Base):
+    """A workflow run, upserted from workflow_run webhooks and the github_actions_sync job.
+    A row is only overwritten by data with the same or a newer `updated_at`."""
+
+    __tablename__ = "workflow_runs"
+    __table_args__ = (
+        Index("ix_github_workflow_runs_repo_created", "repo", "created_at"),
+        {"schema": "github"},
+    )
+
+    # GitHub's run id.
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    repo: Mapped[str] = mapped_column(String(201))
+    workflow_id: Mapped[int | None] = mapped_column(BigInteger)
+    name: Mapped[str | None] = mapped_column(Text)
+    path: Mapped[str | None] = mapped_column(Text)
+    event: Mapped[str | None] = mapped_column(String(64))
+    branch: Mapped[str | None] = mapped_column(String(255))
+    head_sha: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str | None] = mapped_column(String(32))
+    conclusion: Mapped[str | None] = mapped_column(String(32))
+    run_attempt: Mapped[int | None] = mapped_column(Integer)
+    html_url: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class GitHubWorkflowJob(Base):
+    """A job of a workflow run (from workflow_job webhooks). No FK to workflow_runs: a job
+    event can arrive before its run's event."""
+
+    __tablename__ = "workflow_jobs"
+    __table_args__ = (
+        Index("ix_github_workflow_jobs_run_id", "run_id"),
+        {"schema": "github"},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    run_id: Mapped[int] = mapped_column(BigInteger)
+    repo: Mapped[str | None] = mapped_column(String(201))
+    name: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str | None] = mapped_column(String(32))
+    conclusion: Mapped[str | None] = mapped_column(String(32))
+    run_attempt: Mapped[int | None] = mapped_column(Integer)
+    html_url: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # [{name, status, conclusion, number, started_at, completed_at}]
+    steps: Mapped[list[Any]] = mapped_column(JSONB, server_default=text("'[]'::jsonb"))
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class GitHubWebhookEvent(Base):
+    """One received webhook delivery (signature verified; invalid ones are never stored)."""
+
+    __tablename__ = "webhook_events"
+    __table_args__ = (
+        CheckConstraint(_WEBHOOK_STATUS_CHECK, name="status"),
+        Index("ix_github_webhook_events_due", "status", "next_attempt_at"),
+        Index("ix_github_webhook_events_received_at", "received_at"),
+        {"schema": "github"},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    # X-GitHub-Delivery (a GUID); unique, so a redelivery is recognised.
+    delivery_id: Mapped[str] = mapped_column(String(100), unique=True)
+    event: Mapped[str] = mapped_column(String(64))
+    action: Mapped[str | None] = mapped_column(String(64))
+    repo: Mapped[str | None] = mapped_column(String(201))
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(16), server_default=text("'pending'"))
+    attempts: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    # A pending event is not retried before this time (backoff after a failed attempt).
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    error: Mapped[str | None] = mapped_column(Text)
+    # The JSON body, trimmed to GITHUB_WEBHOOK_STORE_MAX_BYTES (`payload_truncated`).
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("'{}'::jsonb"))
+    payload_truncated: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    signature_valid: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))

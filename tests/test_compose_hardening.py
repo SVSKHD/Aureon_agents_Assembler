@@ -14,7 +14,14 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ROOT / "compose.yaml"
 ONE_SHOTS = {"mount-check", "migrate"}
-WORKERS = {"scheduler", "dhan-feed", "research-worker", "coding-worker", "imaging-worker"}
+WORKERS = {
+    "scheduler",
+    "dhan-feed",
+    "research-worker",
+    "coding-worker",
+    "imaging-worker",
+    "github-webhook-worker",
+}
 
 
 @pytest.fixture(scope="module")
@@ -31,6 +38,7 @@ def test_expected_services_and_profiles_kept(services: dict[str, dict[str, Any]]
     assert profiles["coding-worker"] == ("coding",)
     assert profiles["dhan-feed"] == ("dhan",)
     assert profiles["research-worker"] == ("research",)
+    assert profiles["github-webhook-worker"] == ("github",)
     for core in ("api", "redis", "scheduler", "docker-proxy", "migrate", "mount-check"):
         assert profiles[core] == (), core
 
@@ -112,7 +120,7 @@ def test_docker_compose_config_validates(tmp_path: Path) -> None:
         shutil.copy(ROOT / f, tmp_path / f)
     (tmp_path / ".env").write_text((ROOT / ".env.example").read_text())
     profiles = ["--profile", "imaging", "--profile", "coding", "--profile", "dhan"]
-    profiles += ["--profile", "research"]
+    profiles += ["--profile", "research", "--profile", "github"]
     r = subprocess.run(
         ["docker", "compose", *profiles, "config", "-q"],
         cwd=tmp_path,

@@ -22,6 +22,7 @@ Trading Phase F enables PAPER mode end to end: intents, risk, admin approval, si
 Phase E hardens production: an ENV=prod startup checklist, health-gated compose start order, nightly backups with a weekly restore drill, systemd boot units and a security review ([docs/16-production-hardening.md](docs/16-production-hardening.md), [docs/17-security-review.md](docs/17-security-review.md); sudo steps in [docs/manual-setup.md](docs/manual-setup.md)).
 Phase 15 adds the read-only GitHub integration: a PAT-from-env client with redaction, pagination, retry and rate limits, connection health, synced `github.*` tables and repo browsing ([docs/18-github-foundation.md](docs/18-github-foundation.md)).
 Phase 16 adds issue and PR operations, issue ↔ Spasta task links, `github.tracked_operations` and a minimal approval gate. Merge, force-push, branch protection, branch delete and repo-config changes run only after an admin approves with their password re-entered ([docs/19-github-issues-prs.md](docs/19-github-issues-prs.md)).
+Phase 17 adds GitHub Actions: workflows, runs, jobs and sanitised logs, allowlisted dispatch and re-runs (production workflows behind the approval gate), and an HMAC-verified, idempotent webhook receiver processed by the `github-webhooks` worker into `github.workflow_runs` / `workflow_jobs` ([docs/20-github-actions-webhooks.md](docs/20-github-actions-webhooks.md)).
 
 ## Layout
 
@@ -105,6 +106,9 @@ tests/  scripts/  deploy/  docs/
 | POST / PUT / PATCH / DELETE | `…/pulls/{n}/merge`, `…/force-push`, `…/branch-protection/{branch}`, `…/branches/{branch}`, `…/settings`, `…/actions-permissions` | Gated: 202 with an approval id. Nothing is written to GitHub until it is approved (admin). |
 | GET / POST | `/api/v1/approvals[/{id}]`, `/api/v1/approvals/{id}/approve\|deny` | Approval requests. Approve re-verifies the admin password, then executes once (admin). |
 | GET | `/api/v1/github/operations` | Tracked GitHub writes and gated operations (admin). |
+| GET | `/api/v1/github/repositories/{owner}/{repo}/actions/workflows\|runs[/{id}[/jobs\|logs]]`, `…/actions/jobs/{id}/logs` | Actions workflows, runs, jobs; logs as sanitised, tail-first text (admin) ([docs/20-github-actions-webhooks.md](docs/20-github-actions-webhooks.md)). |
+| POST | `…/actions/workflows/{workflow}/dispatch`, `…/actions/runs/{id}/rerun\|rerun-failed\|cancel` | Allowlisted dispatch and re-run (production workflows: 202 + approval), cancel; tracked (admin). |
+| POST | `/api/v1/github/webhooks` | Public GitHub webhook receiver: HMAC-SHA256 verified, idempotent on the delivery id, processed by the worker. |
 | GET | `/api/docs`, `/api/openapi.json` | Swagger UI and schema; both off when `ENV=prod` ([docs/16-production-hardening.md](docs/16-production-hardening.md)). |
 
 ## Configuration

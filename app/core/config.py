@@ -290,6 +290,40 @@ class Settings(BaseSettings):
     # (docs/19-github-issues-prs.md).
     GITHUB_DIFF_MAX_BYTES: int = Field(default=2 * 1024 * 1024, ge=1024, le=50 * 1024 * 1024)
 
+    # --- Actions + webhooks (docs/20-github-actions-webhooks.md). ---
+    # Job / run logs are returned tail-first, at most this many bytes after sanitising.
+    GITHUB_LOG_MAX_BYTES: int = Field(default=1024 * 1024, ge=1024, le=16 * 1024 * 1024)
+    # At most this much is downloaded from the log blob (text job log or zipped run logs).
+    GITHUB_LOG_DOWNLOAD_MAX_BYTES: int = Field(
+        default=32 * 1024 * 1024, ge=1024, le=256 * 1024 * 1024
+    )
+    # Unzipped run logs: total size and entry count caps (zip-bomb guard).
+    GITHUB_LOG_UNZIP_MAX_BYTES: int = Field(default=64 * 1024 * 1024, ge=1024, le=512 * 1024 * 1024)
+    GITHUB_LOG_ZIP_MAX_ENTRIES: int = Field(default=500, ge=1, le=10_000)
+    # Hosts (fnmatch patterns, https only) a log redirect may point at. Used for logs only.
+    GITHUB_LOG_HOSTS: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: [
+            "pipelines.actions.githubusercontent.com",
+            "*.actions.githubusercontent.com",
+            "productionresultssa*.blob.core.windows.net",
+        ]
+    )
+    # JSON list of "owner/repo:workflow_file" that may be dispatched / re-run. Empty = none.
+    GITHUB_DISPATCH_ALLOWLIST: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # Workflow names or file names that deploy to production: dispatch / re-run of these goes
+    # through the ApprovalGate. Any name or file containing "deploy" or "prod" counts too.
+    GITHUB_PROD_WORKFLOWS: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # HMAC-SHA256 secret for X-Hub-Signature-256. Unset = the receiver answers 503.
+    GITHUB_WEBHOOK_SECRET: SecretStr | None = None
+    GITHUB_WEBHOOK_MAX_BYTES: int = Field(default=1024 * 1024, ge=1024, le=25 * 1024 * 1024)
+    # The stored payload (github.webhook_events.payload) is trimmed to at most this size.
+    GITHUB_WEBHOOK_STORE_MAX_BYTES: int = Field(default=256 * 1024, ge=1024, le=1024 * 1024)
+    GITHUB_WEBHOOK_MAX_ATTEMPTS: int = Field(default=5, ge=1, le=50)
+    GITHUB_WEBHOOK_RETRY_BASE_SECONDS: float = Field(default=5.0, ge=0)
+    GITHUB_WEBHOOK_POLL_SECONDS: float = Field(default=5.0, gt=0, le=300)
+    GITHUB_ACTIONS_SYNC_CRON: str = "*/15 * * * *"
+    GITHUB_ACTIONS_SYNC_RUNS: int = Field(default=30, ge=1, le=100)
+
     # --- Approval gate (docs/19-github-issues-prs.md; grown by the Phase 20 engine). ---
     # A pending approval request expires this many minutes after it was created.
     APPROVALS_TTL_MINUTES: int = Field(default=30, ge=1, le=24 * 60)
@@ -303,6 +337,11 @@ class Settings(BaseSettings):
     def github_configured(self) -> bool:
         return bool(self.GITHUB_TOKEN and self.GITHUB_TOKEN.get_secret_value().strip())
 
+    @property
+    def github_webhook_configured(self) -> bool:
+        s = self.GITHUB_WEBHOOK_SECRET
+        return bool(s and s.get_secret_value().strip())
+
     @field_validator(
         "CODE_REPOS",
         "CODE_ALLOWED_COMMANDS",
@@ -311,6 +350,9 @@ class Settings(BaseSettings):
         "NEWS_FEED_URLS",
         "GITHUB_ALLOWED_OWNERS",
         "GITHUB_ALLOWED_REPOS",
+        "GITHUB_LOG_HOSTS",
+        "GITHUB_DISPATCH_ALLOWLIST",
+        "GITHUB_PROD_WORKFLOWS",
         mode="before",
     )
     @classmethod
@@ -323,6 +365,9 @@ class Settings(BaseSettings):
                 "NEWS_FEED_URLS",
                 "GITHUB_ALLOWED_OWNERS",
                 "GITHUB_ALLOWED_REPOS",
+                "GITHUB_LOG_HOSTS",
+                "GITHUB_DISPATCH_ALLOWLIST",
+                "GITHUB_PROD_WORKFLOWS",
             )
             return [] if info.field_name in lists else {}
         return v

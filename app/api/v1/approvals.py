@@ -13,7 +13,8 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-# Importing the GitHub ops module registers the github.* executors.
+# Importing the GitHub ops / actions modules registers the github.* executors.
+import app.services.github_actions
 import app.services.github_ops  # noqa: F401
 from app.auth.deps import AdminRequired, SettingsDep
 from app.schemas.approvals import (
