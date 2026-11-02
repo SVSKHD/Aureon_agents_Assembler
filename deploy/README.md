@@ -79,6 +79,10 @@ curl -sS -o /dev/null -w '%{http_code}\n' -b $J -H "x-csrf-token: $CSRF" -X POST
 
 Ollama chat smoke test: see [docs/03-ollama.md](../docs/03-ollama.md#deploy-and-validate).
 
+Frontend support APIs (migration 0011, attachments on the HDD, optional news feeds): see
+[docs/02-auth-and-finance.md](../docs/02-auth-and-finance.md#frontend-support) and
+[docs/manual-setup.md](../docs/manual-setup.md).
+
 Dhan (read-only adapter, feed worker, jobs): see [docs/11-dhan.md](../docs/11-dhan.md#deploy-and-validate).
 
 MT5 bot (read-only status export, sync job): see [docs/12-mt5-adapter.md](../docs/12-mt5-adapter.md#deploy-and-validate).

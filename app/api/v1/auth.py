@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
@@ -12,7 +13,13 @@ from app.auth.security import csrf_token_for
 from app.auth.service import normalize_email
 from app.core.config import Settings
 from app.models.auth import User
-from app.schemas.auth import LoginRequest, LoginResponse, RevokeAllResponse, UserOut
+from app.schemas.auth import (
+    LoginRequest,
+    LoginResponse,
+    RevokeAllResponse,
+    SessionOut,
+    UserOut,
+)
 from app.services import audit
 from app.services.audit import ClientInfo
 
@@ -138,3 +145,45 @@ async def revoke_all(
     await db.commit()
     _clear_cookies(response, settings)
     return RevokeAllResponse(revoked=count)
+
+
+@router.get("/sessions", response_model=list[SessionOut])
+async def list_sessions(current: Current, svc: AuthServiceDep) -> list[SessionOut]:
+    """The current user's active (not revoked, not expired) sessions."""
+    return [
+        SessionOut(
+            id=row.id,
+            created_at=row.created_at,
+            expires_at=row.expires_at,
+            ip=row.ip,
+            user_agent=row.user_agent,
+            current=row.id == current.session.id,
+        )
+        for row in await svc.active_sessions(current.user.id)
+    ]
+
+
+@router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_session(
+    session_id: uuid.UUID,
+    request: Request,
+    response: Response,
+    current: CsrfProtected,
+    db: DbSession,
+    svc: AuthServiceDep,
+    settings: SettingsDep,
+) -> None:
+    """Sign out one of your own sessions. Another user's (or an unknown) id is 404."""
+    if not await svc.revoke_own(current.user.id, session_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    audit.record(
+        db,
+        "session_revoked",
+        ClientInfo.from_request(request),
+        actor_user_id=current.user.id,
+        target_user_id=current.user.id,
+        details={"session_id": str(session_id), "current": session_id == current.session.id},
+    )
+    await db.commit()
+    if session_id == current.session.id:
+        _clear_cookies(response, settings)

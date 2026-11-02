@@ -20,7 +20,12 @@ PUBLIC = {
     ("GET", "/api/health"),
     ("GET", "/api/health/ready"),
     ("POST", "/api/auth/login"),  # rate-limited per (email, IP) and per IP
+    # Read-only public data for the frontend, rate-limited per IP (docs/02, D-backend).
+    ("GET", "/api/public/shares/{doc_id}"),
+    ("GET", "/api/public/forex"),
 }
+# Public routes that must carry the per-IP limiter dependency.
+PUBLIC_RATE_LIMITED = {p for m, p in PUBLIC if p.startswith("/api/public/")}
 
 ADMIN = {
     ("PUT", "/api/finance/portfolio-profiles/{profile_id}"),
@@ -78,6 +83,9 @@ def test_every_route_requires_auth_except_the_public_allowlist(settings: Setting
     for m, p, deps in pairs:
         if (m, p) in PUBLIC:
             assert "get_current" not in deps, (m, p)
+            assert m in SAFE or p == "/api/auth/login", (m, p)
+        if p in PUBLIC_RATE_LIMITED:
+            assert "rate_limited" in deps, (m, p)
 
 
 def test_every_unsafe_route_requires_csrf(settings: Settings) -> None:

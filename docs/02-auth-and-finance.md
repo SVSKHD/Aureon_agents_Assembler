@@ -135,3 +135,136 @@ curl -sS -b $J -H "x-csrf-token: $CSRF" -H 'content-type: application/json' $B/a
   id; no double claim; audit
 - documents: set, merge and ownership
 - portfolio: admin-only writes
+
+## Frontend support
+
+Revision **0011** (additive: two new tables, no existing table altered). These are the small
+APIs the ASTRA-FRONTEND app needs to move off Supabase / Firebase (its stages 3 and 6).
+Decisions: [decisions.md](decisions.md#d-backend--frontend-support-apis) (D-Dbe-*).
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| GET | `/api/finance/{trades,expenses,secured}?updated_since=` | also on `/api/finance/documents/{namespace}`: rows with `updated_at > updated_since` |
+| GET | `/api/finance/changes?since=<iso with offset>` | `{cursor, truncated, trades, expenses, secured, documents, deleted}` for the signed-in user |
+| GET | `/api/auth/sessions` | own non-revoked, non-expired sessions: `id, created_at, expires_at, ip, user_agent, current` |
+| DELETE | `/api/auth/sessions/{id}` | CSRF; revoke one own session (another user's or unknown id: 404); audited `session_revoked` |
+| POST | `/api/finance/attachments` | multipart `kind`, `ref`, `file`; CSRF; the row must be yours (404); audited |
+| GET | `/api/finance/attachments?kind=&ref=` | your attachments (newest first, max 500) |
+| GET / DELETE | `/api/finance/attachments/{id}` | metadata / delete (file removed after commit; audited) |
+| GET | `/api/finance/attachments/{id}/file` | the file, `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff` |
+| GET | `/api/public/shares/{doc_id}` | no auth; namespace `aureon-shares` with `data.isPublic == true`, else 404; `ownerId`/`userId` stripped |
+| GET | `/api/public/forex?limit=` | no auth; ownerless namespace `forex` documents, newest `published` first (max 200) |
+
+**Change sync.**
+
+- Every delete of a trade, expense, secured row or document writes a tombstone to
+  `core.finance_tombstones` (`kind` = `trades|expenses|secured|document`, `ref` = row id or
+  `namespace/doc_id`).
+- `/changes` returns rows and documents with `updated_at > since` and tombstones with
+  `deleted_at > since`, oldest first, at most `FINANCE_CHANGES_MAX_ROWS` per list.
+  - Store `cursor` and send it as `since` next time.
+  - When `truncated` is true, call again at once with the returned cursor.
+  - A row id can appear both as a row and in `deleted` (deleted, then re-created with the same
+    id). Apply the delete only when its `deleted_at` is newer than the row's `updated_at`.
+- The `purge-agent-history` job prunes tombstones older than
+  `FINANCE_TOMBSTONE_RETENTION_DAYS` (30). A client offline for longer must do a full re-sync
+  (list endpoints without `updated_since`).
+
+**Attachments.**
+
+- Files are stored at `${DATA_ROOT}/finance-attachments/<user uuid>/<attachment uuid>`: a path
+  built from UUIDs only. The client's filename is cleaned and kept as metadata only.
+- Uploads need the HDD marker, through the same `check_data_root` the imaging code uses (503
+  without it).
+- The type is sniffed from the magic bytes (PNG, JPEG, WebP, PDF); anything else is 415. The
+  header the client sent is ignored.
+- Size limits: over `FINANCE_ATTACHMENT_MAX_BYTES` is 413; past
+  `FINANCE_ATTACHMENTS_MAX_PER_USER` is 409 `attachment_limit`.
+- Deleting a finance row deletes its attachments (records and files).
+
+**Public shares (owner side).** Use the existing documents API with namespace
+`aureon-shares`:
+
+| Action | Request |
+| --- | --- |
+| Publish | `PUT /api/finance/documents/aureon-shares/<random id>` with `{"data": {..., "isPublic": true}}` |
+| Update | the same `PUT`, or with `"merge": true` |
+| Unpublish | `PUT ... {"data": {"isPublic": false}, "merge": true}`, or `DELETE` |
+
+- Use an unguessable doc id (e.g. a UUID): anyone with the id can read a public share.
+- Another user cannot overwrite your share (404).
+- Both public endpoints are rate limited per client IP (`PUBLIC_RATE_LIMIT_PER_MINUTE`, Redis;
+  429 with `Retry-After`).
+
+**News feed job (`news_pull`).** Offline by default.
+
+- When `NEWS_FEED_URLS` (JSON list) is empty, the job is not added to the default jobs and a
+  manual run does nothing.
+- What it does:
+  - fetches each RSS / Atom URL (timeout `NEWS_HTTP_TIMEOUT`, max `NEWS_MAX_FEED_BYTES`)
+  - follows at most 3 redirects, and only to http(s) URLs
+  - refuses any feed with a DOCTYPE or ENTITY declaration (uses defusedxml when installed)
+  - keeps items with an http(s) link, at most `NEWS_MAX_ITEMS` (200) per run
+- Items are upserted into `public.astra_documents` namespace `forex`: `doc_id` = sha1(link),
+  no owner, data `{title, link, published, source}`. Unchanged items and user-owned rows are
+  never rewritten.
+- Errors are recorded per feed host, never with the URL (it may contain a token).
+
+**Config.**
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `FINANCE_ATTACHMENT_MAX_BYTES` | `10485760` | max upload size (413 above) |
+| `FINANCE_ATTACHMENTS_MAX_PER_USER` | `2000` | attachments per user (409 above) |
+| `FINANCE_TOMBSTONE_RETENTION_DAYS` | `30` | tombstone retention |
+| `FINANCE_CHANGES_MAX_ROWS` | `5000` | rows per list in one `/changes` call |
+| `PUBLIC_RATE_LIMIT_PER_MINUTE` | `60` | `/api/public/*` requests per IP per minute |
+| `NEWS_FEED_URLS` | `[]` | JSON list of RSS/Atom URLs; empty = job off |
+| `NEWS_PULL_CRON` | `*/30 * * * *` | schedule of `news-pull` (scheduler timezone) |
+| `NEWS_HTTP_TIMEOUT` | `10` | seconds per feed request |
+| `NEWS_MAX_ITEMS` | `200` | items per run |
+| `NEWS_MAX_FEED_BYTES` | `2097152` | max feed size |
+
+**Deploy and validate.**
+
+```bash
+docker compose run --rm aureon-api alembic upgrade 0011
+curl -sS -b $J $B/api/auth/sessions
+curl -sS -b $J "$B/api/finance/changes?since=2026-01-01T00:00:00Z" | jq '.cursor, (.deleted|length)'
+curl -sS -b $J -H "x-csrf-token: $CSRF" -F kind=expenses -F ref=<expense id> \
+  -F file=@receipt.pdf $B/api/finance/attachments
+curl -sS $B/api/public/forex?limit=5
+```
+
+**Rollback.** `alembic downgrade 0010` drops only the two new tables (the attachment files on
+the HDD stay in place). Then redeploy the previous image.
+
+**Tests.**
+
+- `tests/test_frontend_support_db.py` covers:
+  - changes and tombstones, `updated_since`, and tombstone pruning
+  - sessions list and single revoke: another user's session is 404, CSRF is required, and it
+    is audited
+  - attachments: another user gets 404 on all four routes and cannot upload against your row;
+    a fake PNG is 415; a PDF is sniffed; oversize is 413; the per-user cap; files are removed on
+    delete and on row delete
+  - public shares: unpublished is 404, owner ids are stripped, and unpublish works
+  - forex: ordering, and user-owned docs are hidden
+  - the rate limit
+  - the news upsert, with respx
+- `tests/test_news_unit.py` covers:
+  - RSS and Atom fixtures
+  - refusing DOCTYPE/XXE and billion-laughs payloads
+  - the redirect scheme check and the size cap
+  - errors carry no URL
+  - the job is off when the feed list is empty
+
+**Open risks.**
+
+- The upload size is checked while reading the spooled multipart body. The proxy body limit
+  (Cloudflare / nginx) is what stops a huge request before it is spooled.
+- The `/changes` cursor is the API server clock. A write that commits after the cursor, but
+  carries an earlier `updated_at`, can be missed until a full re-sync. In practice that window
+  is milliseconds.
+- `/api/public/forex` lists only rows with no owner. Legacy forex documents that were written
+  with an owner are not shown until they are re-pulled.

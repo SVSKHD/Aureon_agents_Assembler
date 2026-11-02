@@ -43,8 +43,9 @@ These are also enforced, but outside the startup check:
 
 - Only the API is published, and only on loopback. `tests/test_compose_hardening.py` asserts it.
 - Postgres and Ollama are reached by container name over `PRIVATE_AI_NETWORK`.
-- Every non-GET route needs CSRF, and every route except `/api/health`, `/api/health/ready`
-  and `POST /api/auth/login` needs a session. `tests/test_route_auth.py` asserts it.
+- Every non-GET route needs CSRF. Every route except `/api/health`, `/api/health/ready`,
+  `POST /api/auth/login` and the two rate-limited `GET /api/public/*` routes needs a session.
+  `tests/test_route_auth.py` asserts it.
 
 ## Endpoints
 
@@ -52,7 +53,9 @@ No new endpoints. Three existing POSTs now **require the CSRF header** (they pre
 needed a session): `/api/trading/strategies/backtest`, `/api/trading/signals/{id}/explain` and
 `/api/trading/backtests/{id}/explain`. The SPA already sends `X-CSRF-Token` on every unsafe
 request. In prod, `/api/openapi.json` and `/api/docs` return 404. The Nginx snippet now answers
-404 to `/api/health/ready` from outside. On-box checks call `127.0.0.1:8000` directly.
+404 to `/api/health/ready` from outside. On-box checks call `127.0.0.1:8000` directly. It also
+allows 11 MB bodies on `POST /api/finance/attachments` only (receipts up to 10 MiB). The news
+fetcher now refuses redirects to internal hosts (docs/17 S-16).
 
 ## Config
 
@@ -245,7 +248,7 @@ still stops at `mount-check`. After a reboot, check with
 | File | Covers |
 | --- | --- |
 | `tests/test_prod_hardening.py` | Each checklist item refused; the API lifespan refuses to start; the LIVE flag needs `PHASE_G_APPROVED=yes` while LIVE stays `preconditions_unmet`; redaction (structlog + stdlib); security headers; the worker healthcheck and heartbeat file; DSN database swap |
-| `tests/test_route_auth.py` | Walks every route: auth except a 3-route allowlist, CSRF on every unsafe method, a pinned admin set, no docs/openapi in prod |
+| `tests/test_route_auth.py` | Walks every route: auth except a 5-route allowlist (public ones rate-limited), CSRF on every unsafe method, a pinned admin set, no docs/openapi in prod |
 | `tests/test_compose_hardening.py` | Ports (loopback API only, no `0.0.0.0`), restart, healthchecks, read_only/caps/no-new-privileges/limits/logging, start order, docker.sock only on the proxy, `docker compose config` |
 | `tests/test_ops_scripts.py` | Fake `docker` on PATH: exact pg_dump argv (compose exec -T, schemas, tables, no port), manifest and checksums, HDD and BACKUP_DIR guards, retention path guard (old, unmanifested, odd name, symlink, outside), refusals (`--into-live` without `--yes-i-am-sure`, `--target-db spasta`, tampered checksums, existing target, bad names), drill drops only its own DB, healthcheck, shellcheck. **db:** a real backup → drill round trip against the test DB |
 

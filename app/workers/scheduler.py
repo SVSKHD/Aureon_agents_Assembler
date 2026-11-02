@@ -43,8 +43,9 @@ from app.core.logging import configure_logging, get_logger
 from app.db.session import build_engine, build_sessionmaker
 from app.models.agents import Agent, AgentLog, AgentRun, ScheduledJob
 from app.models.auth import UserSession
+from app.models.finance import FinanceTombstone
 from app.models.trading import BrokerAccount
-from app.services import dhan_sync, mt5_sync, paper
+from app.services import dhan_sync, mt5_sync, news, paper
 
 log = get_logger("worker.scheduler")
 MAX_BACKOFF_SECONDS = 3600
@@ -67,14 +68,29 @@ TaskFn = Callable[[TaskContext], Awaitable[dict[str, Any]]]
 
 
 async def purge_agent_history(ctx: TaskContext) -> dict[str, Any]:
+    """Old agent logs/runs, and finance delete tombstones past their retention."""
     logs_cutoff = func.now() - timedelta(days=ctx.settings.AGENT_LOG_RETENTION_DAYS)
     runs_cutoff = func.now() - timedelta(days=ctx.settings.AGENT_RUN_RETENTION_DAYS)
+    tomb_cutoff = func.now() - timedelta(days=ctx.settings.FINANCE_TOMBSTONE_RETENTION_DAYS)
     async with ctx.maker() as db, db.begin():
         logs = await db.execute(delete(AgentLog).where(AgentLog.created_at < logs_cutoff))
         runs = await db.execute(
             delete(AgentRun).where(AgentRun.started_at < runs_cutoff, AgentRun.status != "running")
         )
-    return {"logs_deleted": logs.rowcount, "runs_deleted": runs.rowcount}  # type: ignore[attr-defined]
+        tombs = await db.execute(
+            delete(FinanceTombstone).where(FinanceTombstone.deleted_at < tomb_cutoff)
+        )
+    return {
+        "logs_deleted": logs.rowcount,  # type: ignore[attr-defined]
+        "runs_deleted": runs.rowcount,  # type: ignore[attr-defined]
+        "tombstones_deleted": tombs.rowcount,  # type: ignore[attr-defined]
+    }
+
+
+async def news_pull(ctx: TaskContext) -> dict[str, Any]:
+    """Pull NEWS_FEED_URLS into astra_documents namespace forex (no-op when empty)."""
+    async with ctx.maker() as db, db.begin():
+        return await news.pull(db, ctx.settings)
 
 
 async def purge_expired_sessions(ctx: TaskContext) -> dict[str, Any]:
@@ -196,6 +212,7 @@ TASKS: dict[str, TaskFn] = {
     "mt5_sync_status": mt5_sync_status,
     "paper_process": paper_process,
     "paper_reconcile": paper_reconcile,
+    "news_pull": news_pull,
 }
 
 # (id, task, cron) — created if missing; an admin's later edits (pause etc.) are kept.
@@ -226,6 +243,8 @@ def default_jobs(settings: Settings) -> list[tuple[str, str, str]]:
             )
     if settings.mt5_configured:
         jobs.append(("mt5-sync-status", "mt5_sync_status", settings.MT5_SYNC_CRON))
+    if settings.NEWS_FEED_URLS:
+        jobs.append(("news-pull", "news_pull", settings.NEWS_PULL_CRON))
     return jobs
 
 

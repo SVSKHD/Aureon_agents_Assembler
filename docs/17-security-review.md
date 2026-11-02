@@ -24,6 +24,8 @@ Runbook: [docs/16-production-hardening.md](16-production-hardening.md).
 | S-13 | Low | Only login is rate-limited. Chat, images, backtests and explanations are bounded by queues (429 when full), not per-user rates. Finance writes have no limit. | Open (accepted): single-household deployment; the queues bound resource use. Add per-user Redis limits if accounts are ever opened to others. |
 | S-14 | Info | Container images are pinned by tag, not digest (`python:3.12-slim`, `redis:7.4-alpine`, `tecnativa/docker-socket-proxy:0.3.0`). There is no image CVE scan. | Open: pin digests and run `trivy image` on the server (manual-setup.md). |
 | S-15 | Info | Backups live on the same HDD as the data. | Open: off-box copy needs a destination from the owner. |
+| S-16 | Medium | The news fetcher (`app/services/news.py`, added by the frontend-support phase) followed redirects to any http(s) URL. A feed host could have redirected the scheduler to internal services (Docker service names, loopback, private and link-local addresses), and whatever parsed as a feed would have been published at `/api/public/forex`. | **Fixed:** redirects may only go to public hosts (global IPs or dotted names; never localhost, `.local` or `.internal`). Tested. Feed URLs themselves come only from the owner's `NEWS_FEED_URLS`. |
+| S-17 | Low | Receipt attachments accept up to `FINANCE_ATTACHMENT_MAX_BYTES` (10 MiB), but the Nginx snippet capped every `/api/` body at 2 MB, so larger receipts failed at the proxy with a confusing 413. | **Fixed:** an exact `location = /api/finance/attachments` with `client_max_body_size 11m`. Everything else stays at 2 MB. |
 
 Nothing found in: SQL injection, SSRF, path traversal in images and the coding agent,
 session handling, and password storage (details below).
@@ -34,11 +36,13 @@ session handling, and password storage (details below).
 and asserts four things:
 
 - Every route requires `get_current` (a valid, unexpired, server-side session), except this
-  allowlist: `GET /api/health`, `GET /api/health/ready`, `POST /api/auth/login`.
+  allowlist: `GET /api/health`, `GET /api/health/ready`, `POST /api/auth/login`, and the
+  read-only `GET /api/public/shares/{doc_id}` and `GET /api/public/forex`. Those two must
+  carry the per-IP `rate_limited` dependency, and they strip owner ids from the data they
+  return.
 - Every unsafe method (POST/PUT/PATCH/DELETE) requires `require_csrf`. The `X-CSRF-Token`
   header must equal the CSRF cookie, and both must equal HMAC(SECRET_KEY, session token).
-- The set of `require_admin` routes equals a pinned list (31 routes), so any change is a
-  deliberate diff.
+- The set of `require_admin` routes equals a pinned list, so any change is a deliberate diff.
 - In prod there are no docs or openapi routes, and there are no websocket routes or mounts.
 
 Object-level access is enforced in services and covered by the existing DB tests. Finance rows
@@ -59,7 +63,9 @@ Current map (method, path, guard):
 | POST | `/api/auth/login` | **public** |
 | POST | `/api/auth/logout` | CsrfProtected (session + CSRF) |
 | GET | `/api/auth/me` | Current (session) |
+| GET | `/api/auth/sessions` | Current (session) |
 | POST | `/api/auth/sessions/revoke-all` | CsrfProtected (session + CSRF) |
+| DELETE | `/api/auth/sessions/{session_id}` | CsrfProtected (session + CSRF) |
 | POST | `/api/chat` | CsrfProtected (session + CSRF) |
 | POST | `/api/code/analyze` | AdminRequired (session + CSRF + admin) |
 | GET | `/api/code/tasks` | AdminRequired (session + CSRF + admin) |
@@ -71,6 +77,12 @@ Current map (method, path, guard):
 | GET | `/api/conversations` | Current (session) |
 | DELETE | `/api/conversations/{conversation_id}` | CsrfProtected (session + CSRF) |
 | GET | `/api/conversations/{conversation_id}` | Current (session) |
+| GET | `/api/finance/attachments` | Current (session) |
+| POST | `/api/finance/attachments` | CsrfProtected (session + CSRF) |
+| DELETE | `/api/finance/attachments/{attachment_id}` | CsrfProtected (session + CSRF) |
+| GET | `/api/finance/attachments/{attachment_id}` | Current (session) |
+| GET | `/api/finance/attachments/{attachment_id}/file` | Current (session) |
+| GET | `/api/finance/changes` | Current (session) |
 | POST | `/api/finance/claim` | AdminRequired (session + CSRF + admin) |
 | GET | `/api/finance/documents/{namespace}` | Current (session) |
 | DELETE | `/api/finance/documents/{namespace}/{doc_id}` | CsrfProtected (session + CSRF) |
@@ -104,6 +116,8 @@ Current map (method, path, guard):
 | GET | `/api/images/{asset_id}/file` | Current (session) |
 | GET | `/api/models` | Current (session) |
 | GET | `/api/models/status` | Current (session) |
+| GET | `/api/public/forex` | **public**, per-IP rate limit |
+| GET | `/api/public/shares/{doc_id}` | **public**, per-IP rate limit |
 | GET | `/api/repos` | AdminRequired (session + CSRF + admin) |
 | GET | `/api/repos/{name}/branches` | AdminRequired (session + CSRF + admin) |
 | GET | `/api/repos/{name}/commits` | AdminRequired (session + CSRF + admin) |
@@ -189,8 +203,12 @@ images (`IMAGE_QUEUE_MAX`), research AI (`RESEARCH_AI_QUEUE_MAX`) and backtests
   blocks `.git`, `.env*`, keys and secrets. `safe_path` re-checks after resolving symlinks.
   Refs must match a SHA or `^[A-Za-z0-9][A-Za-z0-9._/-]*$` with no `..` or `@{`, so a ref can
   never start with `-` (no git option injection). `git log` puts paths after `--`.
-- **Finance attachments:** there is no upload endpoint yet. `BACKUP_DATA_DIRS` entries in the
-  ops scripts are validated (no leading `.`), and restore unpacks into a new folder.
+- **Finance attachments** (frontend-support phase): the stored path is
+  `finance-attachments/<user uuid>/<attachment uuid>`, built from UUIDs only, so the client's
+  filename never reaches the filesystem. The content type is sniffed from magic bytes, and
+  `safe_file` re-resolves and requires the path under `DATA_ROOT/finance-attachments`.
+  Downloads are scoped to the owner. `BACKUP_DATA_DIRS` entries in the ops scripts are
+  validated (no leading `.`), and restore unpacks into a new folder.
 
 ## 5. Subprocesses
 
@@ -208,11 +226,12 @@ No endpoint executes a shell command.
 ## 6. Outbound HTTP (SSRF)
 
 No user input becomes a URL. Outbound hosts come from settings only: `OLLAMA_BASE_URL`,
-`DHAN_BASE_URL`, `DHAN_FEED_URL`, `DHAN_INSTRUMENT_CSV_URL`, `MT5_STATUS_URL` and
-`DOCKER_API_URL`. The httpx clients do not follow redirects (the default, and explicit for
-MT5). There is no news-feed fetcher in the codebase; the research AI prompt only says it has
-no news. Any future feed must use an allowlist of hosts, `follow_redirects=False`, and a size
-cap and timeout.
+`DHAN_BASE_URL`, `DHAN_FEED_URL`, `DHAN_INSTRUMENT_CSV_URL`, `MT5_STATUS_URL`,
+`DOCKER_API_URL` and `NEWS_FEED_URLS`. The httpx clients do not follow redirects (the default,
+and explicit for MT5). The news fetcher follows at most 3 redirects by hand, http(s) only and
+now only to public hosts (S-16). It caps responses at `NEWS_MAX_FEED_BYTES`, rejects
+DOCTYPE/ENTITY before XML parsing, and is off unless the owner sets `NEWS_FEED_URLS`. It runs
+in the scheduler container, which cannot reach the Docker proxy.
 
 ## 7. Secrets in logs and errors
 

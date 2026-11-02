@@ -8,6 +8,8 @@ Phases A, B (Dhan, read-only), C (MT5 bot, read-only) and D (research agents) ar
 blocked on the live schema and the image pipeline hookup is pending the /opt/image-agent inspection.** Phase 1 provides
 health, config, logging, async DB and Alembic. Phase 2 adds cookie-session auth with CSRF,
 rate limiting and an audit log ([docs/02-auth-and-finance.md](docs/02-auth-and-finance.md)).
+Frontend support adds change sync, session management, receipt attachments, public shares and an
+offline-by-default news feed ([docs/02-auth-and-finance.md](docs/02-auth-and-finance.md#frontend-support)).
 Phase 3 adds local-Ollama chat over SSE with stored conversations ([docs/03-ollama.md](docs/03-ollama.md)).
 Phase 4 adds queued Stable Diffusion jobs run by a separate worker ([docs/04-imaging.md](docs/04-imaging.md)).
 Phase 5 adds the agent registry, a cron scheduler and system status ([docs/05-agents.md](docs/05-agents.md)).
@@ -88,6 +90,10 @@ tests/  scripts/  deploy/  docs/
 | GET | `/api/repos`, `/api/repos/{name}/tree\|file\|commits\|branches` | Allowlisted local repos, read from git (admin). |
 | POST / GET | `/api/code/analyze`, `/api/code/tasks[/{id}[/diff\|approve\|reject]]` | Coding agent: explain code; patch in an isolated worktree, test, approve (admin, audited; never pushes). |
 | CRUD | `/api/finance/{trades,expenses,secured,documents,portfolio-profiles}`, `/api/finance/totals`, `/api/finance/claim` | Spasta finance tables, scoped to the signed-in user ([docs/02-auth-and-finance.md](docs/02-auth-and-finance.md#finance)). |
+| GET | `/api/finance/changes`, `?updated_since=` on finance lists | Change sync with delete tombstones ([docs/02-auth-and-finance.md](docs/02-auth-and-finance.md#frontend-support)). |
+| POST / GET / DELETE | `/api/finance/attachments[/{id}[/file]]` | Receipt attachments on the HDD (PNG/JPEG/WebP/PDF, owner-scoped). |
+| GET / DELETE | `/api/auth/sessions[/{id}]` | List your active sessions; revoke one (audited). |
+| GET | `/api/public/shares/{doc_id}`, `/api/public/forex` | No auth, rate limited: public shares, pulled forex news. |
 | GET | `/api/docs`, `/api/openapi.json` | Swagger UI and schema; both off when `ENV=prod` ([docs/16-production-hardening.md](docs/16-production-hardening.md)). |
 
 ## Configuration
@@ -115,6 +121,13 @@ Every variable is listed in [.env.example](.env.example).
 | `LOGIN_MAX_FAILURES` | `5` | Failed logins per (email, IP) per window. |
 | `LOGIN_MAX_FAILURES_PER_IP` | `20` | Failed logins per IP per window. |
 | `LOGIN_WINDOW_SECONDS` | `900` | Rate-limit window. |
+| `FINANCE_ATTACHMENT_MAX_BYTES` | `10485760` | Max receipt upload size (413 above). |
+| `FINANCE_ATTACHMENTS_MAX_PER_USER` | `2000` | Receipt attachments per user. |
+| `FINANCE_TOMBSTONE_RETENTION_DAYS` | `30` | Delete tombstones kept for `/api/finance/changes`. |
+| `FINANCE_CHANGES_MAX_ROWS` | `5000` | Rows per list in one `/changes` call. |
+| `PUBLIC_RATE_LIMIT_PER_MINUTE` | `60` | `/api/public/*` requests per IP per minute. |
+| `NEWS_FEED_URLS` | empty | JSON list of RSS/Atom URLs for `news_pull`; empty = off. |
+| `NEWS_PULL_CRON`, `NEWS_HTTP_TIMEOUT`, `NEWS_MAX_ITEMS`, `NEWS_MAX_FEED_BYTES` | `*/30 * * * *`, `10`, `200`, `2097152` | News job schedule and limits. |
 | `FORWARDED_ALLOW_IPS` | `127.0.0.1` | Proxy IPs whose `X-Forwarded-For` uvicorn trusts. |
 | `OLLAMA_MAX_CONCURRENT` / `OLLAMA_MAX_QUEUE` | `1` / `3` | Running / waiting generations; beyond that `POST /api/chat` returns 429. |
 | `OLLAMA_QUEUE_RETRY_AFTER` | `15` | `Retry-After` seconds on 429. |

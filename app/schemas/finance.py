@@ -176,6 +176,44 @@ class DocumentOut(BaseModel):
     updated_at: dt.datetime
 
 
+class TombstoneOut(BaseModel):
+    kind: str  # trades | expenses | secured | document
+    ref: str
+    deleted_at: dt.datetime
+
+
+class ChangesOut(BaseModel):
+    cursor: dt.datetime  # pass as `since` next time
+    truncated: bool = False  # a list hit the per-call cap; call again with `cursor`
+    trades: list[TradeOut]
+    expenses: list[ExpenseOut]
+    secured: list[SecuredOut]
+    documents: list[DocumentOut]
+    deleted: list[TombstoneOut]
+
+
+AttachmentKind = Literal["trades", "expenses", "secured"]
+
+
+class AttachmentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    kind: str
+    ref: str
+    filename: str
+    content_type: str
+    size_bytes: int
+    sha256: str
+    created_at: dt.datetime
+
+
+class PublicDocumentOut(BaseModel):
+    doc_id: str
+    data: dict[str, Any]
+    updated_at: dt.datetime
+
+
 class PortfolioIn(_In):
     content: dict[str, Any]
 
