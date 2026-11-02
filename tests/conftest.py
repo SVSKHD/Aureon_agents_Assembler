@@ -35,6 +35,8 @@ def settings(data_root: Path) -> Settings:
         SECRET_KEY="t" * 40,
         CORS_ORIGINS="http://localhost:5173",
         HEALTH_CHECK_TIMEOUT=1.0,
+        # Never pick up a real token from the host environment.
+        GITHUB_TOKEN=None,
     )
 
 
