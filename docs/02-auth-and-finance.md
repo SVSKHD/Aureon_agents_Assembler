@@ -1,7 +1,6 @@
 # 02 — Auth and finance
 
-**Status:** auth is done and tested (revision `0002`). Finance is blocked until the real table
-definitions are in [docs/00-inspection.md §4](00-inspection.md#4-existing-finance-schema-blocks-phase-2).
+**Status:** auth (revision `0002`) and finance (revision `0010`) are done and tested.
 
 ## Auth
 
@@ -82,24 +81,57 @@ The password is read from stdin (asked twice on a terminal) and must be at least
 The script refuses to run if an admin already exists, and a Postgres advisory lock serializes
 concurrent runs. `scripts/bootstrap_admin.py` is the same tool for a dev checkout.
 
-## Finance (blocked)
+## Finance
 
-Prompt 3 §6–9 needs the real definitions of `public.astra_documents`, `public.trades`,
-`public.expenses`, `public.secured` and `public.portfolio_profiles`. Hard rule 1 says to inspect
-before changing anything, so no finance migration has been written against guessed columns.
+Revision **0010**; the decisions are in [decisions.md](decisions.md#a--finance-prompt-3).
 
-Once the `pg_dump --schema-only` output is in 00-inspection.md §4, the planned work is:
+The DDL comes from ASTRA-FRONTEND `supabase/migrations/` (D-A1). The migration is additive:
 
-1. **Migration `0003` (additive):** add a nullable `user_id uuid REFERENCES core.users(id)` and an
-   index on each of the five tables. Existing columns, JSONB fields, composite PKs, session
-   values, buy/sell and recurrence fields stay as they are.
-2. **Backfill (documented, reversible):** set `user_id` on existing rows from the `astra_uid()`
-   owner mapping to the bootstrapped admin. Make `user_id` `NOT NULL` in a later revision only
-   after verifying the backfill. Downgrade drops only the added columns and indexes.
-3. **`astra_uid()` default:** the service layer sets `user_id` from the session. The old default
-   is left in place until the Vue app stops depending on it.
-4. **Models, schemas and CRUD:** `/api/finance/{documents,trades,expenses,secured,portfolio-profiles}`
-   with pagination and filters. Every query is scoped to the user in the service layer.
-   Money uses `Numeric`/`Decimal`.
-5. **Tests:** user A cannot read, update or delete user B's rows on every endpoint. Migrations are
-   tested up and down on a copy of the live DB.
+- **Ownership:** a nullable `aureon_user_id uuid` column (FK `core.users`, `ON DELETE SET NULL`)
+  plus an index on `trades`, `expenses`, `secured` and `astra_documents`.
+- **Identity map:** the new table `core.finance_identities` (Aureon user ↔ legacy uid).
+- **Missing tables:** created only if absent (fresh DB / CI), without the Supabase-only bits.
+
+Existing columns, composite PKs, RLS policies and `astra_uid()` defaults are untouched.
+Downgrade removes only the added column, index and table.
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| GET / POST | `/api/finance/{trades,expenses,secured}` | paged; `date_from`, `date_to`; trades: `symbol`, `session`, `side`; expenses: `category`, `kind` |
+| GET / PATCH / DELETE | `/api/finance/{trades,expenses,secured}/{id}` | client-minted ids kept (409 on replay) |
+| GET | `/api/finance/totals` | exact sums (trade P&L, expenses, secured) for a range |
+| GET | `/api/finance/documents/{namespace}` | the user's documents in a namespace |
+| GET / PUT / DELETE | `/api/finance/documents/{namespace}/{doc_id}` | PUT = Firestore `setDoc`, `merge` flag |
+| GET / PUT | `/api/finance/portfolio-profiles/{id}` | read: signed in; write: admin (audited) |
+| POST | `/api/finance/claim` | admin: attach a legacy owner's unclaimed rows; dry run unless `apply` (audited) |
+
+**Rules that apply to every endpoint:**
+
+- Every query is scoped to the signed-in user in `app/services/finance.py`.
+- Another user's row is a 404.
+- Writes need CSRF.
+- Money is Decimal on the wire, converted to the legacy `double precision` at the boundary
+  (D-A3).
+
+**Claiming the existing rows on the server:**
+
+```bash
+# legacy uid = the user_id text the old app wrote (Supabase auth.users id or Firebase uid)
+curl -sS -b $J -H "x-csrf-token: $CSRF" -H 'content-type: application/json' $B/api/finance/claim \
+  -d '{"legacy_user_id":"<uid>","user_id":"<aureon user id>"}'                 # dry run: counts
+curl -sS -b $J -H "x-csrf-token: $CSRF" -H 'content-type: application/json' $B/api/finance/claim \
+  -d '{"legacy_user_id":"<uid>","user_id":"<aureon user id>","apply":true}'    # apply
+```
+
+**Tests:** `tests/test_finance_db.py` covers:
+
+- CRUD with exact decimals; client ids; 409 replays; filters; totals
+- user B gets 404 on GET, PATCH and DELETE of every resource, and 0 in lists and totals; admins
+  are scoped too
+- CSRF and 401
+- validation: negative money, recurring without a day, bad session or side, client-chosen
+  owner, bad ids
+- legacy rows: invisible until claimed; dry run versus apply; new rows keep the legacy owner
+  id; no double claim; audit
+- documents: set, merge and ownership
+- portfolio: admin-only writes
