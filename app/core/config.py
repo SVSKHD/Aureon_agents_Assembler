@@ -254,12 +254,44 @@ class Settings(BaseSettings):
     NEWS_MAX_ITEMS: int = Field(default=200, ge=1, le=1000)
     NEWS_MAX_FEED_BYTES: int = Field(default=2 * 1024 * 1024, ge=1024)
 
+    # --- GitHub (docs/18-github-foundation.md). The token comes from env only. ---
+    # Fine-grained PAT. Never stored in the DB, never logged, never sent to the frontend.
+    GITHUB_TOKEN: SecretStr | None = None
+    GITHUB_API_URL: str = "https://api.github.com"
+    # JSON list of owners (users/orgs) whose repos are visible. Empty = the token user's own.
+    GITHUB_ALLOWED_OWNERS: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # Optional JSON list of "owner/name". When set, only these repos are visible.
+    GITHUB_ALLOWED_REPOS: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # In-memory cache of GitHub GET responses (branches, commits, tree, contents). 0 = off.
+    GITHUB_CACHE_TTL_SECONDS: float = Field(default=60.0, ge=0)
+    GITHUB_CONNECT_TIMEOUT: float = Field(default=5.0, gt=0)
+    GITHUB_READ_TIMEOUT: float = Field(default=20.0, gt=0)
+    GITHUB_MAX_ATTEMPTS: int = Field(default=3, ge=1, le=3)
+    GITHUB_RETRY_BACKOFF_SECONDS: float = Field(default=0.5, ge=0)
+    # A 429 / secondary limit asking to wait longer than this is returned as 429, not waited.
+    GITHUB_MAX_RETRY_WAIT_SECONDS: float = Field(default=20.0, ge=0)
+    # Below this many remaining core requests the client refuses until the window resets.
+    GITHUB_RATE_LIMIT_FLOOR: int = Field(default=50, ge=0)
+    GITHUB_MAX_PAGES: int = Field(default=10, ge=1, le=100)
+    # GET .../contents returns decoded text up to this size; larger or binary = metadata only.
+    GITHUB_MAX_FILE_BYTES: int = Field(default=512 * 1024, ge=1024, le=1024 * 1024)
+    GITHUB_MAX_TREE_ENTRIES: int = Field(default=5000, ge=10, le=100_000)
+    GITHUB_SYNC_CRON: str = "*/20 * * * *"
+    # The `github` agent is reported stale when no sync heartbeat arrived within this long.
+    GITHUB_AGENT_STALE_SECONDS: float = Field(default=3600.0, gt=0)
+
+    @property
+    def github_configured(self) -> bool:
+        return bool(self.GITHUB_TOKEN and self.GITHUB_TOKEN.get_secret_value().strip())
+
     @field_validator(
         "CODE_REPOS",
         "CODE_ALLOWED_COMMANDS",
         "PAPER_COSTS",
         "PAPER_DHAN_CHARGES",
         "NEWS_FEED_URLS",
+        "GITHUB_ALLOWED_OWNERS",
+        "GITHUB_ALLOWED_REPOS",
         mode="before",
     )
     @classmethod
@@ -267,7 +299,13 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             if v.strip():
                 return json.loads(v)
-            return [] if info.field_name in ("CODE_ALLOWED_COMMANDS", "NEWS_FEED_URLS") else {}
+            lists = (
+                "CODE_ALLOWED_COMMANDS",
+                "NEWS_FEED_URLS",
+                "GITHUB_ALLOWED_OWNERS",
+                "GITHUB_ALLOWED_REPOS",
+            )
+            return [] if info.field_name in lists else {}
         return v
 
     @field_validator("IMAGE_AGENT_COMMAND", mode="before")
