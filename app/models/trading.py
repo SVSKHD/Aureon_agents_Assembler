@@ -548,3 +548,26 @@ class AiAnalysis(Base):
     content: Mapped[str] = mapped_column(Text)
     # Explanations only: nothing in this table can create or approve an order intent.
     created_at: Mapped[datetime] = _created()
+
+
+class IndicatorValue(Base):
+    """Technical-analysis output per candle (Phase D). `name` carries the parameters
+    ("ema:9", "macd:12:26:9"); `values` holds Decimal strings, never floats."""
+
+    __tablename__ = "indicator_values"
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "instrument_id", "timeframe", "name", "ts", name="pk_indicator_values"
+        ),
+        CheckConstraint(f"timeframe IN {TIMEFRAMES}", name="timeframe"),
+        S,
+    )
+
+    instrument_id: Mapped[int] = mapped_column(
+        ForeignKey("trading.instruments.id", ondelete="CASCADE")
+    )
+    timeframe: Mapped[str] = mapped_column(String(4))
+    name: Mapped[str] = mapped_column(String(64))
+    ts: Mapped[datetime] = mapped_column(TS)  # candle open time the value is for
+    values: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    computed_at: Mapped[datetime] = _created()

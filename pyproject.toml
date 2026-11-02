@@ -20,6 +20,8 @@ dependencies = [
     "croniter>=3.0",
     "tzdata>=2024.1",
     "websockets>=13.0",
+    "numpy>=2.0,<3",
+    "pandas>=2.2,<4",
 ]
 
 [project.optional-dependencies]
@@ -32,6 +34,7 @@ dev = [
     "mypy>=1.10",
     "types-psutil",
     "types-croniter",
+    "pandas-stubs",
 ]
 
 [build-system]
