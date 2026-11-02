@@ -31,6 +31,10 @@ class Settings(BaseSettings):
 
     # postgresql+asyncpg://user:pass@<postgres-container>:5432/spasta
     DATABASE_URL: SecretStr
+    # Phase 22 (docs/24-production-integration.md): the migrator role's URL, used ONLY by the
+    # `migrate` service / alembic (it owns the app schemas). Unset = DATABASE_URL is used.
+    # Keep it out of the shared .env in production (compose reads it from .env.migrate).
+    MIGRATIONS_DATABASE_URL: SecretStr | None = None
     # redis://aureon-redis:6379/0
     REDIS_URL: str = "redis://aureon-redis:6379/0"
     # http://<ollama-container>:11434 over the private Docker network
@@ -418,6 +422,35 @@ class Settings(BaseSettings):
         default_factory=lambda: ["spasta.online"]
     )
 
+    # --- Production integration (docs/24-production-integration.md) ---
+    # Alerts: open incidents (severity >= warning), stale heartbeats, failed/old backups and
+    # approvals about to expire, sent to DISCORD_WEBHOOK_URL. Empty cron = job not created.
+    ALERTS_CRON: str = "*/5 * * * *"
+    # One alert per fingerprint per this many minutes.
+    ALERTS_DEDUP_MINUTES: int = Field(default=60, ge=1, le=7 * 24 * 60)
+    ALERTS_MAX_PER_RUN: int = Field(default=10, ge=1, le=100)
+    # Pending approvals expiring within this many minutes are announced.
+    ALERTS_APPROVAL_EXPIRY_MINUTES: int = Field(default=10, ge=1, le=24 * 60)
+    # Status file written by scripts/ops/backup.sh (read-only mount in the scheduler).
+    BACKUP_STATUS_FILE: Path = Path("/mnt/spasta-data/ops-status/backup.json")
+    # The last successful backup may be at most this old (nightly timer + slack).
+    BACKUP_MAX_AGE_HOURS: float = Field(default=26.0, gt=0)
+    # Cloudflare Access JWT verification in the app (off unless both are set). AUD is a comma
+    # list (one tag per Access application: spasta.online and api.spasta.online).
+    CF_ACCESS_TEAM_DOMAIN: str | None = None
+    CF_ACCESS_AUD: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    CF_ACCESS_CERTS_TTL_SECONDS: float = Field(default=3600.0, ge=60)
+    CF_ACCESS_LEEWAY_SECONDS: float = Field(default=30.0, ge=0, le=300)
+    # Path prefixes that skip the check (Access bypass policies): the GitHub webhook receiver
+    # (HMAC-verified) and the public, rate-limited endpoints. /api/health is on-box only.
+    CF_ACCESS_BYPASS_PATHS: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["/api/v1/github/webhooks", "/api/public/", "/api/health"]
+    )
+
+    @property
+    def cf_access_enabled(self) -> bool:
+        return bool((self.CF_ACCESS_TEAM_DOMAIN or "").strip() and self.CF_ACCESS_AUD)
+
     @property
     def github_configured(self) -> bool:
         return bool(self.GITHUB_TOKEN and self.GITHUB_TOKEN.get_secret_value().strip())
@@ -484,6 +517,8 @@ class Settings(BaseSettings):
         "INCIDENT_RESTART_CONTAINERS",
         "CLAUDE_CLI_ENV_PASSTHROUGH",
         "CLAUDE_REVIEW_INTERNAL_DOMAINS",
+        "CF_ACCESS_AUD",
+        "CF_ACCESS_BYPASS_PATHS",
         mode="before",
     )
     @classmethod

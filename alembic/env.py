@@ -32,7 +32,13 @@ target_metadata = Base.metadata
 
 
 def _database_url() -> str:
-    url = config.get_main_option("sqlalchemy.url") or os.environ.get("DATABASE_URL")
+    # Phase 22: migrations run as the migrator role (owner of the app schemas) when
+    # MIGRATIONS_DATABASE_URL is set; otherwise DATABASE_URL, as before.
+    url = (
+        config.get_main_option("sqlalchemy.url")
+        or os.environ.get("MIGRATIONS_DATABASE_URL")
+        or os.environ.get("DATABASE_URL")
+    )
     if not url:
         raise RuntimeError("DATABASE_URL is not set")
     return url
