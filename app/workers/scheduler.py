@@ -31,7 +31,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.ollama.client import OllamaClient
-from app.agents.registry import SCHEDULER, AgentRegistry, Heartbeat
+from app.agents.registry import GITHUB, SCHEDULER, AgentRegistry, Heartbeat
 from app.agents.trading.base import BrokerAdapter
 from app.agents.trading.dhan import build_dhan_adapter
 from app.agents.trading.dhan.adapter import DhanAdapter
@@ -41,11 +41,13 @@ from app.agents.trading.types import Timeframe
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging, get_logger
 from app.db.session import build_engine, build_sessionmaker
+from app.integrations.github import build_github_client
+from app.integrations.github.client import GitHubClient, GitHubError
 from app.models.agents import Agent, AgentLog, AgentRun, ScheduledJob
 from app.models.auth import UserSession
 from app.models.finance import FinanceTombstone
 from app.models.trading import BrokerAccount
-from app.services import dhan_sync, mt5_sync, news, paper
+from app.services import dhan_sync, github, mt5_sync, news, paper
 
 log = get_logger("worker.scheduler")
 MAX_BACKOFF_SECONDS = 3600
@@ -59,6 +61,7 @@ class TaskContext:
     dhan: DhanAdapter | None = None
     mt5: MT5Adapter | None = None
     redis: Redis | None = None
+    github: GitHubClient | None = None
 
 
 TaskFn = Callable[[TaskContext], Awaitable[dict[str, Any]]]
@@ -202,6 +205,46 @@ async def paper_reconcile(ctx: TaskContext) -> dict[str, Any]:
     return out
 
 
+async def github_sync(ctx: TaskContext) -> dict[str, Any]:
+    """GitHub connection health + repository sync; heartbeats the `github` agent."""
+    client = ctx.github
+    if client is None:
+        raise RuntimeError("GitHub is not configured (GITHUB_TOKEN)")
+    registry = AgentRegistry(ctx.maker)
+    if await registry.register(GITHUB, {"fingerprint": client.fingerprint}):
+        await registry.heartbeat(GITHUB.id, "idle")
+        return {"skipped": "github agent is paused"}
+    conn = await github.check_connection(ctx.maker, client, ctx.settings)
+    out: dict[str, Any] = {"ok": conn.ok, "login": conn.login}
+    error = None if conn.ok else conn.detail or "connection check failed"
+    if error is None:
+        try:
+            run = await github.sync_repositories(
+                ctx.maker, client, ctx.settings, trigger="scheduler"
+            )
+            out |= {
+                "sync_run_id": run.id,
+                "repos_upserted": run.repos_upserted,
+                "repos_removed": run.repos_removed,
+            }
+        except GitHubError as exc:
+            error = f"{exc.code}: {exc.message}"
+    details = {
+        "fingerprint": client.fingerprint,
+        "login": conn.login,
+        "ok": error is None,
+        "detail": error,
+        "rate_limit": client.rate_limit.as_dict() if client.rate_limit else None,
+        "stale_after_s": ctx.settings.GITHUB_AGENT_STALE_SECONDS,
+        **{k: v for k, v in out.items() if k.startswith("repos_")},
+    }
+    await registry.heartbeat(GITHUB.id, "error" if error else "idle", details)
+    if error:
+        await registry.log(GITHUB.id, "error", f"GitHub: {error}")
+        raise RuntimeError(f"GitHub sync failed: {error}")
+    return out
+
+
 TASKS: dict[str, TaskFn] = {
     "purge_agent_history": purge_agent_history,
     "purge_expired_sessions": purge_expired_sessions,
@@ -213,6 +256,7 @@ TASKS: dict[str, TaskFn] = {
     "paper_process": paper_process,
     "paper_reconcile": paper_reconcile,
     "news_pull": news_pull,
+    "github_sync": github_sync,
 }
 
 # (id, task, cron) — created if missing; an admin's later edits (pause etc.) are kept.
@@ -245,6 +289,8 @@ def default_jobs(settings: Settings) -> list[tuple[str, str, str]]:
         jobs.append(("mt5-sync-status", "mt5_sync_status", settings.MT5_SYNC_CRON))
     if settings.NEWS_FEED_URLS:
         jobs.append(("news-pull", "news_pull", settings.NEWS_PULL_CRON))
+    if settings.github_configured:
+        jobs.append(("github-sync", "github_sync", settings.GITHUB_SYNC_CRON))
     return jobs
 
 
@@ -271,12 +317,13 @@ class Scheduler:
         dhan: DhanAdapter | None = None,
         mt5: MT5Adapter | None = None,
         redis: Redis | None = None,
+        github: GitHubClient | None = None,
     ) -> None:
         self.settings = settings
         self.maker = maker
         self.tasks = TASKS if tasks is None else tasks
         self.registry = AgentRegistry(maker)
-        self.ctx = TaskContext(settings, maker, ollama, dhan, mt5, redis)
+        self.ctx = TaskContext(settings, maker, ollama, dhan, mt5, redis, github)
         self.paused = False
         self.running_job: str | None = None
 
@@ -418,7 +465,10 @@ async def main() -> int:
     redis = Redis.from_url(settings.REDIS_URL)
     dhan = build_dhan_adapter(settings, redis, maker)
     mt5 = build_mt5_adapter(settings)
-    scheduler = Scheduler(settings, maker, ollama=ollama, dhan=dhan, mt5=mt5, redis=redis)
+    gh_client = build_github_client(settings)
+    scheduler = Scheduler(
+        settings, maker, ollama=ollama, dhan=dhan, mt5=mt5, redis=redis, github=gh_client
+    )
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -449,6 +499,8 @@ async def main() -> int:
             await dhan.aclose()
         if mt5 is not None:
             await mt5.aclose()
+        if gh_client is not None:
+            await gh_client.aclose()
         await redis.aclose()
         await engine.dispose()
         log.info("scheduler_stopped")

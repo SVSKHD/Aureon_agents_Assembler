@@ -20,6 +20,7 @@ Trading Phase C watches the separate Aureon MT5 bot through its read-only status
 Trading Phase D adds the research agents: market data, indicators, signals, risk decisions, backtests and Ollama explanations ([docs/13-research-agents.md](docs/13-research-agents.md)).
 Trading Phase F enables PAPER mode end to end: intents, risk, admin approval, simulated fills, P&L and reconciliation; no broker orders ([docs/15-paper-trading.md](docs/15-paper-trading.md)).
 Phase E hardens production: an ENV=prod startup checklist, health-gated compose start order, nightly backups with a weekly restore drill, systemd boot units and a security review ([docs/16-production-hardening.md](docs/16-production-hardening.md), [docs/17-security-review.md](docs/17-security-review.md); sudo steps in [docs/manual-setup.md](docs/manual-setup.md)).
+Phase 15 adds the read-only GitHub integration: a PAT-from-env client with redaction, pagination, retry and rate limits, connection health, synced `github.*` tables and repo browsing ([docs/18-github-foundation.md](docs/18-github-foundation.md)).
 
 ## Layout
 
@@ -94,6 +95,9 @@ tests/  scripts/  deploy/  docs/
 | POST / GET / DELETE | `/api/finance/attachments[/{id}[/file]]` | Receipt attachments on the HDD (PNG/JPEG/WebP/PDF, owner-scoped). |
 | GET / DELETE | `/api/auth/sessions[/{id}]` | List your active sessions; revoke one (audited). |
 | GET | `/api/public/shares/{doc_id}`, `/api/public/forex` | No auth, rate limited: public shares, pulled forex news. |
+| GET / POST | `/api/v1/github/connection[/check]` | GitHub connection health; check it now (admin; never returns the token) ([docs/18-github-foundation.md](docs/18-github-foundation.md)). |
+| GET | `/api/v1/github/repositories[?refresh=true]`, `/api/v1/github/repositories/{owner}/{repo}` | Allowlisted repos from `github.repositories` (sync on demand); live repo detail (admin). |
+| GET | `/api/v1/github/repositories/{owner}/{repo}/branches\|commits\|tree\|contents/{path}` | Branches, commits, git tree, file contents (text up to a cap; binaries metadata only) (admin). |
 | GET | `/api/docs`, `/api/openapi.json` | Swagger UI and schema; both off when `ENV=prod` ([docs/16-production-hardening.md](docs/16-production-hardening.md)). |
 
 ## Configuration

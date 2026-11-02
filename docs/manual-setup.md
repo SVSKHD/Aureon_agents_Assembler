@@ -160,3 +160,46 @@ Check these too:
   work over http.
 - `DEBUG` and `API_DOCS_ENABLED` are unset.
 - `FORWARDED_ALLOW_IPS` is the Docker bridge gateway (deploy/README.md).
+
+## 15 — GitHub foundation
+
+See [18-github-foundation.md](18-github-foundation.md). Without these steps the integration
+stays off: `GET /api/v1/github/connection` says `configured: false` and the other GitHub
+endpoints answer 503 `github_not_configured`.
+
+1. **Create a fine-grained personal access token.** On GitHub, go to Settings → Developer
+   settings → Personal access tokens → Fine-grained tokens → Generate new token.
+   - **Resource owner:** your user, or the organisation that owns the repos (an org may
+     have to approve fine-grained tokens first).
+   - **Expiration:** 90 days at most. Put a calendar reminder a week before it expires.
+     Rotating means a new token in `.env` plus a restart. The old connection row stays as
+     history under its own fingerprint.
+   - **Repository access:** "Only select repositories". Pick exactly the repos Aureon should
+     see (e.g. `Aureon_agents_Assembler` and the frontend repo), never "All repositories".
+   - **Repository permissions:**
+     - Metadata: **Read** (mandatory)
+     - Contents: **Read and write**
+     - Pull requests: **Read and write**
+     - Issues: **Read and write**
+     - Actions: **Read and write**
+     - Workflows: **Read and write**, only if workflows will be dispatched or edited (Phase 17);
+       otherwise leave it at no access
+     - Everything else: no access. This phase only reads; the write permissions are for
+       Phases 16–17, so they are asked for once.
+   - **Account permissions:** none.
+2. **Put it on the server only:** in the backend `.env` next to `compose.yaml`
+   (`chmod 600 .env`):
+   ```
+   GITHUB_TOKEN=github_pat_...
+   GITHUB_ALLOWED_OWNERS=["SVSKHD"]
+   # optional, an exact list:
+   GITHUB_ALLOWED_REPOS=["SVSKHD/Aureon_agents_Assembler"]
+   ```
+   Never put it in the frontend: no `VITE_*` variable, nothing in the browser, nothing in Git.
+   The frontend talks only to `/api/v1/github/*`, which never returns the token.
+3. **Restart:** run `docker compose up -d api scheduler`, then, as an admin,
+   `POST /api/v1/github/connection/check`. Expect `ok: true` and your login. Then
+   `GET /api/v1/github/repositories?refresh=true`.
+4. **If it leaks** (it shows up in a log, a paste or a commit): revoke it on GitHub
+   immediately, create a new one and restart. Every log line and error is redacted, but
+   revoking is the only real fix.

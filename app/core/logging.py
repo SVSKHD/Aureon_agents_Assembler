@@ -20,12 +20,15 @@ SENSITIVE_KEY = re.compile(
 # user:password@ in URLs/DSNs, and bearer tokens, inside free-text values.
 _URL_CREDS = re.compile(r"(?P<scheme>[a-z][a-z0-9+.-]*://)(?P<user>[^:/@\s]+):[^@/\s]+@", re.I)
 _BEARER = re.compile(r"(?P<p>\b(?:bearer|token)\s+)[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE)
+# GitHub credentials in free text (classic/OAuth/app tokens and fine-grained PATs).
+_GITHUB_TOKEN = re.compile(r"github_pat_[A-Za-z0-9_]{8,}|gh[pousr]_[A-Za-z0-9]{8,}")
 _MAX_DEPTH = 6
 
 
 def _scrub_text(value: str) -> str:
     value = _URL_CREDS.sub(lambda m: f"{m['scheme']}{m['user']}:{REDACTED}@", value)
-    return _BEARER.sub(lambda m: f"{m['p']}{REDACTED}", value)
+    value = _BEARER.sub(lambda m: f"{m['p']}{REDACTED}", value)
+    return _GITHUB_TOKEN.sub(REDACTED, value)
 
 
 def _scrub(value: Any, depth: int = 0) -> Any:
