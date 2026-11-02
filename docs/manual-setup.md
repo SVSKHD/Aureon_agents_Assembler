@@ -400,3 +400,68 @@ the engine works with the seeded policies and no notifications.
 3. **Voice (optional).** To let the local model resolve phrases the grammar misses, pull a
    small model on the Ollama box and set `VOICE_OLLAMA_MODEL=<model>`; otherwise leave it
    empty (grammar only).
+
+## 22 — Production integration
+
+See [24-production-integration.md](24-production-integration.md). In order:
+
+1. **Scoped DB roles (needs the Postgres superuser, inside its container).**
+   ```bash
+   scripts/ops/backup.sh                                  # first
+   python3 -c "import secrets; print(secrets.token_urlsafe(32))"   # x3: app, migrator, readonly
+   scripts/ops/apply-db-roles.sh --dry-run
+   scripts/ops/apply-db-roles.sh                          # prompts; or AUREON_*_DB_PASSWORD env
+   ```
+   Then switch the URLs (passwords in a password manager, never in Git):
+   - `.env`: `DATABASE_URL=postgresql+asyncpg://aureon_app:<pw>@<postgres-container>:5432/spasta`
+   - new `.env.migrate` (`chmod 600`): `MIGRATIONS_DATABASE_URL=postgresql+asyncpg://aureon_migrator:<pw>@<postgres-container>:5432/spasta`
+   - `scripts/ops/ops.env`: `AUREON_MIGRATOR_ROLE=aureon_migrator` (rollback drill)
+   - `docker compose up -d`, then `GET /api/v1/system/integrations` → `database.scoped: true`.
+   - Re-run `scripts/ops/apply-db-roles.sh` (empty passwords = keep) after every deploy that
+     adds tables. Backups/analytics may use `aureon_readonly`.
+   - If the old app role was the owner of `public.trades` etc., nothing changes for it.
+2. **Rollback drill (once now, then before risky upgrades):**
+   `scripts/ops/rollback-drill.sh --steps 3` → report in `$BACKUP_DIR/drills/rollback-*.json`.
+3. **Cloudflare Tunnel + Access** (dashboard + sudo): follow
+   [deploy/cloudflare/README.md](../deploy/cloudflare/README.md) steps 1–8: tunnel routes for
+   both hostnames, the Access applications (owner email allowlist, 24 h sessions, the
+   `aureon-ops` service token, Bypass only for `api.spasta.online/api/v1/github/webhooks`
+   and `*/api/public`), `/etc/cloudflared/config.yml` from `config.yml.example`
+   (`sudo cloudflared tunnel ingress validate && sudo systemctl restart cloudflared`), and the
+   nginx block:
+   ```bash
+   sudo ln -s /opt/private-ai/aureon/deploy/nginx/api-spasta-online.conf /etc/nginx/sites-enabled/
+   sudo nginx -t && sudo systemctl reload nginx
+   ```
+   Optionally `.env`: `CF_ACCESS_TEAM_DOMAIN=<team>.cloudflareaccess.com`,
+   `CF_ACCESS_AUD=<web aud>,<api aud>`, then `docker compose up -d api`. Point the GitHub
+   webhook at `https://api.spasta.online/api/v1/github/webhooks`.
+4. **Enable the alerts.** `DISCORD_WEBHOOK_URL` (Phase 20) must be set; keep
+   `ALERTS_CRON=*/5 * * * *` (or your cadence), `docker compose up -d scheduler`. Check
+   `GET /api/scheduler/jobs` lists `alerts-dispatch`, and run it once with
+   `POST /api/scheduler/jobs/alerts-dispatch/run`. The backup alert needs the status file:
+   run `scripts/ops/backup.sh` once (it creates `$DATA_ROOT/ops-status/backup.json`, 0644).
+5. **Resources.** `free -h`, `docker stats --no-stream`; do not run the `imaging` and
+   `coding` profiles together unless RAM allows (budget table in docs/24).
+6. **Run the acceptance list on the server and paste the results** into docs/24 as
+   "Results (server, <date>)":
+   ```bash
+   cd /opt/private-ai/aureon
+   export AUREON_ACCEPTANCE_EMAIL=<admin email>          # password: prompted (or AUREON_ACCEPTANCE_PASSWORD)
+   export AUREON_ACCEPTANCE_PR=SVSKHD/<repo>#<open test PR>        # optional: merge-gate step
+   export AUREON_ACCEPTANCE_WEBHOOK_SECRET=<GITHUB_WEBHOOK_SECRET>  # optional: idempotency half
+   export AUREON_ACCEPTANCE_CODE_REPO=<CODE_REPOS entry>            # optional: coding step
+   export AUREON_ACCEPTANCE_INSTRUMENT_ID=<mt5 instrument id with a live price>  # paper step
+   export AUREON_ACCEPTANCE_DRILL_DIR=/mnt/spasta-data/backups/aureon/drills
+   # Runs in the api image (it has httpx), on the compose network, against the API itself:
+   docker compose run --rm --no-deps -it \
+     -v "$PWD/scripts/ops/acceptance.py:/opt/acceptance.py:ro" \
+     -v /mnt/spasta-data/ops-status:/out -v "$AUREON_ACCEPTANCE_DRILL_DIR:/drills:ro" \
+     -e AUREON_ACCEPTANCE_EMAIL -e AUREON_ACCEPTANCE_PR -e AUREON_ACCEPTANCE_WEBHOOK_SECRET \
+     -e AUREON_ACCEPTANCE_CODE_REPO -e AUREON_ACCEPTANCE_INSTRUMENT_ID \
+     -e AUREON_ACCEPTANCE_DRILL_DIR=/drills \
+     api python /opt/acceptance.py --base-url http://aureon-api:8000 --report /out/acceptance.json
+   ```
+   (the password is prompted on the tty; nothing is passed in argv).
+   Add `--skip-heavy` to avoid starting chat/image/coding jobs. Through Cloudflare instead,
+   use `--base-url https://api.spasta.online` with `CF_ACCESS_CLIENT_ID/SECRET`.
