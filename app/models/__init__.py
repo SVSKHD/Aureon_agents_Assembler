@@ -1,5 +1,6 @@
 """Import every model module here so Base.metadata is complete for Alembic."""
 
+from app.models import brokers, trading  # noqa: F401  (registers trading/dhan/mt5 tables)
 from app.models.agents import Agent, AgentLog, AgentRun, ScheduledJob
 from app.models.ai import Conversation, Message, ModelInventory
 from app.models.auth import AuditEvent, Role, User, UserSession
