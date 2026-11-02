@@ -507,9 +507,8 @@ class GitHubClient:
                         if tail_bytes is not None:
                             return bytes(buf[-tail_bytes:]), True
                         return bytes(buf[:max_bytes]), True
-                if tail_bytes is not None and len(buf) > tail_bytes:
-                    return bytes(buf[-tail_bytes:]), True
-                return bytes(buf), False
+                out = bytes(buf[-tail_bytes:]) if tail_bytes is not None else bytes(buf)
+                return out, seen > len(out)
             except httpx.TransportError as exc:
                 raise GitHubUnavailable(
                     f"log download from {host} failed: {type(exc).__name__}"

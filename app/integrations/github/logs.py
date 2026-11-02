@@ -111,6 +111,7 @@ def _entry_order(name: str) -> tuple[int, str]:
 _ANSI = re.compile(
     r"\x1b\[[0-?]*[ -/]*[@-~]"
     r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|\x1b[ -/]+[0-~]"
     r"|\x1b[@-Z\\-_]"
     r"|\x9b[0-?]*[ -/]*[@-~]"
 )

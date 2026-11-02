@@ -240,3 +240,68 @@ what would change it. Newest phase last.
 - **D-16-15: issue lists leave out PRs.** GitHub's issues endpoint returns PRs too. They are
   filtered out unless `include_pulls=true`. Lists return one GitHub page with `has_next`
   from the Link header.
+
+## 17 — GitHub Actions and webhooks
+
+- **D-17-1: logs are fetched without the token, from named hosts only.** The API client keeps
+  refusing off-host redirects (D-15-6); for logs it returns the Location instead, and a
+  separate HTTP client with no Authorization header fetches it. `GITHUB_LOG_HOSTS` matches
+  label by label (`*` is one DNS label), https on 443 only, no URL credentials, every hop
+  re-checked. The pre-signed URL is never logged.
+- **D-17-2: sanitise in a fixed order: strip ANSI → tail cut → redact → cap.** Stripping first
+  stops an escape code hiding a token; cutting at a line start before redacting means the
+  cut never splits a token, and redacting only the kept tail bounds the regex work. Tail
+  first because failures are at the end.
+- **D-17-3: "production" is the explicit list plus a keyword rule.** A workflow whose name,
+  file or file stem is in `GITHUB_PROD_WORKFLOWS`, or whose name or file contains `deploy`
+  or `prod`, is gated. The keyword rule cannot be switched off: a forgotten list entry must
+  fail safe (gated), not open.
+- **D-17-4: one allowlist for dispatch and re-run; cancel needs only the repo allowlist.**
+  Re-running a deploy run is a deploy, so re-runs use the same allowlist and the same gate
+  (kind `github.workflow_dispatch_prod`, payload `action` = dispatch | rerun |
+  rerun_failed). Cancel only stops work.
+- **D-17-5: a non-numeric workflow is refused before any GitHub call.** A numeric id is
+  resolved first (one GET) and then checked against the allowlist by its file; nothing is
+  written either way.
+- **D-17-6: the dispatch artifact binds the commit.** It includes the sha the ref points at
+  (and the inputs), so a push between request and approval invalidates the approval: the
+  approver approves deploying a specific commit. The re-run artifact binds the head sha and
+  `run_attempt`.
+- **D-17-7: `file_gated` takes `op` and `target`.** Kinds registered outside
+  `github_ops` (this one) pass their own tracked-operation name and target; the Phase 16
+  kinds are unchanged. The executor reuses `github_ops._on_status`.
+- **D-17-8: the receiver answers before any processing.** Order: 503 (no secret) → 415 → 413
+  → 401 → 400 → insert. Invalid signatures store nothing, only a Redis hash counter per
+  reason and a log line. Only `sha256=` signatures are accepted.
+- **D-17-9: idempotency is the unique `delivery_id`.** `INSERT … ON CONFLICT DO NOTHING`;
+  a conflict is 200 `duplicate`, whatever the earlier row's status. GitHub's "Redeliver"
+  keeps the delivery id, so a manual redelivery is also a no-op: to reprocess a failed
+  event, set its status back to `pending` in SQL.
+- **D-17-10: off-allowlist repos and unhandled events are stored as `ignored`.** They are kept
+  for the audit trail (trimmed, redacted) but never queued or processed. With no allowlist
+  set, the receiver uses the login of the last successful connection check, never a live
+  GitHub call.
+- **D-17-11: Redis is a wake-up, the DB is the queue.** The list carries delivery ids only
+  and is trimmed to 10,000; the worker also scans due pending rows with `FOR UPDATE SKIP
+  LOCKED`, so retries, Redis restarts and enqueue failures lose nothing, and several
+  workers never process a row twice.
+- **D-17-12: handlers run in a savepoint.** A failure rolls back the handler's partial writes
+  while the row stays locked, then `attempts`, `error` (redacted) and `next_attempt_at`
+  (base·2^(n-1), ≤ 1 h) are set with a core UPDATE. After `GITHUB_WEBHOOK_MAX_ATTEMPTS` the
+  event is `failed` (poison) and never picked up again.
+- **D-17-13: out-of-order events never regress a row.** A run upsert applies only when the
+  incoming `updated_at` is not older; a job upsert never moves a completed job back to a
+  non-completed status of the same attempt. Jobs have no FK to runs.
+- **D-17-14: `on_workflow_failed` callbacks fire after commit, once per delivery,
+  best-effort.** failure / timed_out / startup_failure conclusions of `completed` runs.
+  A raising callback is logged, never retried, and never fails the event. `WorkflowFailure`
+  carries branch, event and head sha for Phase 18's recursion guard.
+- **D-17-15: push / pull_request / issues are recorded, not fetched.** The API's GET cache
+  lives in another process, so there is nothing to drop; `push` updates
+  `github.repositories.pushed_at`.
+- **D-17-16: the Actions sync reads the pause flag only.** `github_actions_sync` checks the
+  `github` agent's `paused`, but does not register or heartbeat it, so it never overwrites
+  `github_sync`'s connection details.
+- **D-17-17: the worker is its own agent and compose service.** `github-webhooks` (kind
+  integration), same image as the scheduler, profile `github`, 0.5 CPU / 256 MB, the shared
+  hardening, the heartbeat-file healthcheck, Redis + Postgres networks only, no ports.
