@@ -71,6 +71,34 @@ class AuthService:
             .values(revoked_at=func.now())
         )
 
+    async def active_sessions(self, user_id: uuid.UUID) -> list[UserSession]:
+        """The user's sessions that are neither revoked nor expired, newest first."""
+        rows = await self.db.scalars(
+            select(UserSession)
+            .where(
+                UserSession.user_id == user_id,
+                UserSession.revoked_at.is_(None),
+                UserSession.expires_at > func.now(),
+            )
+            .order_by(UserSession.created_at.desc(), UserSession.id)
+        )
+        return list(rows.all())
+
+    async def revoke_own(self, user_id: uuid.UUID, session_id: uuid.UUID) -> bool:
+        """Revoke one of the user's own active sessions. False if it is not theirs, unknown,
+        or already revoked / expired (the API answers 404 for all of those)."""
+        result = await self.db.execute(
+            update(UserSession)
+            .where(
+                UserSession.id == session_id,
+                UserSession.user_id == user_id,
+                UserSession.revoked_at.is_(None),
+                UserSession.expires_at > func.now(),
+            )
+            .values(revoked_at=func.now())
+        )
+        return bool(result.rowcount)  # type: ignore[attr-defined]
+
     async def revoke_all(self, user_id: uuid.UUID) -> int:
         result = await self.db.execute(
             update(UserSession)
