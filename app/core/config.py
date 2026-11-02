@@ -237,15 +237,37 @@ class Settings(BaseSettings):
     # The stream ends after this long; the browser's EventSource reconnects with its cursor.
     TRADING_STREAM_MAX_SECONDS: float = Field(default=1800.0, gt=0)
 
+    # --- frontend support (docs/02-auth-and-finance.md, "Frontend support") ---
+    # Receipt attachments, stored under DATA_ROOT/finance-attachments/<user>/<id>.
+    FINANCE_ATTACHMENT_MAX_BYTES: int = Field(default=10 * 1024 * 1024, ge=1024)
+    FINANCE_ATTACHMENTS_MAX_PER_USER: int = Field(default=2000, ge=1)
+    # Delete tombstones (for GET /api/finance/changes) are pruned after this many days.
+    FINANCE_TOMBSTONE_RETENTION_DAYS: int = Field(default=30, ge=1)
+    # Max rows per kind returned by one GET /api/finance/changes call.
+    FINANCE_CHANGES_MAX_ROWS: int = Field(default=5000, ge=10)
+    # GET /api/public/* requests allowed per client IP per minute.
+    PUBLIC_RATE_LIMIT_PER_MINUTE: int = Field(default=60, ge=1)
+    # RSS/Atom feeds for the `news_pull` job (JSON list). Empty = the job is not scheduled.
+    NEWS_FEED_URLS: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    NEWS_PULL_CRON: str = "*/30 * * * *"
+    NEWS_HTTP_TIMEOUT: float = Field(default=10.0, gt=0)
+    NEWS_MAX_ITEMS: int = Field(default=200, ge=1, le=1000)
+    NEWS_MAX_FEED_BYTES: int = Field(default=2 * 1024 * 1024, ge=1024)
+
     @field_validator(
-        "CODE_REPOS", "CODE_ALLOWED_COMMANDS", "PAPER_COSTS", "PAPER_DHAN_CHARGES", mode="before"
+        "CODE_REPOS",
+        "CODE_ALLOWED_COMMANDS",
+        "PAPER_COSTS",
+        "PAPER_DHAN_CHARGES",
+        "NEWS_FEED_URLS",
+        mode="before",
     )
     @classmethod
     def _parse_json(cls, v: object, info: ValidationInfo) -> object:
         if isinstance(v, str):
             if v.strip():
                 return json.loads(v)
-            return [] if info.field_name == "CODE_ALLOWED_COMMANDS" else {}
+            return [] if info.field_name in ("CODE_ALLOWED_COMMANDS", "NEWS_FEED_URLS") else {}
         return v
 
     @field_validator("IMAGE_AGENT_COMMAND", mode="before")

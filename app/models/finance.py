@@ -27,12 +27,15 @@ from sqlalchemy import (
     DateTime,
     Double,
     ForeignKey,
+    Identity,
+    Index,
     Integer,
     MetaData,
     SmallInteger,
     Table,
     Text,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -142,4 +145,50 @@ class FinanceIdentity(Base):
     linked_by: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("core.users.id", ondelete="SET NULL")
     )
+    created_at: Mapped[datetime] = mapped_column(TS_COL, server_default=func.now())
+
+
+class FinanceTombstone(Base):
+    """A deleted finance row or document, so GET /api/finance/changes can report deletes.
+    `ref` is the row id, or "namespace/doc_id" for a document. Pruned after
+    FINANCE_TOMBSTONE_RETENTION_DAYS by the purge-agent-history job."""
+
+    __tablename__ = "finance_tombstones"
+    __table_args__ = (
+        Index("ix_finance_tombstones_user_deleted", "aureon_user_id", "deleted_at"),
+        {"schema": "core"},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    aureon_user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("core.users.id", ondelete="CASCADE")
+    )
+    kind: Mapped[str] = mapped_column(Text)  # trades | expenses | secured | document
+    ref: Mapped[str] = mapped_column(Text)
+    deleted_at: Mapped[datetime] = mapped_column(TS_COL, server_default=func.now())
+
+
+class FinanceAttachment(Base):
+    """A receipt file on the HDD, attached to one of the owner's trades/expenses/secured rows.
+    `storage_path` is relative to DATA_ROOT and built from UUIDs only."""
+
+    __tablename__ = "finance_attachments"
+    __table_args__ = (
+        Index("ix_finance_attachments_owner_ref", "aureon_user_id", "kind", "ref"),
+        {"schema": "core"},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    aureon_user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("core.users.id", ondelete="CASCADE")
+    )
+    kind: Mapped[str] = mapped_column(Text)  # trades | expenses | secured
+    ref: Mapped[str] = mapped_column(Text)
+    filename: Mapped[str] = mapped_column(Text)
+    content_type: Mapped[str] = mapped_column(Text)
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    sha256: Mapped[str] = mapped_column(Text)
+    storage_path: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(TS_COL, server_default=func.now())
