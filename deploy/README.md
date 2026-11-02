@@ -88,6 +88,9 @@ Coding agent (migration 0008, opt-in `coding-worker`): see
 
 Research agents (migration 0007, opt-in worker): see [docs/13-research-agents.md](../docs/13-research-agents.md#deploy-and-validate).
 
+Paper trading (migration 0009, scheduler jobs `paper-process` / `paper-reconcile`): see
+[docs/15-paper-trading.md](../docs/15-paper-trading.md#deploy-and-validate).
+
 Agents, scheduler, system status and the host-status helper: see
 [docs/05-agents.md](../docs/05-agents.md#deploy-and-validate).
 
