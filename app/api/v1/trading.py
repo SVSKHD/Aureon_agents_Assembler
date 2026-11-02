@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
@@ -40,9 +40,11 @@ from app.schemas.trading import (
     ExecutionOut,
     FundsOut,
     HealthOut,
+    HoldingOut,
     InstrumentOut,
     LiveToken,
     ModeChange,
+    OptionChainOut,
     OrderOut,
     PositionOut,
     QuoteOut,
@@ -51,6 +53,7 @@ from app.schemas.trading import (
     SignalOut,
     StrategyOut,
     StrategyVersionOut,
+    TradeOut,
     TradingAgentStatus,
 )
 from app.services import audit
@@ -333,6 +336,64 @@ async def account_orders(
     adapter = adapter_for(_adapters(request), acct.broker, "orders")
     rows = await call_adapter(adapter.orders(acct.account_id), settings)
     return _page([OrderOut.model_validate(o) for o in rows], limit, offset)
+
+
+@router.get("/accounts/{account_id}/holdings", response_model=Page[HoldingOut])
+async def account_holdings(
+    account_id: uuid.UUID,
+    request: Request,
+    db: DbSession,
+    current: Current,
+    settings: SettingsDep,
+    limit: Limit = 100,
+    offset: Offset = 0,
+) -> Page[HoldingOut]:
+    acct = await get_visible_account(db, current, account_id)
+    adapter = adapter_for(_adapters(request), acct.broker, "holdings")
+    rows = await call_adapter(adapter.holdings(acct.account_id), settings)
+    return _page([HoldingOut.model_validate(h) for h in rows], limit, offset)
+
+
+@router.get("/accounts/{account_id}/trades", response_model=Page[TradeOut])
+async def account_trades(
+    account_id: uuid.UUID,
+    request: Request,
+    db: DbSession,
+    current: Current,
+    settings: SettingsDep,
+    limit: Limit = 100,
+    offset: Offset = 0,
+) -> Page[TradeOut]:
+    acct = await get_visible_account(db, current, account_id)
+    adapter = adapter_for(_adapters(request), acct.broker, "trades")
+    rows = await call_adapter(adapter.trades(acct.account_id), settings)
+    return _page([TradeOut.model_validate(t) for t in rows], limit, offset)
+
+
+@router.get("/option-chain/expiries", response_model=list[date])
+async def option_expiries(
+    request: Request,
+    _: Current,
+    settings: SettingsDep,
+    underlying: Annotated[str, Query(max_length=40)],
+    broker: Broker = Broker.DHAN,
+) -> list[date]:
+    adapter = adapter_for(_adapters(request), broker.value, "option_expiries")
+    return await call_adapter(adapter.option_expiries(underlying), settings)
+
+
+@router.get("/option-chain", response_model=OptionChainOut)
+async def option_chain(
+    request: Request,
+    _: Current,
+    settings: SettingsDep,
+    underlying: Annotated[str, Query(max_length=40, description="e.g. IDX_I:13 (NIFTY)")],
+    expiry: date,
+    broker: Broker = Broker.DHAN,
+) -> OptionChainOut:
+    adapter = adapter_for(_adapters(request), broker.value, "option_chain")
+    chain = await call_adapter(adapter.option_chain(underlying, expiry), settings)
+    return OptionChainOut.model_validate(chain)
 
 
 @router.get("/quotes", response_model=list[QuoteOut])

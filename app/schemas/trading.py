@@ -146,6 +146,61 @@ class QuoteOut(_FromAttrs):
     volume: Decimal | None
 
 
+class HoldingOut(_FromAttrs):
+    source: ValueSource = "broker"
+    account_id: str
+    symbol: str
+    isin: str | None
+    quantity: Decimal
+    available_quantity: Decimal
+    avg_cost: Decimal
+    last_price: Decimal | None
+
+
+class TradeOut(_FromAttrs):
+    source: ValueSource = "broker"
+    account_id: str
+    trade_id: str
+    order_id: str
+    symbol: str
+    broker_instrument_id: str | None
+    side: str
+    quantity: Decimal
+    price: Decimal
+    executed_at: datetime
+
+
+class OptionLegOut(_FromAttrs):
+    broker_instrument_id: str | None
+    last_price: Decimal | None
+    oi: Decimal | None
+    volume: Decimal | None
+    implied_volatility: Decimal | None
+    delta: Decimal | None
+    gamma: Decimal | None
+    theta: Decimal | None
+    vega: Decimal | None
+    previous_close: Decimal | None
+    previous_oi: Decimal | None
+    bid: Decimal | None
+    ask: Decimal | None
+
+
+class OptionStrikeOut(_FromAttrs):
+    strike: Decimal
+    call: OptionLegOut | None
+    put: OptionLegOut | None
+
+
+class OptionChainOut(_FromAttrs):
+    source: ValueSource = "broker"
+    underlying: str
+    expiry: date
+    underlying_price: Decimal | None
+    as_of: datetime
+    strikes: list[OptionStrikeOut]
+
+
 # --- stored data --------------------------------------------------------------------------
 
 
