@@ -59,6 +59,15 @@ ADMIN = {
     ("GET", "/api/code/tasks/{task_id}/diff"),
     ("POST", "/api/code/tasks/{task_id}/approve"),
     ("POST", "/api/code/tasks/{task_id}/reject"),
+    # Phase 15 GitHub foundation: admin only, GETs included (docs/18-github-foundation.md).
+    ("GET", "/api/v1/github/connection"),
+    ("POST", "/api/v1/github/connection/check"),
+    ("GET", "/api/v1/github/repositories"),
+    ("GET", "/api/v1/github/repositories/{owner}/{repo}"),
+    ("GET", "/api/v1/github/repositories/{owner}/{repo}/branches"),
+    ("GET", "/api/v1/github/repositories/{owner}/{repo}/commits"),
+    ("GET", "/api/v1/github/repositories/{owner}/{repo}/tree"),
+    ("GET", "/api/v1/github/repositories/{owner}/{repo}/contents/{path:path}"),
 }
 
 SAFE = {"GET", "HEAD", "OPTIONS"}
