@@ -94,6 +94,21 @@ class Settings(BaseSettings):
     IMAGE_QUEUE_KEY: str = "aureon:imaging:wake"
     IMAGE_STUB_DELAY: float = Field(default=0.0, ge=0)
 
+    # --- agents / scheduler / monitoring (docs/05-agents.md) ---
+    AGENT_HEARTBEAT_SECONDS: float = Field(default=15.0, gt=0)
+    # An agent whose last heartbeat is older than this is reported as "stale".
+    AGENT_STALE_SECONDS: float = Field(default=60.0, gt=0)
+    AGENT_LOG_RETENTION_DAYS: int = Field(default=30, ge=1)
+    AGENT_RUN_RETENTION_DAYS: int = Field(default=90, ge=1)
+    SCHEDULER_TICK_SECONDS: float = Field(default=5.0, gt=0)
+    # Cron expressions are evaluated in this zone.
+    SCHEDULER_TIMEZONE: str = "Asia/Kolkata"
+    # Read-only Docker API (a socket proxy that only allows GET /containers). Empty = off.
+    DOCKER_API_URL: str = "http://aureon-docker-proxy:2375"
+    # JSON written by deploy/host-status (systemctl is-active for a fixed unit list).
+    HOST_STATUS_FILE: Path = Path("/mnt/spasta-data/status/host-services.json")
+    HOST_STATUS_MAX_AGE_SECONDS: float = Field(default=120.0, gt=0)
+
     @field_validator("IMAGE_AGENT_COMMAND", mode="before")
     @classmethod
     def _parse_command(cls, v: object) -> object:
