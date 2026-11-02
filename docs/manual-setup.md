@@ -267,3 +267,39 @@ See [20-github-actions-webhooks.md](20-github-actions-webhooks.md).
    `github-webhooks`.
 7. **Secret rotation:** change `.env` and the GitHub webhook secret together, restart the
    API, and redeliver any 401 deliveries from GitHub's Recent Deliveries page.
+
+## 18 — Self-repair
+
+Detection and recovery need nothing extra. Repairs stay disabled (tasks `queued` with the
+reason) until all of this is done. See [21-self-repair.md](21-self-repair.md).
+
+1. **Check RAM first.** A 7B coder model in Q4 needs about 5–6 GB of RAM while loaded. The
+   coding worker also runs the tests (`mem_limit: 3g`). Check with `free -h` on the host and
+   `docker exec <ollama> ollama ps`. Don't run it next to another large model: Ollama keeps
+   a model loaded for a few minutes after use.
+2. **Pull the model** into the existing Ollama container (no external API is involved):
+   `docker exec <ollama-container> ollama pull qwen2.5-coder:7b`, then
+   `docker exec <ollama-container> ollama list`.
+3. **Configure `.env`:**
+   - `REPAIR_MODEL=qwen2.5-coder:7b`
+   - `REPAIR_REPO=<the CODE_REPOS entry, e.g. aureon-agentic>`. That entry must list
+     allowlisted `tests` (e.g. `[".venv/bin/python","-m","pytest","-q","-m","not db"]`) and
+     usually `"link": [".venv"]`.
+   - `REPAIR_GITHUB_REPO=SVSKHD/Aureon_agents_Assembler`, which must also be in
+     `GITHUB_ALLOWED_REPOS` / `GITHUB_ALLOWED_OWNERS`
+   - optionally `GITHUB_DISPATCH_ALLOWLIST` entries so failed CI runs can be re-run once
+4. **PAT permissions.** The fine-grained `GITHUB_TOKEN` needs **Contents: Read and write**
+   (blobs, trees, commits and the `repair/*` ref) and **Pull requests: Read and write** on
+   the repair repo. Keep it limited to the repos Aureon manages. The coding worker holds this
+   token, so give it nothing more.
+5. **Protect the base branch** on GitHub (require a PR review), so a repair PR can only land
+   through review plus the approval-gated merge.
+6. **Network.** The coding worker reaches GitHub's API over its `private-ai` network, so that
+   network needs outbound HTTPS. Check with
+   `docker exec aureon-coding python -c "import urllib.request;print(urllib.request.urlopen('https://api.github.com').status)"`.
+7. **Apply and start:** `docker compose run --rm migrate` (0015),
+   `docker compose up -d api scheduler`, `docker compose --profile coding up -d coding-worker`.
+   `GET /api/v1/repairs/status` should say `enabled: true`.
+8. **Container restarts stay manual.** The docker-proxy is read-only by design. If a
+   `docker` incident says `manual`, restart the container yourself
+   (`docker compose restart <svc>`) and resolve the incident.

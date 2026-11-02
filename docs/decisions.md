@@ -305,3 +305,64 @@ what would change it. Newest phase last.
 - **D-17-17: the worker is its own agent and compose service.** `github-webhooks` (kind
   integration), same image as the scheduler, profile `github`, 0.5 CPU / 256 MB, the shared
   hardening, the heartbeat-file healthcheck, Redis + Postgres networks only, no ports.
+
+## 18 — Self-repair
+
+- **D-18-1: the repair loop lives in the coding worker.** It reuses the coding agent's
+  worktree sandbox, patch validator, path checks and argv allowlist, and shares one
+  process-wide `HEAVY_MODEL_LOCK` (`app/agents/ollama/heavy.py`) with the coding loop. Each
+  loop holds it for a whole task (model call and tests), so code and repair never run a
+  model or a test suite concurrently. There was no existing Ollama lock in the coding worker;
+  this one is new.
+- **D-18-2: repair branches reach GitHub through the REST API, never `git push`.** Blobs →
+  tree → commit → `refs/heads/repair/<id12>` → PR. The agent's git keeps
+  `protocol.allow=never` and no credential ever exists in a worktree. The local base sha is
+  the commit's parent, so the base must already be on GitHub.
+- **D-18-3: `REPAIR_MODEL` defaults to empty (disabled).** The spec asks for a default model
+  and "unset = disabled". The code default is empty (disabled); `.env.example` suggests the
+  Qwen coder model to set. `REPAIR_REPO`, `REPAIR_GITHUB_REPO` and `GITHUB_TOKEN` must also
+  be set. Missing any of them: tasks are created `queued` with the reason and never claimed.
+- **D-18-4: exceptions are captured in memory, written in the background.** The structlog
+  processor sits in both the structlog and the stdlib chains, plus a chained
+  `sys.excepthook`. No I/O happens inside a log call. Flushers run in the API, the coding
+  worker and the webhook worker; the scheduler flushes inside `incident_scan`. Fingerprint =
+  type + innermost `app` frame (module:function). Rate limit: one write per fingerprint per
+  `INCIDENT_EXCEPTION_RATE_SECONDS`, at most 200 fingerprints per process.
+- **D-18-5: stdlib tracebacks are now rendered before redaction.** While wiring the processor
+  we found that stdlib records with `exc_info` (uvicorn's "Exception in ASGI application")
+  were serialised as a raw tuple, including the exception's repr, so a token in the message
+  bypassed `redact_secrets`. `format_exc_info` now runs in the stdlib chain before
+  redaction.
+- **D-18-6: Docker health is probed by the API.** Only the API is on the docker-proxy's
+  internal network, so the API runs a small loop (`INCIDENT_DOCKER_PROBE_SECONDS`). The
+  scheduler's scan uses the pluggable probe, which defaults to "unknown".
+- **D-18-7: container restarts are `manual`.** The shipped proxy has `POST: "0"`. The
+  `restart_container` action exists, but it only runs when
+  `INCIDENT_DOCKER_PROXY_ALLOWS_RESTART=true` and the container is in
+  `INCIDENT_RESTART_CONTAINERS`. We did not widen the proxy.
+- **D-18-8: "restart a worker loop" = pause then resume through the registry.** Trading and
+  broker agents are excluded and become `manual`. The Redis lock map has one entry
+  (`imaging`), the only worker lock that exists.
+- **D-18-9: the Actions rerun runs once per run id, with the system as actor.**
+  `github_ops.Actor.user_id` is now optional (`None` = the system). The column was already
+  nullable.
+- **D-18-10: escalation is one-shot.** An escalated incident (`details._escalated`) is
+  never processed again automatically. A finished repair other than `pr_opened` hands the
+  incident back to `open`, still escalated, so nothing loops. Only exception incidents map
+  to a code location; other sources escalate to `_manual`.
+- **D-18-11: the hard blocks are wider than the spec.** They also cover `app/services/approvals*`,
+  `app/core/prod_checks*`, the repair system itself (`repair*`, `incidents*`, the exception
+  sink) and the sandbox (`app/agents/coding/**`), so a repair can never weaken its own
+  guards. `*secret*` and `*credential*` file names are blocked too. Settings changes are
+  allowed, except lines in `app/core/config.py` that name a secret field.
+- **D-18-12: tests are required.** A repo with no allowlisted test command can never get a
+  repair PR (`tests_failed`, "no allowlisted test commands").
+- **D-18-13: the circuit breaker pauses the `repair` agent row.** It upserts the row if the
+  worker never registered, is audited once per opening, and stays open until an admin
+  resumes the agent. Only `failed` and `tests_failed` count; `blocked` and `cancelled` do
+  not.
+- **D-18-14: the merge kind is `github.pr.merge`.** The spec writes `github.pr_merge`; the
+  kind Phase 16 registered is `github.pr.merge`, and repair PRs use it unchanged.
+- **D-18-15: the incident-scan job is a default job** (`INCIDENT_SCAN_CRON`, every minute;
+  empty removes it). The existing default-jobs test now expects it and pauses it, so it
+  stays out of that test's ticks.
