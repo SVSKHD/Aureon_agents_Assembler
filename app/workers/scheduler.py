@@ -58,6 +58,7 @@ from app.services import (
     paper,
     repair_recovery,
 )
+from app.services.approvals import ApprovalGate
 
 log = get_logger("worker.scheduler")
 MAX_BACKOFF_SECONDS = 3600
@@ -309,6 +310,20 @@ async def incident_scan(ctx: TaskContext) -> dict[str, Any]:
     return out
 
 
+async def approval_expire(ctx: TaskContext) -> dict[str, Any]:
+    """Mark due pending approval requests `expired` (an event + audit row + notification
+    each). Expiry is also lazy on every read, so this only makes it timely
+    (docs/23-approval-engine.md)."""
+    gate = ApprovalGate(ctx.maker, ctx.settings)
+    total = 0
+    while True:
+        async with ctx.maker() as db, db.begin():
+            n = await gate.expire_due(db, limit=200)
+        total += n
+        if n < 200:
+            return {"expired": total}
+
+
 TASKS: dict[str, TaskFn] = {
     "purge_agent_history": purge_agent_history,
     "purge_expired_sessions": purge_expired_sessions,
@@ -323,6 +338,7 @@ TASKS: dict[str, TaskFn] = {
     "github_sync": github_sync,
     "github_actions_sync": github_actions_sync,
     "incident_scan": incident_scan,
+    "approval_expire": approval_expire,
 }
 
 # (id, task, cron) — created if missing; an admin's later edits (pause etc.) are kept.
@@ -338,6 +354,7 @@ DEFAULT_JOBS: list[tuple[str, str, str]] = [
 def default_jobs(settings: Settings) -> list[tuple[str, str, str]]:
     """Built-in jobs, plus the Dhan / MT5 jobs when those are configured."""
     jobs = list(DEFAULT_JOBS)
+    jobs.append(("approval-expire", "approval_expire", settings.APPROVALS_EXPIRE_CRON))
     if settings.INCIDENT_SCAN_CRON:
         jobs.append(("incident-scan", "incident_scan", settings.INCIDENT_SCAN_CRON))
     if settings.dhan_configured:

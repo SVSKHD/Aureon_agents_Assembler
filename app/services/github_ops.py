@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -688,6 +689,13 @@ async def merge_status(client: GitHubClient, full: str, number: int) -> MergeSta
 
 async def merge_artifact(client: GitHubClient, full: str, number: int) -> dict[str, Any]:
     """Head sha + sha256 of the unified diff: what a merge approval is bound to."""
+    artifact, _pr = await _merge_artifact_and_pull(client, full, number)
+    return artifact
+
+
+async def _merge_artifact_and_pull(
+    client: GitHubClient, full: str, number: int
+) -> tuple[dict[str, Any], dict[str, Any]]:
     pr = await get_pull(client, full, number, cache=False)
     head, base = pr.get("head") or {}, pr.get("base") or {}
     try:
@@ -704,13 +712,14 @@ async def merge_artifact(client: GitHubClient, full: str, number: int) -> dict[s
         if exc.upstream_status != 406:
             raise
         diff_sha = "too_large"
-    return {
+    artifact = {
         "number": number,
         "head_sha": head.get("sha"),
         "base_ref": base.get("ref"),
         "state": pr.get("state"),
         "diff_sha256": diff_sha,
     }
+    return artifact, pr
 
 
 async def ref_sha(client: GitHubClient, full: str, branch: str) -> str | None:
@@ -875,7 +884,7 @@ async def request_merge(
     commit_title: str | None,
     commit_message: str | None,
 ) -> GatedOut:
-    artifact = await merge_artifact(client, full, number)
+    artifact, pr = await _merge_artifact_and_pull(client, full, number)
     if artifact["state"] != "open":
         raise ApprovalError(409, "pr_not_open", "only an open pull request can be merged")
     if artifact["head_sha"] != expected_head_sha:
@@ -888,6 +897,15 @@ async def request_merge(
         "merge_method": merge_method,
         "sha": expected_head_sha,
     }
+    # Policy metadata only (never sent to GitHub): a repair PR resolves the `repair.*` policy.
+    head_obj = pr.get("head")
+    head: dict[str, Any] = head_obj if isinstance(head_obj, dict) else {}
+    payload["head_ref"] = str(head.get("ref") or "")[:255]
+    payload["labels"] = [
+        str(lb.get("name"))[:100]
+        for lb in (pr.get("labels") or [])
+        if isinstance(lb, dict) and lb.get("name")
+    ][:50]
     if commit_title is not None:
         payload["commit_title"] = commit_title
     if commit_message is not None:
@@ -1008,6 +1026,23 @@ async def _on_status(db: AsyncSession, req: ApprovalRequest) -> None:
     )
 
 
+REPAIR_BRANCH_PREFIX = "repair/"
+REPAIR_LABEL = "repair"
+REPAIR_MERGE_SUBJECT = "repair.pr_merge"
+
+
+def merge_policy_subject(kind: str, payload: Mapping[str, Any]) -> str:
+    """A merge of a self-repair PR (head branch `repair/*`, or labelled `repair`) resolves the
+    `repair.*` approval policy; any other merge resolves by its kind."""
+    head_ref = str(payload.get("head_ref") or "")
+    labels = payload.get("labels") or []
+    if head_ref.startswith(REPAIR_BRANCH_PREFIX) or (
+        isinstance(labels, list) and REPAIR_LABEL in [str(x).lower() for x in labels]
+    ):
+        return REPAIR_MERGE_SUBJECT
+    return kind
+
+
 def register_executors(registry: ExecutorRegistry = REGISTRY) -> None:
     for kind in KIND_OPS:
         registry.register(
@@ -1017,6 +1052,7 @@ def register_executors(registry: ExecutorRegistry = REGISTRY) -> None:
                 current_artifact=_current_artifact,
                 on_status=_on_status,
                 requires=("github",),
+                policy_subject=merge_policy_subject if kind == "github.pr.merge" else None,
             )
         )
 
