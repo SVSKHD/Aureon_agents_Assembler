@@ -25,6 +25,7 @@ import signal
 from typing import Any
 
 from redis.asyncio import Redis
+from redis.exceptions import TimeoutError as RedisTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.registry import AgentRegistry, AgentSpec, Heartbeat
@@ -72,6 +73,8 @@ class WebhookWorker:
             return None
         try:
             item = await self.redis.brpop([hooks.QUEUE_KEY], timeout=wait)
+        except RedisTimeoutError:  # redis-py >= 8: an empty blocking pop, not an outage
+            return None
         except Exception as exc:  # Redis down: the DB scan still works
             log.warning("github_webhooks_redis_error", error=type(exc).__name__)
             await asyncio.sleep(wait)

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from redis.asyncio import Redis
+from redis.exceptions import TimeoutError as RedisTimeoutError
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -294,7 +295,9 @@ class ImagingWorker:
         while not self.stopping.is_set():
             while not self.stopping.is_set() and not self.paused and await self.run_once():
                 pass
-            with contextlib.suppress(asyncio.TimeoutError):
+            # redis-py >= 8 raises its own TimeoutError when a blocking pop of >= 5 s finds
+            # nothing; that is an idle wake-up, not a failure (it used to end this loop).
+            with contextlib.suppress(asyncio.TimeoutError, RedisTimeoutError):
                 await redis.blpop([self.settings.IMAGE_QUEUE_KEY], timeout=5)
 
 

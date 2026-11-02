@@ -284,3 +284,52 @@ def test_nginx_api_host_requires_the_access_header_except_bypass_paths() -> None
     assert tf.count('decision       = "bypass"') == 2
     assert "api.spasta.online/api/v1/github/webhooks" in tf
     assert "session_duration" in tf and "var.owner_email" in tf
+
+
+async def test_blocking_pops_survive_an_idle_redis_timeout() -> None:
+    """redis-py >= 8 raises redis.exceptions.TimeoutError when a >= 5 s blocking pop finds
+    nothing. Found by the Phase 22 acceptance run: the image worker's serve loop died on its
+    first idle wait and never picked up another job."""
+    from redis.exceptions import TimeoutError as RedisTimeoutError
+
+    from app.workers.imaging import ImagingWorker
+
+    calls = {"n": 0}
+
+    class FakeRedis:
+        async def blpop(self, keys: list[str], **kw: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                w.stopping.set()
+            raise RedisTimeoutError("Timeout reading from 127.0.0.1:6379")
+
+    w = ImagingWorker.__new__(ImagingWorker)
+    w.settings = type("S", (), {"IMAGE_QUEUE_KEY": "q"})()  # type: ignore[assignment]
+    w.paused = False
+    w.stopping = asyncio.Event()
+
+    async def run_once() -> bool:
+        return False
+
+    w.run_once = run_once  # type: ignore[method-assign]
+    await asyncio.wait_for(w.serve(FakeRedis()), 5)  # type: ignore[arg-type]
+    assert calls["n"] == 3
+
+
+def test_acceptance_script_has_16_steps_and_no_credential_args() -> None:
+    import importlib.util
+
+    path = ROOT / "scripts" / "ops" / "acceptance.py"
+    spec = importlib.util.spec_from_file_location("acceptance", path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    import sys
+
+    sys.modules["acceptance"] = mod  # dataclasses resolve their module
+    spec.loader.exec_module(mod)
+    assert len(mod.STEPS) == 16 and len({s for s, _ in mod.STEPS}) == 16
+    for sid, _ in mod.STEPS:
+        assert hasattr(mod.Acceptance, f"step_{sid}"), sid
+    src = path.read_text()
+    assert "--password" not in src and "--email" not in src  # env/stdin only
+    assert mod.main(["--base-url", "http://127.0.0.1:1"]) == 2  # no email set -> refuses
