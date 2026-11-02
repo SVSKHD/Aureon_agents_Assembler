@@ -25,6 +25,7 @@ Phase 16 adds issue and PR operations, issue ↔ Spasta task links, `github.trac
 Phase 17 adds GitHub Actions: workflows, runs, jobs and sanitised logs, allowlisted dispatch and re-runs (production workflows behind the approval gate), and an HMAC-verified, idempotent webhook receiver processed by the `github-webhooks` worker into `github.workflow_runs` / `workflow_jobs` ([docs/20-github-actions-webhooks.md](docs/20-github-actions-webhooks.md)).
 Phase 18 adds incidents and self-repair: exceptions, stale heartbeats, Docker health, failed Actions runs and DB/API probes become `agents.incidents`; safe recovery actions run first; then the local Ollama coder model patches the code in a sandboxed worktree, the allowlisted tests gate it, and a PR is opened from `repair/<id>` (never merged automatically; hard blocks on trading, risk, auth, secrets and infra) ([docs/21-self-repair.md](docs/21-self-repair.md)).
 Phase 19 adds an advisory Claude PR reviewer via the local Claude CLI (off unless `CLAUDE_REVIEW_ENABLED`): an availability check, a data-classification filter (sensitive paths and secret-shaped content are never sent; emails, IPs and internal hosts are masked), structured verdicts in `agents.reviews`, and publishing as a COMMENT review that never replaces the approval gate ([docs/22-claude-review.md](docs/22-claude-review.md)).
+Phase 20 grows the approval gate into the full approval engine: per-kind policies (N distinct admins, expiry, self-approval, re-auth), multiple artifacts with drift invalidation, a short-lived server-side session re-auth stamp, a hash-chained event log with verification, an admin inbox with an SSE stream, Discord notifications that only deep-link into the app, voice navigation (never an action), and paper-intent approvals through the engine (`trading.paper_intent`) ([docs/23-approval-engine.md](docs/23-approval-engine.md)).
 
 ## Layout
 
@@ -89,7 +90,7 @@ tests/  scripts/  deploy/  docs/
 | POST / GET | `/api/trading/strategies/backtest`, `/api/trading/backtests[/{id}]` | Queue backtests (param grid); results + trades. |
 | GET | `/api/trading/indicators`, `/api/trading/risk-decisions`, `/api/trading/ai-analyses` | Stored analysis output. |
 | POST | `/api/trading/signals/{id}/explain`, `/api/trading/backtests/{id}/explain` | Queue an Ollama explanation (explanation only). |
-| POST / GET | `/api/trading/order-intents[/{id}[/approve\|cancel]]` | Paper intents: risk-checked, admin approval, simulated fill ([docs/15-paper-trading.md](docs/15-paper-trading.md)). |
+| POST / GET | `/api/trading/order-intents[/{id}[/approve\|cancel]]` | Paper intents: risk-checked, admin approval through the approval engine (approve files a `trading.paper_intent` request: 202, or 200 when `{"password"}` is given and one approval suffices), simulated fill ([docs/15-paper-trading.md](docs/15-paper-trading.md), [docs/23-approval-engine.md](docs/23-approval-engine.md)). |
 | GET / POST | `/api/trading/accounts/{id}/paper[/reconcile\|reconciliations]` | Paper book: equity, P&L, positions; reconciliation. |
 | GET | `/api/trading/stream` | SSE: signals, risk decisions, backtests, agent state, Dhan quotes ([docs/14-frontend.md](docs/14-frontend.md)). |
 | GET | `/api/repos`, `/api/repos/{name}/tree\|file\|commits\|branches` | Allowlisted local repos, read from git (admin). |
@@ -107,6 +108,11 @@ tests/  scripts/  deploy/  docs/
 | GET / POST / PATCH | `/api/v1/github/repositories/{owner}/{repo}/pulls[/{n}]`, `…/pulls/{n}/files\|diff\|commits\|merge-status\|comments\|issue-comments\|reviews` | PRs: list, detail, files, size-capped diff, commits, comments, reviews, create and update (admin). |
 | POST / PUT / PATCH / DELETE | `…/pulls/{n}/merge`, `…/force-push`, `…/branch-protection/{branch}`, `…/branches/{branch}`, `…/settings`, `…/actions-permissions` | Gated: 202 with an approval id. Nothing is written to GitHub until it is approved (admin). |
 | GET / POST | `/api/v1/approvals[/{id}]`, `/api/v1/approvals/{id}/approve\|deny` | Approval requests. Approve re-verifies the admin password, then executes once (admin). |
+| GET | `/api/v1/approvals?status=&kind=`, `/api/v1/approvals/inbox`, `/api/v1/approvals/stream`, `/api/v1/approvals/{id}/events` | Approvals with counts by status; the admin's actionable inbox; SSE of approval events; events with hash-chain verification (admin) ([docs/23-approval-engine.md](docs/23-approval-engine.md)). |
+| GET / PUT | `/api/v1/approvals/policies` | Approval policies; PUT upserts by pattern, needs the password, audited (admin). |
+| POST / DELETE | `/api/v1/approvals/reauth` | Stamp (or drop) a short-lived server-side re-auth for this session; approve with `{"use_reauth": true}` where the policy allows (admin). |
+| POST | `/api/v1/voice/intent` | Transcript to a navigation route (inbox, approval, repairs, PR, agents); never acts (admin). |
+| GET | `/api/v1/audit/events?event_type=&actor_user_id=&since=&until=` | The audit log, newest first, paged (admin). |
 | GET | `/api/v1/github/operations` | Tracked GitHub writes and gated operations (admin). |
 | GET | `/api/v1/github/repositories/{owner}/{repo}/actions/workflows\|runs[/{id}[/jobs\|logs]]`, `…/actions/jobs/{id}/logs` | Actions workflows, runs, jobs; logs as sanitised, tail-first text (admin) ([docs/20-github-actions-webhooks.md](docs/20-github-actions-webhooks.md)). |
 | POST | `…/actions/workflows/{workflow}/dispatch`, `…/actions/runs/{id}/rerun\|rerun-failed\|cancel` | Allowlisted dispatch and re-run (production workflows: 202 + approval), cancel; tracked (admin). |
