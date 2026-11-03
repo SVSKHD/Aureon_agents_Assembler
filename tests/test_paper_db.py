@@ -34,7 +34,7 @@ from app.core.config import Settings
 from app.main import create_app
 from app.models.agents import AgentLog
 from app.models.auth import AuditEvent, User
-from app.models.brokers import Mt5Symbol
+from app.models.brokers import MANUAL_MT5_SERVER, Mt5Symbol
 from app.models.trading import (
     BrokerAccount,
     Execution,
@@ -641,6 +641,52 @@ async def test_mt5_requires_contract_size_and_uses_it(make_env: EnvFactory) -> N
             spec = await paper.instrument_spec(db, gold)
         assert (spec.multiplier, spec.lot_step, spec.currency) == (D(100), D("0.01"), "USD")
         assert acc.pip_value(spec, D("0.1")) == D("0.100")
+
+
+async def test_admin_registered_contract_size_works_without_an_mt5_bot(
+    make_env: EnvFactory,
+) -> None:
+    """Found by the first production acceptance run: with MT5_SERVER unset, the PUT answered
+    200 but dropped contract_size, so every MT5 paper intent was refused (422)."""
+    async with make_env(MT5_SERVER=None) as env:
+        r = await env.send(
+            "admin",
+            "PUT",
+            "/api/trading/mt5/instruments/XAUUSD",
+            json={
+                "lot_size": "0.01",
+                "tick_size": "0.01",
+                "currency": "USD",
+                "digits": 2,
+                "contract_size": "100",
+            },
+        )
+        assert r.status_code == 200, r.text
+        async with env.maker() as db:
+            gold = await db.get(Instrument, env.gold)
+            assert gold is not None
+            sym = await db.scalar(select(Mt5Symbol).where(Mt5Symbol.symbol == "XAUUSD"))
+            assert sym is not None and sym.server == MANUAL_MT5_SERVER
+            spec = await paper.instrument_spec(db, gold)
+            assert spec.multiplier == D(100)
+        # A spec synced for the real broker server wins over the admin one.
+        async with env.maker() as db, db.begin():
+            db.add(
+                Mt5Symbol(
+                    server="Demo-1",
+                    symbol="XAUUSD",
+                    digits=2,
+                    point=D("0.01"),
+                    contract_size=D(50),
+                    volume_step=D("0.01"),
+                    currency_profit="USD",
+                    trading_instrument_id=env.gold,
+                )
+            )
+        async with env.maker() as db:
+            gold = await db.get(Instrument, env.gold)
+            assert gold is not None
+            assert (await paper.instrument_spec(db, gold)).multiplier == D(50)
 
 
 async def test_reconciliation_flags_drift(make_env: EnvFactory) -> None:

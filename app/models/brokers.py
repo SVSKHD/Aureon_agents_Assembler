@@ -124,6 +124,12 @@ class Mt5Terminal(Base):
     last_seen_at: Mapped[datetime | None] = mapped_column(TS)
 
 
+# `server` of a symbol spec an admin registered (PUT /api/trading/mt5/instruments/{symbol})
+# while MT5_SERVER is unset (paper trading without an MT5 bot). A spec synced for the real
+# server wins over it (app/services/paper.py instrument_spec).
+MANUAL_MT5_SERVER = "manual"
+
+
 class Mt5Symbol(Base):
     """Symbol spec, per broker server (contract size, digits and volume limits differ)."""
 
