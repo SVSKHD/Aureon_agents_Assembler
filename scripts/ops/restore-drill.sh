@@ -51,6 +51,16 @@ SRC="$(resolve_backup "$SRC")"
 CREATED=1 # from here on the scratch DB may exist and is ours to drop
 "$OPS_DIR/restore.sh" "$SRC" --target-db "$DRILL_DB" >"$WORK/restore.out"
 
+# restore.sh restores with --no-owner --no-privileges, so the scratch copy belongs to PG_USER.
+# The migrate image connects as the migrator role (MIGRATIONS_DATABASE_URL) when the scoped
+# roles are in use, so let it read the version table of THIS scratch database only.
+if [[ -n "${AUREON_MIGRATOR_ROLE:-}" ]]; then
+  [[ "$AUREON_MIGRATOR_ROLE" =~ ^[a-z_][a-z0-9_]{0,62}$ ]] || die "invalid AUREON_MIGRATOR_ROLE" 2
+  psql_q "$DRILL_DB" -c \
+    "GRANT SELECT ON public.aureon_alembic_version TO \"$AUREON_MIGRATOR_ROLE\"" ||
+    log "could not grant the version table to $AUREON_MIGRATOR_ROLE"
+fi
+
 log "alembic current on $DRILL_DB"
 docker compose --project-directory "$AUREON_DIR" run --rm --no-deps -T migrate \
   python -m app.workers.migrate --current-for "$DRILL_DB" >"$WORK/alembic.out" 2>&1 ||

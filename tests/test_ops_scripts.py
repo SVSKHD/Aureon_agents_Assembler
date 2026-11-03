@@ -421,6 +421,24 @@ def test_drill_restores_checks_and_drops_only_its_scratch_db(ops: Ops) -> None:
     assert (ops.backups / "drills").is_dir()
 
 
+def test_drill_lets_the_migrator_read_only_the_scratch_version_table(ops: Ops) -> None:
+    """restore.sh restores --no-owner --no-privileges; the migrate image connects as the
+    migrator role, so `alembic current` needs SELECT on the scratch copy's version table
+    (found on the first production drill)."""
+    ops.backup()
+    ops.log.unlink()
+    r = ops.run("restore-drill.sh", AUREON_MIGRATOR_ROLE="aureon_migrator")
+    assert r.returncode == 0, r.stderr
+    db = json.loads(r.stdout[r.stdout.index("{") :])["scratch_database"]
+    grants = [c for c in ops.calls() if any("GRANT" in a for a in c)]
+    assert len(grants) == 1
+    g = " ".join(grants[0])
+    assert 'GRANT SELECT ON public.aureon_alembic_version TO "aureon_migrator"' in g
+    assert f"-d {db}" in g
+    r = ops.run("restore-drill.sh", AUREON_MIGRATOR_ROLE="bad;role")
+    assert r.returncode == 2
+
+
 def test_drill_fails_on_row_count_mismatch_and_still_drops(ops: Ops) -> None:
     ops.backup()
     ops.log.unlink()
