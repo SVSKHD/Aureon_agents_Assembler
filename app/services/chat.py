@@ -38,6 +38,27 @@ from app.models.ai import Conversation, Message, ModelInventory
 log = get_logger(__name__)
 
 TITLE_LEN = 80
+
+
+def chat_options(num_ctx: int, num_thread: int) -> dict[str, Any]:
+    """Ollama options every API chat (and the startup warm-up) uses. The warm-up must load
+    the model with the same num_ctx/num_thread, or the first chat would reload it."""
+    options: dict[str, Any] = {"num_ctx": num_ctx}
+    if num_thread:
+        options["num_thread"] = num_thread
+    return options
+
+
+def trim_history(history: list[dict[str, str]], max_messages: int) -> list[dict[str, str]]:
+    """System messages plus the newest `max_messages` other turns, in their original order.
+    0 keeps everything. The full conversation stays stored; only the prompt is shorter."""
+    if max_messages <= 0:
+        return history
+    keep = {i for i, m in enumerate(history) if m["role"] != "system"}
+    keep = set(sorted(keep)[-max_messages:])
+    return [m for i, m in enumerate(history) if m["role"] == "system" or i in keep]
+
+
 RUN_STATUS = {
     "complete": "succeeded",
     "cancelled": "cancelled",
@@ -93,9 +114,14 @@ class ConversationService:
         return bool(result.rowcount)  # type: ignore[attr-defined]
 
     async def start_turn(
-        self, conversation_id: uuid.UUID | None, model: str, new: list[dict[str, str]]
+        self,
+        conversation_id: uuid.UUID | None,
+        model: str,
+        new: list[dict[str, str]],
+        max_history: int = 0,
     ) -> tuple[Conversation, list[dict[str, str]], list[int]] | None:
         """Store the new turns and return (conversation, prompt for Ollama, new message ids).
+        The prompt re-sends at most `max_history` stored turns (plus system ones; 0 = all).
 
         Returns None if conversation_id is not one of this user's conversations.
         """
@@ -123,7 +149,7 @@ class ConversationService:
         self.db.add_all(rows)
         conv.updated_at = func.now()
         await self.db.flush()
-        return conv, history + new, [r.id for r in rows]
+        return conv, trim_history(history, max_history) + new, [r.id for r in rows]
 
 
 async def sync_inventory(db: AsyncSession, models: list[ModelInfo]) -> None:

@@ -79,6 +79,7 @@ class OllamaClient:
         connect_timeout: float,
         read_timeout: float,
         cache_ttl: float,
+        keep_alive: str | None = None,
     ) -> None:
         self._http = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
@@ -87,6 +88,9 @@ class OllamaClient:
             ),
         )
         self._cache_ttl = cache_ttl
+        # Sent as Ollama's `keep_alive` on every chat (e.g. "24h"): how long the model stays
+        # loaded after a request. None = Ollama's own default (OLLAMA_KEEP_ALIVE, else 5m).
+        self._keep_alive = keep_alive or None
         self._cache: tuple[float, list[ModelInfo]] | None = None
         self._lock = asyncio.Lock()
         # Bumped on every successful refresh, so callers can sync the inventory table once.
@@ -124,12 +128,39 @@ class OllamaClient:
         data = await self._get_json("/api/ps")
         return list(data.get("models", []))
 
+    async def warm_up(self, model: str, options: dict[str, Any]) -> float:
+        """Load `model` into memory without generating anything (an empty prompt), with the
+        same options the chat uses (a different num_ctx would make Ollama reload it).
+        Returns the seconds it took. Raises OllamaError on failure."""
+        payload: dict[str, Any] = {"model": model, "prompt": "", "options": options}
+        if self._keep_alive:
+            payload["keep_alive"] = self._keep_alive
+        t0 = time.monotonic()
+        try:
+            resp = await self._http.post("/api/generate", json=payload)
+        except httpx.TimeoutException as exc:
+            raise OllamaTimeout("Ollama did not finish loading the model") from exc
+        except httpx.TransportError as exc:
+            raise OllamaUnavailable("Ollama is unreachable") from exc
+        if resp.status_code == 404:
+            raise ModelNotFound(_error_text(resp.content))
+        if resp.status_code >= 400:
+            raise OllamaError(_error_text(resp.content))
+        return time.monotonic() - t0
+
     async def chat_stream(
         self, model: str, messages: list[dict[str, str]], options: dict[str, Any]
     ) -> AsyncIterator[dict[str, Any]]:
         """Yield Ollama's NDJSON chunks. Closing the generator closes the HTTP stream,
         which makes Ollama stop generating."""
-        payload = {"model": model, "messages": messages, "stream": True, "options": options}
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "options": options,
+        }
+        if self._keep_alive:
+            payload["keep_alive"] = self._keep_alive
         try:
             async with self._http.stream("POST", "/api/chat", json=payload) as resp:
                 if resp.status_code == 404:

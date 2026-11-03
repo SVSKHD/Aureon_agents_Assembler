@@ -18,6 +18,8 @@ class ModelOut(BaseModel):
 
 class ModelList(BaseModel):
     models: list[ModelOut]
+    # CHAT_DEFAULT_MODEL when it is installed (it is also listed first), else None.
+    default_model: str | None = None
 
 
 class ModelStatus(BaseModel):
