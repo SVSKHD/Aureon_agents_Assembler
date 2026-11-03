@@ -190,9 +190,31 @@ If the grammar finds nothing and `VOICE_OLLAMA_MODEL` is set, the local Ollama m
 choose one of the same five intents. Its answer is validated, and the route is always built
 by the code (a model cannot invent a route or an id format).
 
-Action words (approve, deny, merge, execute, run, deploy) only add the note "navigation only:
-review and act in the app". The module imports no database, approval, GitHub or trading
+Action words (approve, deny, merge, execute, run, deploy, and the trading/write verbs buy,
+sell, trade, order, close, cancel, delete, create, write, push) only add the note "navigation
+only: review and act in the app". There is no trading or write intent: "buy 100 shares" is
+`unknown`, "approve request 5" opens request 5. The module imports no database, approval, GitHub or trading
 code, and the endpoint writes nothing, not even an audit row. The transcript is never logged.
+
+**In the browser.** The control center header has a mic button (admin only). One tap starts
+one utterance with the browser's Web Speech API (a user gesture, `continuous = false`, which is
+what iOS Safari needs); the final transcript goes to this endpoint, and the SPA navigates only
+if the returned route matches the same five patterns (it re-checks; it never calls any other
+endpoint). There is no server-side speech-to-text: Android Chrome sends the audio to Google's
+recogniser and iOS Safari to Apple's (or on-device); only the transcript reaches Aureon. A
+local path (MediaRecorder upload to a whisper.cpp worker) would keep audio on the box but needs
+a new upload endpoint and model; it is not built.
+
+**Headers.** The SPA's Permissions-Policy must allow `microphone=(self)`
+(deploy/nginx/security-headers.conf). With `microphone=()` the browser refuses the mic before
+any prompt (Chrome: SpeechRecognition `not-allowed`), which is why voice "did nothing". The
+Web Speech API needs no CSP change. Apply: `sudo nginx -t && sudo systemctl reload nginx`
+(the sites are symlinked from this checkout, so a deploy pull plus a reload is enough).
+
+**Tailscale.** `https://svskhd8.taila439d5.ts.net` is served by `tailscale serve`, which must
+own :443 on the tailnet addresses. Any other process listening on `*:443` (e.g. a Caddy
+install) wins the bind at boot and answers the ts.net name with a TLS alert. Check
+`ss -ltnp 'sport = :443'` and `journalctl -u tailscaled | grep "address already in use"`.
 
 ### Wiring
 

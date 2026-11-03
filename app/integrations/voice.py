@@ -42,7 +42,11 @@ INTENTS: tuple[str, ...] = (
     "show_agents",
 )
 MAX_TRANSCRIPT = 500
-ACTION_WORDS = ("approve", "deny", "reject", "merge", "execute", "run", "deploy", "dispatch")
+ACTION_WORDS = (
+    "approve", "deny", "reject", "merge", "execute", "run", "deploy", "dispatch",
+    # trading and writes: still only ever navigation (or unknown), never an order or a write
+    "buy", "sell", "trade", "order", "close", "cancel", "delete", "create", "write", "push",
+)  # fmt: skip
 NAV_ONLY_NOTE = "navigation only: review and act in the app"
 
 _REF = r"([0-9a-f]{1,8}(?:-[0-9a-f]{1,12}){0,4}|\d{1,12})"

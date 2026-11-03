@@ -366,3 +366,21 @@ def test_nginx_unknown_host_on_8088_gets_444() -> None:
     for p in confs:
         for addr in re.findall(r"^\s*listen\s+([^\s;]+)", _nginx_body(p.name), re.M):
             assert addr == "127.0.0.1:8088", (p.name, addr)
+
+
+def test_nginx_spa_lets_its_own_pages_use_the_microphone() -> None:
+    # Voice (dictation + navigation) needs the mic on the SPA's own documents; microphone=()
+    # made the browser refuse before any prompt. Nothing else is widened.
+    body = _nginx_body("security-headers.conf")
+    (policy,) = re.findall(r'add_header Permissions-Policy "([^"]+)" always;', body)
+    features = dict(f.split("=", 1) for f in policy.split(", "))
+    assert features["microphone"] == "(self)"
+    for off in ("camera", "geolocation", "payment", "usb"):
+        assert features[off] == "()", off
+    # The Web Speech API needs no CSP change: no blob:, ws(s):, worker or media origins.
+    (csp,) = re.findall(r'add_header Content-Security-Policy "([^"]+)" always;', body)
+    assert "connect-src 'self';" in csp
+    assert "blob:" not in csp.split("connect-src", 1)[1].split(";", 1)[0]
+    assert "worker-src" not in csp and "media-src" not in csp
+    # JSON API responses are not documents: they keep the mic off.
+    assert "microphone=()" in _nginx_body("aureon-api.conf")
