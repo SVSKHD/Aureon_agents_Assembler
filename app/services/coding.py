@@ -38,6 +38,7 @@ from app.agents.ollama.client import OllamaClient
 from app.core.config import Settings
 from app.core.logging import get_logger
 from app.models.agents import CodeTask
+from app.services.coding_git import clone_repos
 
 log = get_logger(__name__)
 
@@ -65,7 +66,8 @@ class CodingConfig:
 
     @classmethod
     def from_settings(cls, s: Settings) -> CodingConfig:
-        repos = parse_repos(s.CODE_REPOS)
+        # Clones of allowlisted GitHub repos (coding_git) are coding repos too.
+        repos = {**clone_repos(s), **parse_repos(s.CODE_REPOS)}  # CODE_REPOS wins on a clash
         allowed = tuple(tuple(a) for a in s.CODE_ALLOWED_COMMANDS) or DEFAULT_ALLOWED
         for r in repos.values():
             for argv in r.tests:

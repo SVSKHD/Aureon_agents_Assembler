@@ -92,3 +92,50 @@ class DiffOut(BaseModel):
     task_id: uuid.UUID
     files: list[str]
     diff: str
+
+
+# --- git ops (clone / pull / push + PR) -----------------------------------------------------
+
+FullName = Field(
+    min_length=3, max_length=201, pattern=r"^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$"
+)
+
+
+class GitRepoIn(BaseModel):
+    repo: str = FullName
+
+
+class GitPushIn(BaseModel):
+    repo: str = FullName
+    branch: str = Field(min_length=1, max_length=200)
+    title: str | None = Field(default=None, max_length=200)
+    body: str | None = Field(default=None, max_length=20_000)
+
+
+class GitOpOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    op: str
+    repo: str
+    branch: str | None
+    title: str | None
+    status: str
+    head_sha: str | None
+    pr_number: int | None
+    pr_url: str | None
+    result: dict[str, Any]
+    error: str | None
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+
+
+class GitRepoStateOut(BaseModel):
+    """One allowlisted repo: whether it is cloned, and the coding-repo name it has."""
+
+    repo: str
+    cloned: bool
+    coding_repo: str
+    default_branch: str | None
+    push_prefixes: list[str]

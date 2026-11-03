@@ -102,6 +102,8 @@ def test_code_tasks_and_repairs_run_under_the_heavy_model_lock() -> None:
     tree = ast.parse((ROOT / "app" / "workers" / "coding.py").read_text())
     assert _inside_lock(tree, "coding.run_task", "HEAVY_MODEL_LOCK") == [True]
     assert _inside_lock(tree, "repairs.run_repair", "HEAVY_MODEL_LOCK") == [True]
+    # Git ops hold the token in a child's env: never while a test process may run.
+    assert _inside_lock(tree, "coding_git.run_op", "HEAVY_MODEL_LOCK") == [True]
 
 
 async def test_repair_loop_holds_the_lock_while_it_runs(monkeypatch: pytest.MonkeyPatch) -> None:

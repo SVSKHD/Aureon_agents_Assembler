@@ -1,8 +1,9 @@
 """Coding agent endpoints (admin only, audited): read allowlisted repos, ask the local
 model about code, and run patch tasks in isolated worktrees. See docs/05-agents.md.
 
-Nothing here can push, merge into a protected branch, deploy, or run a command outside
-CODE_ALLOWED_COMMANDS.
+Nothing here can merge, deploy, or run a command outside CODE_ALLOWED_COMMANDS. The only push
+is the git-ops one (`/api/code/git/push`): a feature branch of an allowlisted repo, run by the
+coding worker, followed by a PR; merging stays behind the approval gate.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from app.agents.coding.paths import PathRejected, normalize
 from app.agents.coding.repos import RepoConfig, RepoNotAllowed, get_repo
 from app.auth.deps import AdminRequired, DbSession, SettingsDep
 from app.core.config import Settings
-from app.models.agents import CodeTask
+from app.models.agents import CodeGitOp, CodeTask
 from app.schemas.code import (
     AnalyzeIn,
     ApproveIn,
@@ -26,12 +27,16 @@ from app.schemas.code import (
     CommitOut,
     DiffOut,
     FileOut,
+    GitOpOut,
+    GitPushIn,
+    GitRepoIn,
+    GitRepoStateOut,
     RepoOut,
     TaskIn,
     TreeItem,
 )
 from app.schemas.common import Page
-from app.services import audit, coding
+from app.services import audit, coding, coding_git
 from app.services.audit import ClientInfo
 
 router = APIRouter(tags=["code"])
@@ -321,3 +326,123 @@ async def reject_task(
     await db.commit()
     await db.refresh(task)
     return CodeTaskOut.model_validate(task)
+
+
+# --- git ops: clone / pull / push + PR (run by the coding worker) -------------------------
+
+
+def _git_cfg(settings: Settings) -> coding_git.GitOpsConfig:
+    try:
+        return coding_git.GitOpsConfig.from_settings(settings)
+    except ValueError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "coding_misconfigured", "detail": str(exc)[:300]},
+        ) from exc
+
+
+@router.get("/code/git/repos", response_model=list[GitRepoStateOut])
+async def git_repos(_: AdminRequired, settings: SettingsDep) -> list[GitRepoStateOut]:
+    """GITHUB_CODING_REPO_ALLOWLIST with each repo's clone state."""
+    cfg = _git_cfg(settings)
+    out = []
+    for full in sorted(cfg.allowlist):
+        path = cfg.clone_path(full)
+        out.append(
+            GitRepoStateOut(
+                repo=full,
+                cloned=(path / ".git").exists(),
+                coding_repo=coding_git.clone_repo_name(full),
+                default_branch=coding_git.head_branch(path),
+                push_prefixes=list(cfg.prefixes),
+            )
+        )
+    return out
+
+
+async def _queue_git(
+    db: DbSession,
+    request: Request,
+    admin: AdminRequired,
+    settings: Settings,
+    op: str,
+    repo: str,
+    **kw: str | None,
+) -> GitOpOut:
+    try:
+        row = await coding_git.queue(
+            db,
+            settings,
+            op=op,
+            repo=repo,
+            user_id=admin.user.id,
+            client=ClientInfo.from_request(request),
+            **kw,
+        )
+    except coding_git.GitOpRefused as exc:
+        raise HTTPException(exc.status, detail={"code": exc.code, "detail": str(exc)}) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "coding_misconfigured", "detail": str(exc)[:300]},
+        ) from exc
+    await db.commit()
+    await db.refresh(row)
+    return GitOpOut.model_validate(row)
+
+
+@router.post("/code/git/clone", response_model=GitOpOut, status_code=status.HTTP_202_ACCEPTED)
+async def git_clone(
+    body: GitRepoIn, request: Request, db: DbSession, admin: AdminRequired, settings: SettingsDep
+) -> GitOpOut:
+    """Queue a clone of an allowlisted repo into CODE_CLONE_ROOT/<owner>/<repo>."""
+    return await _queue_git(db, request, admin, settings, "clone", body.repo)
+
+
+@router.post("/code/git/pull", response_model=GitOpOut, status_code=status.HTTP_202_ACCEPTED)
+async def git_pull(
+    body: GitRepoIn, request: Request, db: DbSession, admin: AdminRequired, settings: SettingsDep
+) -> GitOpOut:
+    """Queue a fetch + fast-forward of the clone's default branch."""
+    return await _queue_git(db, request, admin, settings, "pull", body.repo)
+
+
+@router.post("/code/git/push", response_model=GitOpOut, status_code=status.HTTP_202_ACCEPTED)
+async def git_push(
+    body: GitPushIn, request: Request, db: DbSession, admin: AdminRequired, settings: SettingsDep
+) -> GitOpOut:
+    """Queue a push of one feature branch (never main/master/dev01, the default branch, a
+    protected branch, or a name outside CODE_PUSH_BRANCH_PREFIXES) and a PR to the default
+    branch. Merging stays behind the approval gate."""
+    return await _queue_git(
+        db, request, admin, settings, "push", body.repo,
+        branch=body.branch, title=body.title, body=body.body,
+    )  # fmt: skip
+
+
+@router.get("/code/git/ops", response_model=Page[GitOpOut])
+async def git_ops(
+    db: DbSession, _: AdminRequired, repo: str | None = None, limit: Limit = 50, offset: Offset = 0
+) -> Page[GitOpOut]:
+    from app.services.trading import count
+
+    stmt = select(CodeGitOp)
+    if repo:
+        stmt = stmt.where(CodeGitOp.repo == repo.lower())
+    rows = (
+        await db.scalars(stmt.order_by(CodeGitOp.created_at.desc()).limit(limit).offset(offset))
+    ).all()
+    return Page[GitOpOut](
+        items=[GitOpOut.model_validate(r) for r in rows],
+        total=await count(db, stmt),
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/code/git/ops/{op_id}", response_model=GitOpOut)
+async def git_op(op_id: uuid.UUID, db: DbSession, _: AdminRequired) -> GitOpOut:
+    row = await db.get(CodeGitOp, op_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "git op not found")
+    return GitOpOut.model_validate(row)

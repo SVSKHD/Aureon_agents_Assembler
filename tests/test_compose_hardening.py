@@ -176,7 +176,9 @@ def test_every_service_incl_phase_17_18_workers_is_supervised(
         assert s["depends_on"]["api"]["condition"] == "service_healthy"
     assert services["coding-worker"]["command"] == ["python", "-m", "app.workers.coding"]
     src = (ROOT / "app" / "workers" / "coding.py").read_text()
-    assert "repair_loop(" in src and src.count("async with HEAVY_MODEL_LOCK") == 2
+    # code tasks, repairs and git ops (which hold the token in a git child's env)
+    assert "repair_loop(" in src and "git_loop(" in src
+    assert src.count("async with HEAVY_MODEL_LOCK") == 3
     assert services["github-webhook-worker"]["command"][-1] == "app.workers.github_webhooks"
 
 

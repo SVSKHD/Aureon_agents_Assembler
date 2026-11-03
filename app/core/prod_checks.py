@@ -54,6 +54,8 @@ def production_problems(settings: Settings) -> list[str]:
         problems.append("TRADING_LIVE_ENABLED=true requires PHASE_G_APPROVED=yes")
     if settings.github_configured and not settings.GITHUB_API_URL.startswith("https://"):
         problems.append("GITHUB_API_URL must be https when GITHUB_TOKEN is set")
+    if settings.github_configured and not settings.GITHUB_GIT_URL.startswith("https://"):
+        problems.append("GITHUB_GIT_URL must be https when GITHUB_TOKEN is set")
     try:
         check_data_root(settings)
     except RuntimeError as exc:

@@ -535,3 +535,57 @@ See [23-approval-engine.md](23-approval-engine.md).
   serve loop died on it (no more jobs processed), the research AI lane would too, and the
   webhook worker logged it as an outage. `ReviewRunner.drain()` yields after each gather so a
   finished task's done-callback can run (it could spin forever).
+
+## 23 — Coding agent git ops and the Actions monitor
+
+See [05-agents.md](05-agents.md) ("Git ops") and
+[20-github-actions-webhooks.md](20-github-actions-webhooks.md) ("Actions monitor").
+
+- **D-23-1: a second allowlist, intersected with the GitHub one.** The only repo allowlist
+  that existed was the GitHub one (D-15-3), which also covers read-only browsing.
+  `GITHUB_CODING_REPO_ALLOWLIST` (default `[]` = nothing) names the repos the coding agent may
+  clone and push to; a repo must be on both, checked at queue time and at run time.
+- **D-23-2: the token reaches git through GIT_ASKPASS and one env var, per invocation.** The
+  remote URL never has credentials (so `.git/config` stays clean), argv never has the token
+  (visible in `ps`), credential helpers are cleared (`-c credential.helper=`), user and system
+  config are off, and the askpass script holds no secret and is deleted after each call.
+  Output and errors are redacted, and `.git/config` is checked for userinfo or token shapes
+  after every network op. `http.extraHeader` was rejected: it would put the token in argv
+  or config.
+- **D-23-3: network git only in the git-ops path; the rest keeps `protocol.allow=never`.**
+  `app/agents/coding/git.py` is unchanged. `remote.py` allows exactly the remote's scheme
+  (https; `file` only with `ENV=test`, for tests against a local bare repo), and prod refuses
+  a non-https `GITHUB_GIT_URL`.
+- **D-23-4: git ops are queued in the DB and run by the coding worker.** The API image has no
+  git, and the worker already owns the clones' volume and the heavy-model lock. New table `agents.code_git_ops` (migration **0019, down_revision 0018**:
+  another branch adds 0018 first). One op per repo at a time; ops left `running` by a crash
+  are failed at startup.
+- **D-23-5: git ops hold HEAVY_MODEL_LOCK.** The token sits in a git child's environment for
+  the length of a clone / fetch / push. Holding the lock the code-task and repair loops hold
+  for their tests means no model-patched process can run at the same time to read it.
+- **D-23-6: push rules.** Allowed only under `CODE_PUSH_BRANCH_PREFIXES` (default
+  `aureon/,feat/`); always refused: main, master, dev01, HEAD (case-insensitive), the repo's
+  default branch (from GitHub at run time; unknown = refuse), `CODE_PROTECTED_BRANCHES`, and a
+  branch GitHub reports as protected. An `aureon/task-*` branch needs its task approved. The
+  push is a single explicit refspec without `--force`, so it is fast-forward only.
+- **D-23-7: secrets are checked per commit, not on the net diff.** `git log --name-only
+  origin/<default>..<branch>` lists every path any pushed commit touches, so a secret added
+  then deleted is still refused. Only the `secrets` category (plus the coding blocklist)
+  refuses; infra / auth / trading paths are normal code changes for this agent and are listed
+  in `result.sensitive` instead.
+- **D-23-8: PRs, never merges.** After a push the worker opens a PR to the default branch
+  (reusing an open one for the same head) through `tracked_write`. No merge path was added;
+  merges stay `github.pr.merge` behind the approval engine.
+- **D-23-9: clones are coding repos.** An allowlisted clone appears as `gh-<owner>-<repo>`
+  (base = its checked-out default branch, no test commands) so tasks run on it. `CODE_REPOS`
+  wins on a name clash. The worker rebuilds its repo list per task, so a new clone needs no
+  restart.
+- **D-23-10: the Actions monitor reads the DB only.** Deploys are `deployer` agent runs;
+  CI runs come from `github.workflow_runs`. No GitHub call, so the frontend can poll every
+  15 s. Deploy targets map to `owner/repo@branch` through `DEPLOY_TARGET_REPOS`, because the
+  run details only carry the target name. CI duration is `updated_at - created_at` of a
+  completed run (the run-started time is not stored); the limit applies after merging.
+- **D-23-11: no compose change was needed for the mount.** The coding worker already mounts
+  `DATA_ROOT` read-write at `/mnt/spasta-data` (worktrees live there), and
+  `CODE_CLONE_ROOT` defaults inside it. It stays off the `aureon` network (D-E12); outbound
+  https to GitHub goes through `private-ai`, like Ollama and the self-repair REST calls.

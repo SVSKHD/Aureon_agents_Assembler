@@ -228,7 +228,9 @@ services:
     restart: unless-stopped
 
   # Coding agent (Phase 5b): patch tasks in isolated git worktrees, allowlisted test commands,
-  # never pushes or deploys. Opt-in: `docker compose --profile coding up -d --build`.
+  # never merges or deploys. Git ops (docs/05-agents.md): clones of GITHUB_CODING_REPO_ALLOWLIST
+  # live under CODE_CLONE_ROOT on the data-root volume below; pushes go to feature branches only.
+  # Opt-in: `docker compose --profile coding up -d --build`.
   # CODE_REPOS paths must live under CODE_REPOS_ROOT (mounted read-write at the same path,
   # because git records worktrees and task branches inside each repo's .git).
   coding-worker:
