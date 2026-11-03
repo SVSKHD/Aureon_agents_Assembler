@@ -1,0 +1,11 @@
+[Unit]
+Description=Aureon auto-deploy poll every minute
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=60s
+AccuracySec=10s
+# A poll still running (a long deploy) is never started twice: oneshot + flock in deploy.sh.
+
+[Install]
+WantedBy=timers.target

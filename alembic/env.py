@@ -23,6 +23,10 @@ from app.db.base import Base
 # Own version table name so we never collide with another tool's `alembic_version`
 # in the shared `spasta` database.
 VERSION_TABLE = "aureon_alembic_version"
+# Pinned to public: an unqualified version table follows the role's search_path, so the
+# superuser `spasta` (which has a `spasta` schema) and aureon_migrator would see different
+# tables. Backups, the rollback drill and roles.sql all read public.aureon_alembic_version.
+VERSION_TABLE_SCHEMA = "public"
 
 config = context.config
 if config.config_file_name is not None:
@@ -55,6 +59,7 @@ def _configure(**kw: Any) -> None:
     context.configure(
         target_metadata=target_metadata,
         version_table=VERSION_TABLE,
+        version_table_schema=VERSION_TABLE_SCHEMA,
         include_object=include_object,
         include_schemas=True,
         compare_type=True,

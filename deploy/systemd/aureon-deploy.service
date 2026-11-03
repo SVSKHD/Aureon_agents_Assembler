@@ -1,0 +1,23 @@
+# Pull-based auto-deploy (docs/deploy-automation.md): one poll of origin/main (backend) and
+# origin/dev01 (frontend); deploys whichever moved. Triggered every minute by the timer.
+# Install: sudo cp deploy/systemd/aureon-deploy.{service,timer} /etc/systemd/system/
+#          sudo systemctl daemon-reload && sudo systemctl enable --now aureon-deploy.timer
+# Pause:   sudo systemctl stop aureon-deploy.timer   (or touch /mnt/spasta-data/logs/DEPLOY_PAUSED)
+[Unit]
+Description=Aureon auto-deploy poll (backend main + frontend dev01)
+Documentation=file:///opt/private-ai/aureon/docs/deploy-automation.md
+Requires=docker.service
+After=docker.service network-online.target aureon.service
+Wants=network-online.target
+RequiresMountsFor=/mnt/spasta-data
+
+[Service]
+Type=oneshot
+User=svskhd8
+Group=docker
+WorkingDirectory=/opt/private-ai/aureon
+Environment=HOME=/home/svskhd8
+ExecStart=/opt/private-ai/aureon/scripts/ops/deploy-poll.sh
+# A backend build + migrate + health wait, then a frontend build with tests.
+TimeoutStartSec=1800
+Nice=10

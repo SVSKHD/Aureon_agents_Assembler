@@ -58,9 +58,14 @@ def test_restart_policies(services: dict[str, dict[str, Any]]) -> None:
         assert s.get("restart") == want, name
 
 
+# The docker-socket-proxy image renders haproxy.cfg into its own config dir at every start, so
+# its root fs cannot be read-only (a tmpfs there would hide the template). Nothing else may opt out.
+WRITABLE_ROOT = {"docker-proxy"}
+
+
 def test_hardening_on_every_service(services: dict[str, dict[str, Any]]) -> None:
     for name, s in services.items():
-        assert s.get("read_only") is True, name
+        assert s.get("read_only") is (name not in WRITABLE_ROOT), name
         assert s.get("cap_drop") == ["ALL"], name
         assert "no-new-privileges:true" in s.get("security_opt", []), name
         assert "cap_add" not in s and not s.get("privileged"), name
