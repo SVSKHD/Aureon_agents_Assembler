@@ -403,8 +403,9 @@ class Settings(BaseSettings):
     # POST /containers/{name}/restart (the shipped proxy does not: restarts are "manual").
     INCIDENT_DOCKER_PROXY_ALLOWS_RESTART: bool = False
     INCIDENT_RESTART_CONTAINERS: Annotated[list[str], NoDecode] = Field(default_factory=list)
-    # --- Claude review (docs/22-claude-review.md). The one non-Ollama AI path: the local
-    # Claude CLI, only when enabled, available, and the diff passes the classification filter.
+    # --- Claude review (docs/22-claude-review.md). A non-Ollama AI path (the other is OpenRouter,
+    # docs/25): the local Claude CLI, only when enabled, available, and the diff passes the
+    # classification filter.
     CLAUDE_REVIEW_ENABLED: bool = False
     # The CLI binary: a name looked up on PATH, or an absolute path.
     CLAUDE_CLI_PATH: str = "claude"
@@ -433,6 +434,25 @@ class Settings(BaseSettings):
     CLAUDE_REVIEW_INTERNAL_DOMAINS: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["spasta.online"]
     )
+
+    # --- OpenRouter (docs/25-openrouter.md): opt-in external inference for chat. Off by default;
+    # local Ollama stays the default and the fallback. A data-classification filter decides per
+    # request whether anything may leave the server (app/services/chat_filter.py).
+    OPENROUTER_ENABLED: bool = False
+    # Server-side only. Never logged, never returned, never given to the SPA (no VITE_ var).
+    OPENROUTER_API_KEY: SecretStr | None = None
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    # The model new conversations use when OpenRouter is usable (always allowed).
+    OPENROUTER_DEFAULT_MODEL: str = ""
+    # Comma list of extra OpenRouter model ids the picker offers. Empty = only the default.
+    OPENROUTER_ALLOWED_MODELS: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # USD per UTC day, from OpenRouter's reported cost. 0 = no budget: every call stays local.
+    OPENROUTER_DAILY_LIMIT_USD: Decimal = Field(default=Decimal("0"), ge=0, le=Decimal("10000"))
+    # Connect timeout and the longest silence allowed between streamed chunks.
+    OPENROUTER_TIMEOUT_SECONDS: float = Field(default=60.0, gt=0, le=600)
+    # Research / AI trading explanations stay on local Ollama unless this is true (and even
+    # then the content filter still applies).
+    AI_RESEARCH_EXTERNAL_ALLOWED: bool = False
 
     # --- Production integration (docs/24-production-integration.md) ---
     # Alerts: open incidents (severity >= warning), stale heartbeats, failed/old backups and
@@ -472,6 +492,28 @@ class Settings(BaseSettings):
         s = self.DISCORD_WEBHOOK_URL
         url = s.get_secret_value().strip() if s else ""
         return url or None
+
+    @property
+    def openrouter_key(self) -> str:
+        s = self.OPENROUTER_API_KEY
+        return s.get_secret_value().strip() if s else ""
+
+    @property
+    def openrouter_models(self) -> list[str]:
+        """The OpenRouter model ids a conversation may use: the default, then the allowlist."""
+        extra = (m.strip() for m in self.OPENROUTER_ALLOWED_MODELS)
+        ids = [self.OPENROUTER_DEFAULT_MODEL.strip(), *extra]
+        return list(dict.fromkeys(m for m in ids if m))
+
+    def openrouter_unusable_reason(self) -> str | None:
+        """None when OpenRouter may be tried at all; else why not (a fallback reason code)."""
+        if not self.OPENROUTER_ENABLED:
+            return "disabled"
+        if not self.openrouter_key or not self.OPENROUTER_DEFAULT_MODEL.strip():
+            return "not_configured"
+        if self.OPENROUTER_DAILY_LIMIT_USD <= 0:
+            return "no_budget"
+        return None
 
     @property
     def github_webhook_configured(self) -> bool:
@@ -529,6 +571,7 @@ class Settings(BaseSettings):
         "INCIDENT_RESTART_CONTAINERS",
         "CLAUDE_CLI_ENV_PASSTHROUGH",
         "CLAUDE_REVIEW_INTERNAL_DOMAINS",
+        "OPENROUTER_ALLOWED_MODELS",
         "CF_ACCESS_AUD",
         "CF_ACCESS_BYPASS_PATHS",
         mode="before",

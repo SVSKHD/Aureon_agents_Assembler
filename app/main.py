@@ -27,9 +27,11 @@ from app.db.session import build_engine, build_sessionmaker
 from app.integrations.claude_cli import ClaudeCLI
 from app.integrations.github import build_github_client
 from app.services import incidents
+from app.services.ai_usage import UsageTracker
 from app.services.chat import chat_options
 from app.services.claude_review import ReviewRunner
 from app.services.health import HealthService
+from app.services.inference import build_openrouter
 
 log = get_logger(__name__)
 
@@ -79,6 +81,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             keep_alive=settings.OLLAMA_KEEP_ALIVE or None,
         )
         app.state.ollama = ollama
+        # OpenRouter (docs/25-openrouter.md): a client only when enabled and keyed; the daily
+        # spend counter lives in Redis.
+        openrouter = build_openrouter(settings)
+        app.state.openrouter = openrouter
+        app.state.ai_usage = UsageTracker(redis)
         warmup: asyncio.Task[None] | None = None
         if settings.CHAT_WARMUP and settings.CHAT_DEFAULT_MODEL:
             # In the background: startup and /api/health never wait for a CPU model load.
@@ -160,6 +167,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 with contextlib.suppress(Exception, asyncio.CancelledError):
                     await warmup
             await ollama.aclose()
+            if openrouter is not None:
+                await openrouter.aclose()
             await http.aclose()
             await redis.aclose()
             await engine.dispose()

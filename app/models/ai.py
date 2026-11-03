@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
@@ -13,6 +14,7 @@ from sqlalchemy import (
     Identity,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     Uuid,
@@ -25,12 +27,16 @@ from app.db.base import Base
 
 MESSAGE_ROLES = ("system", "user", "assistant")
 MESSAGE_STATUSES = ("complete", "cancelled", "error", "timeout")
+PROVIDERS = ("ollama", "openrouter")
+CONVERSATION_CONTEXTS = ("general", "finance", "trading", "research")
 
 
 class Conversation(Base):
     __tablename__ = "conversations"
     __table_args__ = (
         Index("ix_ai_conversations_user_id_updated_at", "user_id", "updated_at"),
+        CheckConstraint("provider IN ('ollama','openrouter')", name="provider"),
+        CheckConstraint("context IN ('general','finance','trading','research')", name="context"),
         {"schema": "ai"},
     )
 
@@ -39,7 +45,12 @@ class Conversation(Base):
     )
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("core.users.id", ondelete="CASCADE"))
     title: Mapped[str] = mapped_column(String(200))
+    # The provider + model picked for this conversation (migration 0021). The one that
+    # actually answered a turn is on the message: a turn may fall back to local Ollama.
     model: Mapped[str] = mapped_column(String(200))
+    provider: Mapped[str] = mapped_column(String(16), server_default=text("'ollama'"))
+    # What the conversation is linked to; finance/trading/research force local inference.
+    context: Mapped[str] = mapped_column(String(16), server_default=text("'general'"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -65,6 +76,10 @@ class Message(Base):
     prompt_tokens: Mapped[int | None] = mapped_column(Integer)
     completion_tokens: Mapped[int | None] = mapped_column(Integer)
     duration_ms: Mapped[int | None] = mapped_column(Integer)
+    # Assistant turns (migration 0021): who answered, why it fell back to local, the cost.
+    provider: Mapped[str | None] = mapped_column(String(16))
+    fallback_reason: Mapped[str | None] = mapped_column(String(64))
+    cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
