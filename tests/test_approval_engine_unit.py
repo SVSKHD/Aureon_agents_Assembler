@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -186,6 +187,33 @@ def test_voice_grammar(words: str, intent: str, route: str | None) -> None:
 def test_voice_flags_action_words_as_navigation_only() -> None:
     assert voice.parse("approve request 5").note == voice.NAV_ONLY_NOTE
     assert voice.parse("open repairs").note is None
+
+
+@pytest.mark.parametrize(
+    "words",
+    [
+        "buy 100 shares of reliance",
+        "sell everything",
+        "place a market order",
+        "close all positions",
+        "cancel order 5",
+        "delete repo",
+        "approve all",
+        "approve request 5 and merge pr 7 and deploy",
+        "create an issue",
+        "push to main",
+        "trade nifty",
+    ],
+)
+def test_voice_never_does_more_than_navigate(words: str) -> None:
+    # Whatever is said, the answer is one of five read-only screens or nothing, and an
+    # action word is flagged "navigation only". There is no trading or write intent at all.
+    r = voice.parse(words)
+    assert r.intent in (*voice.INTENTS, "unknown")
+    assert r.route is None or re.fullmatch(
+        r"/dev/(approvals(/[0-9a-f-]+)?|repairs|agents|prs/\d+)", r.route
+    )
+    assert r.note == voice.NAV_ONLY_NOTE
 
 
 class FakeOllama:

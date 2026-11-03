@@ -469,6 +469,12 @@ See [23-approval-engine.md](23-approval-engine.md).
   nothing stateful (asserted by a test), the endpoint writes nothing (not even an audit row,
   so "changes no state" is literal), and the transcript is not logged. The model can only
   choose among the five intents; the route is always built by code.
+- **D-20-13a: voice uses the browser's recogniser; the SPA may use its own mic.** Speech-to-
+  text stays in the browser (Web Speech API): Android Chrome sends audio to Google, iOS Safari
+  to Apple; only the transcript reaches Aureon, and the endpoint is navigation-only. A local
+  STT path (whisper.cpp) is the privacy upgrade if that is not acceptable; it is not built.
+  The SPA's Permissions-Policy is `microphone=(self)` (was `()`, which silently disabled
+  voice); camera, geolocation, payment and usb stay off, and API responses keep `()`.
 - **D-20-14: paper approval reuses `approve_and_execute` unchanged.** The executor lives in
   `app/api/v1/paper.py` so `app.services.paper` keeps its two importers (the Prompt 12 test).
   Artifacts are `intent` + `risk_decision`; the requester is the intent's creator. The old
