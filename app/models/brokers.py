@@ -13,6 +13,7 @@ from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
@@ -22,6 +23,7 @@ from sqlalchemy import (
     Numeric,
     PrimaryKeyConstraint,
     String,
+    Text,
     func,
     text,
 )
@@ -176,3 +178,133 @@ class Mt5AccountSnapshot(Base):
     profit: Mapped[Decimal | None] = mapped_column(MONEY)
     raw: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
     as_of: Mapped[datetime] = mapped_column(TS)
+
+
+# --- mt5 push ingest (migration 0018, docs/12-mt5-adapter.md §3) -------------------------
+
+# Failure kinds the server classifies a push into (the UI's "why").
+FAILURE_KINDS = (
+    "mt5_disconnected",
+    "stale_ticks",
+    "guardian_error",
+    "discord_error",
+    "exception",
+    "stale_heartbeat",
+)
+
+
+class Mt5Push(Base):
+    """One accepted push (idempotency by push_id: the PK). Purged after MT5_EVENT_RETENTION_DAYS."""
+
+    __tablename__ = "pushes"
+    __table_args__ = (Index("ix_mt5_pushes_received_at", "received_at"), {"schema": "mt5"})
+
+    push_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    seq: Mapped[int | None] = mapped_column(BigInteger)
+    generated_at: Mapped[datetime] = mapped_column(TS)
+    received_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
+    size_bytes: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    events_new: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    events_duplicate: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+
+
+class Mt5BotSnapshot(Base):
+    """The latest push per bot: everything status/v1 lacked (guardian, strategy, health,
+    signals_latest) plus the v1 blocks the dashboard reads. One row, replaced per push."""
+
+    __tablename__ = "bot_snapshots"
+    __table_args__ = ({"schema": "mt5"},)
+
+    bot_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    push_id: Mapped[uuid.UUID] = mapped_column()
+    seq: Mapped[int | None] = mapped_column(BigInteger)
+    schema_name: Mapped[str] = mapped_column(String(64))
+    generated_at: Mapped[datetime] = mapped_column(TS)
+    received_at: Mapped[datetime] = mapped_column(TS)
+    bot: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
+    agents: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
+    health: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
+    guardian: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
+    signals_latest: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
+    strategy: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
+    halt: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    console: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    ema921e: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    ema921e_trades: Mapped[list[Any]] = mapped_column(JSONB, server_default=text("'[]'::jsonb"))
+    backtests: Mapped[list[Any]] = mapped_column(JSONB, server_default=text("'[]'::jsonb"))
+    errors: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
+
+
+class Mt5Event(Base):
+    """Journal events and tracebacks, once each (PK = the bot's event id)."""
+
+    __tablename__ = "events"
+    __table_args__ = (
+        Index("ix_mt5_events_t", "t"),
+        Index("ix_mt5_events_kind_t", "kind", "t"),
+        Index("ix_mt5_events_symbol_t", "symbol", "t"),
+        {"schema": "mt5"},
+    )
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    t: Mapped[datetime] = mapped_column(TS)
+    event: Mapped[str] = mapped_column(String(64))
+    # Timeline badge: P, cross, protected, secured, exit, closed, error, or the raw event name.
+    kind: Mapped[str] = mapped_column(String(32))
+    symbol: Mapped[str | None] = mapped_column(String(64))
+    ticket: Mapped[int | None] = mapped_column(BigInteger)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
+    push_id: Mapped[uuid.UUID | None] = mapped_column()
+    received_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
+
+
+class Mt5Failure(Base):
+    """A classified failure. One OPEN row per `key` (kind + symbol); a recurrence bumps
+    last_seen/count, and the row is resolved when the condition clears."""
+
+    __tablename__ = "failures"
+    __table_args__ = (
+        CheckConstraint(f"kind IN {FAILURE_KINDS}", name="kind"),
+        Index(
+            "uq_mt5_failures_open_key",
+            "key",
+            unique=True,
+            postgresql_where=text("resolved_at IS NULL"),
+        ),
+        Index("ix_mt5_failures_last_seen", "last_seen"),
+        {"schema": "mt5"},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    key: Mapped[str] = mapped_column(String(160))
+    kind: Mapped[str] = mapped_column(String(32))
+    symbol: Mapped[str | None] = mapped_column(String(64))
+    reason: Mapped[str] = mapped_column(Text)
+    first_seen: Mapped[datetime] = mapped_column(TS)
+    last_seen: Mapped[datetime] = mapped_column(TS)
+    count: Mapped[int] = mapped_column(Integer, server_default=text("1"))
+    resolved_at: Mapped[datetime | None] = mapped_column(TS)
+    details: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
+
+
+class Mt5Candle(Base):
+    """Recent bars the bot pushed (UTC open time), with its EMA values. Kept separate from
+    trading.market_candles: no registered instrument is needed and the source is the bot."""
+
+    __tablename__ = "candles"
+    __table_args__ = (
+        PrimaryKeyConstraint("symbol", "timeframe", "ts", name="pk_candles"),
+        Index("ix_mt5_candles_ts", "ts"),
+        {"schema": "mt5"},
+    )
+
+    symbol: Mapped[str] = mapped_column(String(64))
+    timeframe: Mapped[str] = mapped_column(String(4))
+    ts: Mapped[datetime] = mapped_column(TS)
+    open: Mapped[Decimal] = mapped_column(PRICE)
+    high: Mapped[Decimal] = mapped_column(PRICE)
+    low: Mapped[Decimal] = mapped_column(PRICE)
+    close: Mapped[Decimal] = mapped_column(PRICE)
+    volume: Mapped[Decimal | None] = mapped_column(QTY)
+    ema: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
+    received_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())

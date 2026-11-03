@@ -54,6 +54,7 @@ from app.services import (
     github,
     github_actions,
     incidents,
+    mt5_ingest,
     mt5_sync,
     news,
     paper,
@@ -175,6 +176,16 @@ async def mt5_sync_status(ctx: TaskContext) -> dict[str, Any]:
     if ctx.mt5 is None:
         raise RuntimeError("MT5 bot export is not configured (MT5_STATUS_FILE / MT5_STATUS_URL)")
     return await mt5_sync.sync_status(ctx.maker, ctx.mt5, ctx.settings)
+
+
+async def mt5_ingest_watch(ctx: TaskContext) -> dict[str, Any]:
+    """Push mode: open a stale_heartbeat failure when the bot stopped pushing."""
+    return await mt5_ingest.watch(ctx.maker, ctx.settings)
+
+
+async def mt5_ingest_purge(ctx: TaskContext) -> dict[str, Any]:
+    """Push mode retention: candles, events, push ids, resolved failures."""
+    return await mt5_ingest.purge(ctx.maker, ctx.settings)
 
 
 def _adapters(ctx: TaskContext) -> dict[str, BrokerAdapter]:
@@ -340,6 +351,8 @@ TASKS: dict[str, TaskFn] = {
     "dhan_reconcile": dhan_reconcile,
     "dhan_backfill_candles": dhan_backfill_candles,
     "mt5_sync_status": mt5_sync_status,
+    "mt5_ingest_watch": mt5_ingest_watch,
+    "mt5_ingest_purge": mt5_ingest_purge,
     "paper_process": paper_process,
     "paper_reconcile": paper_reconcile,
     "news_pull": news_pull,
@@ -383,6 +396,9 @@ def default_jobs(settings: Settings) -> list[tuple[str, str, str]]:
             )
     if settings.mt5_configured:
         jobs.append(("mt5-sync-status", "mt5_sync_status", settings.MT5_SYNC_CRON))
+    if settings.mt5_ingest_enabled:
+        jobs.append(("mt5-ingest-watch", "mt5_ingest_watch", settings.MT5_INGEST_WATCH_CRON))
+        jobs.append(("mt5-ingest-purge", "mt5_ingest_purge", settings.MT5_INGEST_PURGE_CRON))
     if settings.NEWS_FEED_URLS:
         jobs.append(("news-pull", "news_pull", settings.NEWS_PULL_CRON))
     if settings.github_configured:

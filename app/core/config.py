@@ -192,6 +192,30 @@ class Settings(BaseSettings):
     def mt5_configured(self) -> bool:
         return bool(self.MT5_STATUS_FILE or self.MT5_STATUS_URL)
 
+    # --- MT5 push ingest (schema aureon.mt5.push/v1, docs/12-mt5-adapter.md §3) ---
+    # Bearer token the bot sends to POST /api/trading/mt5/ingest. Unset = ingest off (503).
+    # Prod refuses to start when it is set and shorter than 32 characters.
+    MT5_INGEST_TOKEN: SecretStr | None = None
+    MT5_INGEST_MAX_BYTES: int = Field(default=2 * 1024 * 1024, ge=1024)
+    MT5_INGEST_MAX_DECOMPRESSED_BYTES: int = Field(default=8 * 1024 * 1024, ge=1024)
+    # Pushes per minute accepted from the bot (it pushes every ~15 s and retries next poll).
+    MT5_INGEST_RATE_PER_MINUTE: int = Field(default=30, ge=1, le=6000)
+    # No push for longer than this = stale (status card, failures, agents.agents "mt5-bot").
+    MT5_STALE_HEARTBEAT_SECONDS: float = Field(default=90.0, gt=0)
+    # Market open but the newest tick older than this = a `stale_ticks` failure.
+    MT5_STALE_TICK_SECONDS: float = Field(default=120.0, gt=0)
+    # An exception / guardian_error failure with no new occurrence for this long is resolved.
+    MT5_FAILURE_QUIET_SECONDS: float = Field(default=3600.0, gt=0)
+    # Retention of pushed candles, and of events / push ids / resolved failures.
+    MT5_CANDLE_RETENTION_DAYS: int = Field(default=7, ge=1, le=3650)
+    MT5_EVENT_RETENTION_DAYS: int = Field(default=30, ge=1, le=3650)
+    MT5_INGEST_WATCH_CRON: str = "* * * * *"
+    MT5_INGEST_PURGE_CRON: str = "37 3 * * *"
+
+    @property
+    def mt5_ingest_enabled(self) -> bool:
+        return bool(self.MT5_INGEST_TOKEN and self.MT5_INGEST_TOKEN.get_secret_value())
+
     # --- research agents (Trading Phase D, docs/13-research-agents.md) ---
     RESEARCH_TICK_SECONDS: float = Field(default=60.0, ge=5)
     RESEARCH_QUEUE_MAX: int = Field(default=200, ge=1, le=10_000)

@@ -8,6 +8,7 @@ Checked in the API lifespan (docs/16-production-hardening.md, "Production checkl
 4. CORS has no wildcard origin.
 5. The 2 TB HDD is mounted (DATA_ROOT marker present and writable).
 6. TRADING_LIVE_ENABLED is false unless PHASE_G_APPROVED=yes (also enforced by Settings).
+7. MT5_INGEST_TOKEN, when set, is >= 32 chars and not a placeholder.
 """
 
 from __future__ import annotations
@@ -58,6 +59,12 @@ def production_problems(settings: Settings) -> list[str]:
         check_data_root(settings)
     except RuntimeError as exc:
         problems.append(f"data root: {exc}")
+    if settings.MT5_INGEST_TOKEN is not None:
+        tok = settings.MT5_INGEST_TOKEN.get_secret_value()
+        if tok and len(tok) < MIN_SECRET_LEN:
+            problems.append(f"MT5_INGEST_TOKEN is shorter than {MIN_SECRET_LEN} characters")
+        elif tok and any(m in tok.lower() for m in PLACEHOLDER_MARKERS):
+            problems.append("MT5_INGEST_TOKEN is a placeholder")
     if bool((settings.CF_ACCESS_TEAM_DOMAIN or "").strip()) != bool(settings.CF_ACCESS_AUD):
         problems.append("CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD must be set together")
     return problems

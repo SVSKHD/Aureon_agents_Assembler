@@ -10,6 +10,8 @@ Events (each `data:` is JSON):
 - `backtest`  a backtest run that changed status (queued → running → done/failed).
 - `agent`     a trading agent's effective state changed (idle / busy / error / stale / paused).
 - `quote`     the latest Dhan feed values for the requested instruments, when they change.
+- `mt5`       the MT5 bot pushed (new push_id) or its open failures changed; the /trading/mt5
+              page refetches its panels. Current state, may repeat after a reconnect.
 - `bye`       the stream is ending (max duration or session expired); the client reconnects.
 
 Every data event carries an `id:` cursor. A reconnecting EventSource sends it back as
@@ -42,6 +44,7 @@ from app.agents.registry import effective_state
 from app.auth.deps import CurrentSession
 from app.models.agents import Agent
 from app.models.auth import UserSession
+from app.models.brokers import Mt5BotSnapshot, Mt5Failure
 from app.models.trading import BacktestRun, BrokerAccount, Instrument, RiskDecision, TradingSignal
 from app.services.trading import visible_accounts
 
@@ -109,6 +112,7 @@ class StreamState:
     backtests: dict[str, str] = field(default_factory=dict)  # id -> last status sent
     agents: dict[str, str] = field(default_factory=dict)
     quotes: dict[str, str] = field(default_factory=dict)
+    mt5: str | None = None
 
 
 async def _start_cursor(db: AsyncSession) -> Cursor:
@@ -248,7 +252,47 @@ async def poll(
                     },
                 )
             )
+    out += await mt5_events(db, state)
     return out
+
+
+async def mt5_events(db: AsyncSession, state: StreamState) -> list[tuple[str, dict[str, Any]]]:
+    """One `mt5` event when the bot's latest push or its open failures change."""
+    snap = (
+        await db.execute(
+            select(
+                Mt5BotSnapshot.push_id,
+                Mt5BotSnapshot.seq,
+                Mt5BotSnapshot.received_at,
+                Mt5BotSnapshot.generated_at,
+            ).where(Mt5BotSnapshot.bot_id == "mt5-bot")
+        )
+    ).first()
+    if snap is None:
+        return []
+    n_open, last_seen = (
+        await db.execute(
+            select(func.count(), func.max(Mt5Failure.last_seen)).where(
+                Mt5Failure.resolved_at.is_(None)
+            )
+        )
+    ).one()
+    sig = f"{snap.push_id}|{n_open}|{last_seen.isoformat() if last_seen else ''}"
+    if state.mt5 == sig:
+        return []
+    state.mt5 = sig
+    return [
+        (
+            "mt5",
+            {
+                "push_id": snap.push_id,
+                "seq": snap.seq,
+                "received_at": snap.received_at,
+                "generated_at": snap.generated_at,
+                "open_failures": int(n_open or 0),
+            },
+        )
+    ]
 
 
 def _bt_ts(b: BacktestRun) -> datetime:
