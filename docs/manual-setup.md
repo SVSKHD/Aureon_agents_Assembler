@@ -4,6 +4,39 @@ These steps need the owner: sudo on the server, real secrets, or outside account
 never run by an agent. Each phase appends its own section below. Run commands as `svskhd8` on
 the server, from `/opt/private-ai/aureon`, unless a step says otherwise.
 
+## This server (found on the first deploy, 2026-11-03)
+
+The steps below assume a slightly different box. On the Spasta server:
+
+- **Paths.** The checkout is `/srv/projects/Aureon_agents_Assembler`; `/opt/private-ai/aureon`
+  is a symlink to it, so every path below still works. The frontend checkout is
+  `/srv/projects/ASTRA-FRONTEND`; the site is served from `/srv/www/spasta/current`.
+- **Docker access.** `svskhd8` must be in the `docker` group (`sudo usermod -aG docker
+  svskhd8`, then log in again).
+- **sudo.** Run sudo steps in a normal SSH terminal. Claude Code's `!` prefix has no TTY, so
+  sudo cannot ask for the password there.
+- **Postgres** runs from `/opt/private-ai/compose.postgres.yaml` (container
+  `private-ai-postgres-1`, superuser `spasta`, there is no `postgres` role) on the internal
+  network `private-ai_spasta_internal`; Ollama is on `private-ai_ai_private`. The untracked
+  `compose.override.yaml` joins the DB-using services to the Postgres network
+  (`SPASTA_DB_NETWORK` in `.env`); `PRIVATE_AI_NETWORK=private-ai_ai_private`. Postgres needs
+  `restart: unless-stopped` for the reboot drill. `scripts/ops/ops.env`: `PG_USER=spasta`.
+- **First migration on an existing database** runs as the owner of the legacy `public.*`
+  tables (`spasta`), because 0010 adds columns to them: put the owner URL in `.env.migrate`,
+  `docker compose run --rm migrate`, re-run `scripts/ops/apply-db-roles.sh` (the new schemas
+  move to `aureon_migrator`), then switch `.env.migrate` to `aureon_migrator`.
+- **HDD permissions.** The API (uid 10001) must be able to write `DATA_ROOT` itself (prod
+  check): `sudo chgrp 10001 /mnt/spasta-data && sudo chmod 775 /mnt/spasta-data`.
+- **Nginx** is the host package (`apt install nginx`), not the frontend container. Enable
+  `deploy/nginx/spasta-online.conf` and `deploy/nginx/api-spasta-online.conf`; both listen on
+  `127.0.0.1:8088`, where cloudflared sends both hostnames.
+- **cloudflared** runs with `--token-file` (a dashboard-managed tunnel): set the public
+  hostnames in Zero Trust → Networks → Tunnels → the tunnel → Public Hostname, not in
+  `/etc/cloudflared/config.yml`.
+- **The acceptance list** is in [24-production-integration.md](24-production-integration.md)
+  (there is no `22-production.md`).
+- **Deploys after this one are automatic**: [deploy-automation.md](deploy-automation.md).
+
 ## A, C, D — finance, image agent, frontend
 
 1. **Finance (A).**
