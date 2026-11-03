@@ -45,7 +45,7 @@ class Conversation(Base):
     )
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("core.users.id", ondelete="CASCADE"))
     title: Mapped[str] = mapped_column(String(200))
-    # The provider + model picked for this conversation (migration 0021). The one that
+    # The provider + model picked for this conversation (migration 0020). The one that
     # actually answered a turn is on the message: a turn may fall back to local Ollama.
     model: Mapped[str] = mapped_column(String(200))
     provider: Mapped[str] = mapped_column(String(16), server_default=text("'ollama'"))
@@ -76,7 +76,7 @@ class Message(Base):
     prompt_tokens: Mapped[int | None] = mapped_column(Integer)
     completion_tokens: Mapped[int | None] = mapped_column(Integer)
     duration_ms: Mapped[int | None] = mapped_column(Integer)
-    # Assistant turns (migration 0021): who answered, why it fell back to local, the cost.
+    # Assistant turns (migration 0020): who answered, why it fell back to local, the cost.
     provider: Mapped[str | None] = mapped_column(String(16))
     fallback_reason: Mapped[str | None] = mapped_column(String(64))
     cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))

@@ -548,8 +548,8 @@ See [24-production-integration.md](24-production-integration.md). In order:
 See [25-openrouter.md](25-openrouter.md). Without these steps every chat stays on local
 Ollama, exactly as before.
 
-1. **Merge order.** Migration `0021` sits on top of `0020` from the other open PRs. Merge
-   those first; the migrate one-shot applies `0021` on the next deploy.
+1. **Merge order.** Migration `0020` sits on top of `0019` (and `0018`) from the other open PRs. Merge
+   those first; the migrate one-shot applies `0020` on the next deploy.
 2. **Create a key** at openrouter.ai/keys. Give it a credit limit on the OpenRouter side too
    (belt and braces with `OPENROUTER_DAILY_LIMIT_USD`).
 3. **Server `.env` only** (never the SPA's env, and never a `VITE_` variable):

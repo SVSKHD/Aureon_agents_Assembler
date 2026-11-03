@@ -1,6 +1,6 @@
 # 25 — OpenRouter (opt-in external inference)
 
-**Status:** done (migration `0021`). Brief rule 4 was amended on 2026-11-03 (see "Prompt 0"
+**Status:** done (migration `0020`). Brief rule 4 was amended on 2026-11-03 (see "Prompt 0"
 in [decisions.md](decisions.md)). External inference through [OpenRouter](https://openrouter.ai)
 is allowed for chat, but only when you opt in, and only behind a data-classification filter.
 **Local Ollama stays the default and the fallback** for every request.
@@ -163,7 +163,7 @@ records, secrets and logs still block it. A refusal or an error falls back to
 
 ## Deploy
 
-1. Apply migration `0021`. It is additive: two columns on `ai.conversations` with defaults,
+1. Apply migration `0020`. It is additive: two columns on `ai.conversations` with defaults,
    three nullable columns on `ai.messages`. It needs 0018–0020 from the other PRs first.
 2. Set the variables above in the server `.env` (only there), then restart the API (and the
    research worker if the research flag changes).

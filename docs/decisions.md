@@ -576,7 +576,7 @@ See [25-openrouter.md](25-openrouter.md) and "Prompt 0" above.
 - **D-25-4: a conversation context column, stricter only.** `ai.conversations.context`
   (general / finance / trading / research). finance and trading are always local; a link
   can be added to a general conversation but never removed through the API.
-- **D-25-5: the existing `model` column holds the picked model.** Migration 0021 adds only
+- **D-25-5: the existing `model` column holds the picked model.** Migration 0020 adds only
   `provider` and `context` to conversations, plus `provider`, `fallback_reason` and
   `cost_usd` to messages (who actually answered each turn).
 - **D-25-6: fallback in the same stream.** An OpenRouter error (429, 5xx, 4xx, timeout,
@@ -592,7 +592,7 @@ See [25-openrouter.md](25-openrouter.md) and "Prompt 0" above.
 - **D-25-8: audit metadata only.** One `ai.external_call` audit event per attempt: model,
   tokens, cost, latency, outcome, conversation/message id (or research subject). Never the
   prompt or the answer.
-- **D-25-9: migration id 0021.** Developed with `down_revision = "0020"`: other PRs add
-  0018-0020 first. Until they merge, the non-DB chain test
+- **D-25-9: migration id 0020.** `down_revision = "0019"`: 0018 (MT5 ingest) and 0019 (coding
+  git ops) merge first. Until they do, the non-DB chain test
   (`test_the_chain_is_linear_and_every_revision_has_a_downgrade`) fails on this branch.
 
