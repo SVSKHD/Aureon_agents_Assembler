@@ -135,8 +135,12 @@ endpoint is **admin-only** (`AdminRequired`); writes also need CSRF and are audi
 | `POST /api/code/analyze` | queue a question about the code (local Ollama, read-only); the answer lands in the task |
 | `POST /api/code/tasks` | queue a change (below) |
 | `GET /api/code/tasks[/{id}]`, `GET /api/code/tasks/{id}/diff` | status, test results, the diff |
-| `POST /api/code/tasks/{id}/approve` | keep the change on its branch, optionally also as `feature/<name>` or `fix/<name>` |
+| `POST /api/code/tasks/{id}/approve` | approve; queues a `task` git op (returned as `git_op`) that keeps the branch, optionally also as `feature/<name>` or `fix/<name>`, and for a GitHub clone pushes it + opens a PR |
 | `POST /api/code/tasks/{id}/reject` | delete the task branch and its worktree |
+| `GET /api/code/git/repos` | `GITHUB_CODING_REPO_ALLOWLIST` with each repo's clone state (see "Git ops") |
+| `POST /api/code/git/clone`, `/pull` | `{repo: "owner/name"}`: queue a clone / fetch + fast-forward |
+| `POST /api/code/git/push` | `{repo, branch, title?, body?}`: queue a push of one feature branch + a PR |
+| `GET /api/code/git/ops[/{id}]` | queued / running / done / failed git ops, with the PR link |
 
 ### What a change task does
 
@@ -160,10 +164,66 @@ endpoint is **admin-only** (`AdminRequired`); writes also need CSRF and are audi
    (`link`) so tests run offline; they are never committed.
 6. **Review:** the task is `ready` with its diff and test results. **Approve** needs every
    test to pass and never accepts a protected branch (`CODE_PROTECTED_BRANCHES`: main,
-   master, dev01, …). It keeps `aureon/task-<id>` and can add a `feature/…` name. **Nothing is
-   pushed, merged into a protected branch, or deployed.** Pushing and opening a PR stay with you.
+   master, dev01, …). The approval is recorded at once; the git work is a `task` git op the
+   coding worker runs (poll `GET /api/code/git/ops/{id}`): it keeps `aureon/task-<id>`, can
+   add a `feature/…` name, removes the worktree and, **for a clone of an allowlisted GitHub
+   repo only**, pushes that branch under the push rules below and opens a PR. **Nothing is
+   merged or deployed.**
 
 A crash mid-task marks it failed and removes its worktree on the next start.
+
+### Git ops: clone, pull, push + PR
+
+The coding worker can also talk to GitHub, for **allowlisted repos only**:
+
+- **Allowlist.** `GITHUB_CODING_REPO_ALLOWLIST` (JSON list of `owner/repo`, default `[]` =
+  nothing). Each repo must also pass the GitHub allowlist (`GITHUB_ALLOWED_OWNERS` /
+  `_REPOS`, D-15-3); both are checked when an op is queued and again when it runs.
+- **Where.** `CODE_CLONE_ROOT/<owner>/<repo>` (default
+  `/mnt/spasta-data/code-worktrees/repos`, on the HDD volume the worker already mounts
+  read-write). A clone is registered as the coding repo `gh-<owner>-<repo>` with its default
+  branch as base, so analyze / change tasks run on it like on any `CODE_REPOS` entry.
+- **Queue.** The API only validates and queues (`agents.code_git_ops`, migration 0019); the
+  coding worker claims ops one at a time and runs each under `HEAVY_MODEL_LOCK`, so no
+  model-written test process runs while a git child holds the token. One op per repo at a
+  time (409 `op_in_progress`).
+- **Pull** = `git fetch --prune` + a fast-forward-only update of the default branch.
+- **Approval of a task on a clone** pushes too (the `task` op above); the same rules apply,
+  checked by the API where it can and again by the worker against GitHub.
+- **Push rules** (refused before any git runs; 409 `push_refused`): the branch must start with
+  one of `CODE_PUSH_BRANCH_PREFIXES` (default `aureon/,feat/`), must be a plain branch name,
+  and is never `main`, `master`, `dev01`, the repo's default branch, a
+  `CODE_PROTECTED_BRANCHES` name, or a branch GitHub reports as protected. An `aureon/task-*`
+  branch is pushable only once its task is **approved**. The push is one explicit
+  `refs/heads/<b>:refs/heads/<b>` refspec: no `--force`, no tags, no deletes.
+- **Secrets.** Every path touched by **any** commit between `origin/<default>` and the branch
+  is checked (so a secret added and removed again still counts); a hit in the shared
+  `secrets` category (`app/core/sensitive_paths.py`) or the agent's own blocklist (`.git`,
+  `.env*`, keys) refuses the push. Infra / auth / trading paths are allowed but listed in the
+  op's `result.sensitive` for the reviewer.
+- **PR.** After the push, a PR to the default branch is opened (or the open one for that head
+  is reused) through the tracked GitHub client (`github.tracked_operations`, `pr.create`).
+  **Merging is not here:** it stays behind the approval engine (`github.pr.merge`).
+- **Token.** `GITHUB_TOKEN` (needs contents:write and pull_requests:write on these repos)
+  never appears in argv, a remote URL, `.git/config`, the op row or a log. Each network git
+  call gets it in its own environment only (`AUREON_GIT_TOKEN`), read by a temporary
+  `GIT_ASKPASS` script that holds no secret and is deleted afterwards; credential helpers,
+  user and system git config are disabled; output and errors are redacted; and the repo's
+  config is checked for credentials after every clone / pull / push. The remote is
+  `GITHUB_GIT_URL` (https only; prod refuses anything else).
+- **Audit.** `code_git_<op>_queued` (API, with the admin) and `code_git_<op>_done|failed`
+  (worker: repo, branch, sha, PR number, error, duration). Each op is also a `coding` agent
+  run (`code_git_op`).
+
+```bash
+# .env: GITHUB_CODING_REPO_ALLOWLIST=["SVSKHD/ASTRA-FRONTEND"]
+curl -sS -b $J -H "x-csrf-token: $CSRF" -H 'content-type: application/json' \
+  $B/api/code/git/clone -d '{"repo":"SVSKHD/ASTRA-FRONTEND"}'
+curl -sS -b $J $B/api/code/git/ops | python3 -m json.tool          # status, error
+# ... a change task on repo "gh-svskhd-astra-frontend", approved ...
+curl -sS -b $J -H "x-csrf-token: $CSRF" -H 'content-type: application/json' \
+  $B/api/code/git/push -d '{"repo":"SVSKHD/ASTRA-FRONTEND","branch":"aureon/task-0123abcd4567","title":"..."}'
+```
 
 ### Configure
 
@@ -174,7 +234,7 @@ git -C astra-frontend switch dev01
 (cd astra-frontend && npm ci)          # node_modules the tests will reuse
 nano /opt/private-ai/aureon/.env       # CODE_REPOS, CODE_MODEL (see .env.example)
 docker exec <ollama-container> ollama pull qwen2.5-coder:7b
-docker compose run --rm migrate        # 0008: agents.code_tasks (new table only)
+docker compose run --rm migrate        # 0008 code_tasks, 0019 code_git_ops (new tables only)
 docker compose --profile coding up -d --build coding-worker
 curl -sS -b $J $B/api/repos | python3 -m json.tool
 curl -sS -b $J -H "x-csrf-token: $CSRF" -H 'content-type: application/json' $B/api/code/analyze \
@@ -189,6 +249,13 @@ curl -sS -b $J -H "x-csrf-token: $CSRF" -H 'content-type: application/json' $B/a
   Only allowlist repos you own, and review the diff before approving.
 - **Repos are read-write inside `coding-worker`,** because git keeps worktrees and branches in
   `.git`. The agent itself only writes `aureon/task-*` and approved `feature/*` / `fix/*` refs.
+- **The token is in the worker's environment** (`env_file: .env`), as it already was for
+  self-repair. The process is non-dumpable (D-E12), test processes get a scrubbed env, and git
+  ops never overlap a test run (`HEAVY_MODEL_LOCK`). Use a fine-grained token limited to the
+  allowlisted repos.
+- **The API image has no `git`.** Approval therefore runs no git in the API (D-24-12): it
+  queues a `task` git op for the worker. Reject and the read-only `/api/repos/*` endpoints
+  still call git in the API process (unchanged from Phase 5b).
 - **Partial replacement for the GitHub proxy:** `/api/repos/*` covers trees, files, commits and
   branches of local checkouts. GitHub issues, pull requests and comments are not served,
   because Aureon makes no external API calls. Stage 5 of the frontend migration uses these

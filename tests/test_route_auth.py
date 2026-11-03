@@ -25,9 +25,11 @@ PUBLIC = {
     ("GET", "/api/public/forex"),
     # GitHub webhook receiver: authenticated by its HMAC signature instead (docs/20).
     ("POST", "/api/v1/github/webhooks"),
+    # MT5 bot push: machine-to-machine, bearer MT5_INGEST_TOKEN instead (docs/12 §3).
+    ("POST", "/api/trading/mt5/ingest"),
 }
 # Public routes that change state, each with its own authentication.
-PUBLIC_UNSAFE = {"/api/auth/login", "/api/v1/github/webhooks"}
+PUBLIC_UNSAFE = {"/api/auth/login", "/api/v1/github/webhooks", "/api/trading/mt5/ingest"}
 # Public routes that must carry the per-IP limiter dependency.
 PUBLIC_RATE_LIMITED = {p for m, p in PUBLIC if p.startswith("/api/public/")}
 
@@ -64,6 +66,13 @@ ADMIN = {
     ("GET", "/api/code/tasks/{task_id}/diff"),
     ("POST", "/api/code/tasks/{task_id}/approve"),
     ("POST", "/api/code/tasks/{task_id}/reject"),
+    ("GET", "/api/v1/github/actions/monitor"),
+    ("GET", "/api/code/git/repos"),
+    ("POST", "/api/code/git/clone"),
+    ("POST", "/api/code/git/pull"),
+    ("POST", "/api/code/git/push"),
+    ("GET", "/api/code/git/ops"),
+    ("GET", "/api/code/git/ops/{op_id}"),
     # Phase 15 GitHub foundation: admin only, GETs included (docs/18-github-foundation.md).
     ("GET", "/api/v1/github/connection"),
     ("POST", "/api/v1/github/connection/check"),

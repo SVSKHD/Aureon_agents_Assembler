@@ -24,7 +24,8 @@ from app.core.config import Settings
 from app.main import create_app
 from app.models.agents import CodeTask
 from app.models.auth import AuditEvent, User
-from app.services import coding
+from app.services import coding, coding_git
+from app.services.audit import ClientInfo
 from app.workers.coding import recover
 
 pytestmark = pytest.mark.db
@@ -146,6 +147,7 @@ async def env(db_clean: str, settings: Settings, repo: Path, tmp_path: Path) -> 
     engine = create_async_engine(db_clean)
     maker = async_sessionmaker(engine, expire_on_commit=False)
     async with engine.begin() as conn:
+        await conn.exec_driver_sql("DELETE FROM agents.code_git_ops")
         await conn.exec_driver_sql("DELETE FROM agents.code_tasks")
     admin = await bootstrap_admin(maker, "admin@spasta.online", PASSWORD)
     async with maker() as db, db.begin():
@@ -153,6 +155,7 @@ async def env(db_clean: str, settings: Settings, repo: Path, tmp_path: Path) -> 
     assert admin
     yield Env(make_settings(settings, db_clean, repo, tmp_path, [["true"]]), maker, repo, tmp_path)
     async with engine.begin() as conn:
+        await conn.exec_driver_sql("DELETE FROM agents.code_git_ops")
         await conn.exec_driver_sql("DELETE FROM agents.code_tasks")
     await engine.dispose()
 
@@ -216,6 +219,16 @@ async def test_change_task_isolated_tested_and_approved(env: Env) -> None:
             json={"feature_branch": "feature/greet"},
         )
         assert ok.status_code == 200 and ok.json()["status"] == "approved"
+        op = ok.json()["git_op"]
+        assert op["op"] == "task" and op["status"] == "queued"
+        assert op["branch"] == "feature/greet" and op["repo"] == "demo"
+        # The API ran no git: the branch and the worktree are the worker's job.
+        assert "feature/greet" not in git(env.repo, "branch")
+        oid = await coding_git.claim(env.maker)
+        assert str(oid) == op["id"]
+        assert await coding_git.run_op(env.maker, env.settings, None, oid) == "done"
+        done = (await c.get(f"/api/code/git/ops/{op['id']}")).json()
+        assert done["status"] == "done" and done["result"]["pushed"] is False
         assert git(env.repo, "rev-parse", "feature/greet") == task.commit_sha
         assert not await asyncio.to_thread(wt.exists)  # worktree removed, branch kept
         assert git(env.repo, "rev-parse", "--verify", task.branch)
@@ -264,7 +277,7 @@ async def test_failing_tests_block_approval_and_reject_deletes(env: Env) -> None
         admin_id = await db.scalar(select(User.id).where(User.email == "admin@spasta.online"))
         assert t and admin_id
         with pytest.raises(coding.DecisionRefused, match="failed"):
-            await coding.approve(db, env.cfg, t, admin_id, None)
+            await coding.approve(db, env.settings, t, admin_id, None, ClientInfo())
         await coding.reject(db, env.cfg, t, admin_id)
     assert "aureon/task-" not in git(env.repo, "branch")
     main_checkout_untouched(env.repo)

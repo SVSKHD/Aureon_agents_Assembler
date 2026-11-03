@@ -11,8 +11,9 @@ filtered out. A `change` task:
    inside the worktree with symlinks resolved, so it cannot write through a link;
 4. applies it in the worktree only, commits exactly those files, and runs the repo's
    allowlisted test commands there with a scrubbed environment;
-5. waits for an admin: approve keeps the branch (optionally also as `feature/...`),
-   reject deletes it. Nothing is ever pushed, merged into a protected branch or deployed.
+5. waits for an admin: approve keeps the branch (optionally also as `feature/...`) through
+   a `task` git op the coding worker runs (for a GitHub clone it also pushes the branch and
+   opens a PR); reject deletes it. Nothing is ever merged or deployed.
 """
 
 from __future__ import annotations
@@ -37,7 +38,10 @@ from app.agents.coding.repos import BRANCH, RepoConfig, get_repo, parse_repos
 from app.agents.ollama.client import OllamaClient
 from app.core.config import Settings
 from app.core.logging import get_logger
-from app.models.agents import CodeTask
+from app.models.agents import CodeGitOp, CodeTask
+from app.services import coding_git
+from app.services.audit import ClientInfo
+from app.services.coding_git import clone_repos
 
 log = get_logger(__name__)
 
@@ -65,7 +69,8 @@ class CodingConfig:
 
     @classmethod
     def from_settings(cls, s: Settings) -> CodingConfig:
-        repos = parse_repos(s.CODE_REPOS)
+        # Clones of allowlisted GitHub repos (coding_git) are coding repos too.
+        repos = {**clone_repos(s), **parse_repos(s.CODE_REPOS)}  # CODE_REPOS wins on a clash
         allowed = tuple(tuple(a) for a in s.CODE_ALLOWED_COMMANDS) or DEFAULT_ALLOWED
         for r in repos.values():
             for argv in r.tests:
@@ -374,34 +379,39 @@ class DecisionRefused(ValueError):
 
 
 async def approve(
-    db: AsyncSession, cfg: CodingConfig, task: CodeTask, user_id: uuid.UUID, feature: str | None
-) -> CodeTask:
-    """Keep the task branch (and optionally name it feature/...). Never touches a protected
-    branch, never pushes, never deploys."""
+    db: AsyncSession,
+    settings: Settings,
+    task: CodeTask,
+    user_id: uuid.UUID,
+    feature: str | None,
+    client: ClientInfo,
+) -> CodeGitOp:
+    """Record the approval and queue its git work for the coding worker (D-24-12): keep the
+    task branch (optionally also as feature/...), remove the worktree, and for a clone of an
+    allowlisted GitHub repo push the branch and open a PR. Runs no git here (the API image
+    has none). Never touches a protected branch, never merges, never deploys."""
+    cfg = CodingConfig.from_settings(settings)
     if task.kind != "change" or task.status != "ready":
         raise DecisionRefused(f"only a ready change task can be approved (status {task.status})")
     if not task.branch or not TASK_BRANCH.match(task.branch) or task.branch in cfg.protected:
         raise DecisionRefused("task has no agent branch")
+    if not task.commit_sha:
+        raise DecisionRefused("task has no commit")
     failed = [t for t in task.tests if not t.get("ok")]
     if failed:
         raise DecisionRefused(f"{len(failed)} test command(s) failed; fix and re-run instead")
-    repo = get_repo(cfg.repos, task.repo)
-    git = Git(repo.path)
-    if feature:
-        if not FEATURE.match(feature) or feature in cfg.protected:
-            raise DecisionRefused("feature branch must look like feature/<name> or fix/<name>")
-        if feature in await git.branches():
-            raise DecisionRefused(f"{feature} already exists")
-        assert task.commit_sha
-        await git.create_branch(feature, task.commit_sha)
-    if task.worktree:
-        await _cleanup(git, Path(task.worktree), None, delete_branch=False)
+    get_repo(cfg.repos, task.repo)
+    if feature and (not FEATURE.match(feature) or feature in cfg.protected):
+        raise DecisionRefused("feature branch must look like feature/<name> or fix/<name>")
+    branch = feature or task.branch
+    op = await coding_git.queue_task(
+        db, settings, task, branch=branch, feature=feature, user_id=user_id, client=client
+    )
     task.status = "approved"
     task.decided_by = user_id
     task.decided_at = datetime.now(UTC)
-    task.worktree = None
-    task.result = {**task.result, "feature_branch": feature or task.branch}
-    return task
+    task.result = {**task.result, "feature_branch": branch, "git_op_id": str(op.id)}
+    return op
 
 
 async def reject(

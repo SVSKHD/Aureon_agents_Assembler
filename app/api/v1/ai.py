@@ -10,20 +10,28 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
 from app.agents.ollama.client import OllamaClient, OllamaUnavailable
-from app.agents.ollama.limiter import GenerationLimiter, QueueFull
+from app.agents.ollama.limiter import GenerationLimiter, QueueFull, Ticket
 from app.auth.deps import CsrfProtected, Current, DbSession, SettingsDep
+from app.core.config import Settings
 from app.models.ai import Conversation, ModelInventory
 from app.schemas.ai import (
+    AiUsage,
+    CatalogModel,
+    CatalogTarget,
     ChatRequest,
     ConversationDetail,
     ConversationOut,
     ConversationPage,
     MessageOut,
+    ModelCatalog,
     ModelList,
     ModelOut,
     ModelStatus,
     ModelStatusList,
+    OpenRouterStatus,
 )
+from app.services import audit
+from app.services.ai_usage import DailyUsage, UsageTracker, to_micro, utc_today
 from app.services.chat import (
     ChatJob,
     ChatStream,
@@ -31,7 +39,9 @@ from app.services.chat import (
     ConversationService,
     chat_options,
     sync_inventory,
+    trim_history,
 )
+from app.services.inference import Decision, ExternalGate, local_fallback_model
 
 router = APIRouter(tags=["ai"])
 
@@ -39,6 +49,14 @@ router = APIRouter(tags=["ai"])
 def _ollama(request: Request) -> OllamaClient:
     client: OllamaClient = request.app.state.ollama
     return client
+
+
+def _gate(request: Request, settings: Settings) -> ExternalGate:
+    return ExternalGate(
+        settings,
+        getattr(request.app.state, "openrouter", None),
+        getattr(request.app.state, "ai_usage", None),
+    )
 
 
 async def _models_synced(request: Request, db: DbSession) -> list[Any]:
@@ -106,6 +124,85 @@ async def models_status(request: Request, db: DbSession, _: Current) -> ModelSta
     )
 
 
+@router.get("/models/catalog", response_model=ModelCatalog)
+async def model_catalog(
+    request: Request, db: DbSession, _: Current, settings: SettingsDep
+) -> ModelCatalog:
+    """The picker's list: installed Ollama models plus the allowed OpenRouter ids."""
+    try:
+        installed = [m.name for m in await _models_synced(request, db)]
+        reachable = True
+    except OllamaUnavailable:
+        installed, reachable = [], False
+    gate = _gate(request, settings)
+    local = local_fallback_model(settings, installed if reachable else None)
+    models = [CatalogModel(provider="ollama", id=m, label=m) for m in installed]
+    if gate.usable:
+        models += [
+            CatalogModel(provider="openrouter", id=m, label=m) for m in settings.openrouter_models
+        ]
+    default = (
+        CatalogTarget(provider="openrouter", model=settings.OPENROUTER_DEFAULT_MODEL.strip())
+        if gate.usable
+        else CatalogTarget(provider="ollama", model=local)
+    )
+    return ModelCatalog(
+        default=default,
+        local_fallback_model=local,
+        ollama_reachable=reachable,
+        models=models,
+        openrouter=OpenRouterStatus(
+            enabled=settings.OPENROUTER_ENABLED,
+            unavailable_reason=gate.unusable_reason(),
+            research_external_allowed=settings.AI_RESEARCH_EXTERNAL_ALLOWED,
+        ),
+    )
+
+
+@router.get("/ai/usage", response_model=AiUsage)
+async def ai_usage(request: Request, _: Current, settings: SettingsDep) -> AiUsage:
+    """Today's (UTC) OpenRouter spend, tokens and calls against the daily cap."""
+    limit = settings.OPENROUTER_DAILY_LIMIT_USD
+    tracker: UsageTracker | None = getattr(request.app.state, "ai_usage", None)
+    available = True
+    try:
+        usage = await tracker.today() if tracker else DailyUsage(utc_today())
+    except Exception:
+        usage, available = DailyUsage(utc_today()), False
+    spent = usage.spent_usd
+    return AiUsage(
+        day=usage.day,
+        spent_usd=spent,
+        limit_usd=limit,
+        remaining_usd=max(limit - spent, 0),
+        prompt_tokens=usage.prompt_tokens,
+        completion_tokens=usage.completion_tokens,
+        calls=usage.calls,
+        failures=usage.failures,
+        cap_reached=limit <= 0 or usage.cost_micro >= to_micro(limit),
+        available=available,
+    )
+
+
+def _target(body: ChatRequest, conv: Conversation | None, gate: ExternalGate) -> tuple[str, str]:
+    """(provider, model) the user asked for; model "" = the local default."""
+    settings = gate.settings
+    if body.provider is not None:
+        provider = body.provider
+        model = body.model or (conv.model if conv is not None and conv.provider == provider else "")
+        if provider == "openrouter" and not model:
+            model = settings.OPENROUTER_DEFAULT_MODEL.strip()
+        return provider, model
+    if body.model:
+        is_or = "/" in body.model and body.model in settings.openrouter_models
+        return ("openrouter" if is_or else "ollama"), body.model
+    if conv is not None:
+        return conv.provider, conv.model
+    if gate.usable:
+        return "openrouter", settings.OPENROUTER_DEFAULT_MODEL.strip()
+    return "ollama", ""
+
+
 @router.post(
     "/chat",
     response_class=ChatStreamingResponse,
@@ -126,40 +223,84 @@ async def chat(
             f"num_ctx may not exceed {settings.CHAT_MAX_NUM_CTX}",
         )
 
-    ollama = _ollama(request)
-    try:
-        installed = [m.name for m in await _models_synced(request, db)]
-    except OllamaUnavailable as exc:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, exc.message) from exc
-    if body.model not in installed:
-        return JSONResponse(
-            {"detail": f"model {body.model!r} is not installed", "available": installed},
-            status_code=status.HTTP_404_NOT_FOUND,
-        )
-
-    if request.app.state.agent_paused.get("ollama"):
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE, "the ollama agent is paused by an admin"
-        )
-    limiter: GenerationLimiter = request.app.state.chat_limiter
-    try:
-        ticket = limiter.admit()
-    except QueueFull as exc:
-        raise HTTPException(
-            status.HTTP_429_TOO_MANY_REQUESTS,
-            "generation queue is full",
-            headers={"Retry-After": str(exc.retry_after)},
-        ) from exc
-    try:
-        started = await ConversationService(db, current.user.id).start_turn(
-            body.conversation_id,
-            body.model,
-            [{"role": m.role, "content": m.content} for m in body.messages],
-            settings.CHAT_HISTORY_MAX_MESSAGES,
-        )
-        if started is None:
+    svc = ConversationService(db, current.user.id)
+    conv: Conversation | None = None
+    history: list[dict[str, str]] = []
+    if body.conversation_id is not None:
+        conv = await svc.get(body.conversation_id)
+        if conv is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "conversation not found")
-        conv, prompt, message_ids = started
+        history = await svc.history(conv)
+    new = [{"role": m.role, "content": m.content} for m in body.messages]
+    prompt = trim_history(history, settings.CHAT_HISTORY_MAX_MESSAGES) + new
+    context = conv.context if conv is not None else (body.context or "general")
+    if conv is not None and body.context and body.context != "general" and context == "general":
+        context = body.context  # becoming stricter applies to this turn already
+
+    gate = _gate(request, settings)
+    provider, model = _target(body, conv, gate)
+    ollama = _ollama(request)
+    paused = bool(request.app.state.agent_paused.get("ollama"))
+
+    if provider == "openrouter":
+        if body.model and not gate.allowed(model):
+            return JSONResponse(
+                {
+                    "detail": f"model {model!r} is not an allowed OpenRouter model",
+                    "available": settings.openrouter_models,
+                },
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        try:
+            installed: list[str] | None = [m.name for m in await _models_synced(request, db)]
+        except OllamaUnavailable:
+            installed = None
+        fallback = None if paused else local_fallback_model(settings, installed)
+        decision = await gate.decide(model, prompt, context=context)
+    else:
+        try:
+            installed = [m.name for m in await _models_synced(request, db)]
+        except OllamaUnavailable as exc:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, exc.message) from exc
+        if not model:
+            model = local_fallback_model(settings, installed) or ""
+        if model not in installed:
+            return JSONResponse(
+                {"detail": f"model {model!r} is not installed", "available": installed},
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        fallback = model
+        decision = Decision(False)
+
+    first_provider, first_model = provider, model
+    if provider == "openrouter" and not decision.external:
+        if not fallback:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                f"OpenRouter is not used for this turn ({decision.reason}) and no local "
+                "model is available",
+            )
+        first_provider, first_model = "ollama", fallback
+
+    ticket: Ticket | None = None
+    if first_provider == "ollama":
+        if paused:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "the ollama agent is paused by an admin"
+            )
+        limiter: GenerationLimiter = request.app.state.chat_limiter
+        try:
+            ticket = limiter.admit()
+        except QueueFull as exc:
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                "generation queue is full",
+                headers={"Retry-After": str(exc.retry_after)},
+            ) from exc
+    try:
+        conv, message_ids = await svc.store_turn(
+            conv, new, model=model, provider=provider, context=context
+        )
         await db.commit()
 
         options = chat_options(num_ctx, settings.CHAT_NUM_THREAD)
@@ -171,9 +312,19 @@ async def chat(
             ChatJob(
                 conversation_id=conv.id,
                 user_message_ids=message_ids,
-                model=body.model,
+                model=first_model,
                 prompt=prompt,
                 options=options,
+                provider=first_provider,
+                requested_provider=provider,
+                requested_model=model,
+                fallback_model=fallback,
+                route_reason=decision.reason if provider == "openrouter" else None,
+                filter_categories=tuple(decision.categories),
+                temperature=body.temperature,
+                max_tokens=body.max_tokens,
+                user_id=current.user.id,
+                client=audit.ClientInfo.from_request(request),
             ),
             ollama=ollama,
             maker=request.app.state.sessionmaker,
@@ -181,16 +332,26 @@ async def chat(
             timeout=settings.CHAT_TIMEOUT_SECONDS,
             heartbeat=settings.CHAT_HEARTBEAT_SECONDS,
             registry=request.app.state.registry,
+            limiter=request.app.state.chat_limiter,
+            openrouter=gate.client,
+            usage=gate.usage,
         )
     except BaseException:
-        ticket.release()
+        if ticket is not None:
+            ticket.release()
         raise
-    return ChatStreamingResponse(stream, on_close=ticket.release)
+    return ChatStreamingResponse(stream)
 
 
 def _conv_out(c: Conversation) -> ConversationOut:
     return ConversationOut(
-        id=c.id, title=c.title, model=c.model, created_at=c.created_at, updated_at=c.updated_at
+        id=c.id,
+        title=c.title,
+        model=c.model,
+        provider=c.provider or "ollama",
+        context=c.context or "general",
+        created_at=c.created_at,
+        updated_at=c.updated_at,
     )
 
 
@@ -230,6 +391,9 @@ async def get_conversation(
                 completion_tokens=m.completion_tokens,
                 duration_ms=m.duration_ms,
                 created_at=m.created_at,
+                provider=m.provider,
+                fallback_reason=m.fallback_reason,
+                cost_usd=m.cost_usd,
             )
             for m in msgs
         ],

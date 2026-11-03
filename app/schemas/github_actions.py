@@ -102,3 +102,33 @@ class ActionOut(BaseModel):
 class WebhookAck(BaseModel):
     status: Literal["accepted", "duplicate", "ignored"]
     delivery_id: str
+
+
+class MonitorItemOut(BaseModel):
+    """One row of the combined Actions monitor: a host deploy (a `deployer` agent run) or a
+    GitHub Actions CI run (github.workflow_runs), on one timeline."""
+
+    kind: Literal["deploy", "ci"]
+    id: str  # "deploy:<agent run id>" | "ci:<GitHub run id>"
+    name: str
+    repo: str | None = None
+    branch: str | None = None
+    sha: str | None = None
+    # running | queued | success | failure | cancelled | unknown
+    status: str
+    # raw values: agent run status (deploy) / GitHub status + conclusion (ci)
+    raw_status: str | None = None
+    conclusion: str | None = None
+    event: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    duration_ms: int | None = None
+    url: str | None = None
+    error: str | None = None
+    rolled_back: bool | None = None
+
+
+class MonitorOut(BaseModel):
+    items: list[MonitorItemOut]
+    # Newest row time across both sources (the client polls; unchanged = nothing new).
+    latest_at: datetime | None = None

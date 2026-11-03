@@ -3,6 +3,23 @@
 Decisions made autonomously while finishing the roadmap. Each has an ID, the choice, why, and
 what would change it. Newest phase last.
 
+## Prompt 0 — Ground rules (amended 2026-11-03)
+
+Only rule 4 of the original brief's ground rules is recorded here, because it is the one
+that changed. The other rules are unchanged.
+
+- **Rule 4 — AI inference (amended 2026-11-03).**
+  - *Old wording:* AI runs only on the local Ollama. The single exception is the Claude PR
+    review (Phase 19, [22-claude-review.md](22-claude-review.md)), behind its own enable
+    flag and data-classification filter.
+  - *New wording:* External inference via OpenRouter is allowed, **opt-in**
+    (`OPENROUTER_ENABLED=false` by default, a daily USD budget of 0 by default), and only
+    behind a data-classification filter. Local Ollama stays the default and the fallback
+    for every request. **Never** send secrets, credentials, finance records, broker data,
+    positions or full logs to OpenRouter. Research and AI trading explanations stay local
+    unless `AI_RESEARCH_EXTERNAL_ALLOWED=true`. The Claude review exception stands as before.
+  - Implementation: [25-openrouter.md](25-openrouter.md), decisions D-25-*.
+
 ## A — Finance (Prompt 3)
 
 - **D-A1: DDL source.** The production Postgres container is not reachable from the build
@@ -379,6 +396,8 @@ See [22-claude-review.md](22-claude-review.md).
 - **D-19-1: the CLI, not an API client.** The reviewer shells nothing: it runs the local
   `claude` binary with argv only, prompt on stdin, an empty temp cwd and an env of HOME,
   PATH and the listed auth names. No HTTP client for an external AI API exists in the code.
+  *(Superseded 2026-11-03 by the amended rule 4: `app/agents/openrouter/client.py`, see
+  D-25-1.)*
   Default flags turn off tools, MCP and session persistence; they are configurable
   (`CLAUDE_CLI_ARGS`) because CLI flags change between versions.
 - **D-19-2: one shared sensitive-path list.** Phase 18 had not merged a hard-block list, so
@@ -541,3 +560,159 @@ See [23-approval-engine.md](23-approval-engine.md).
   serve loop died on it (no more jobs processed), the research AI lane would too, and the
   webhook worker logged it as an outage. `ReviewRunner.drain()` yields after each gather so a
   finished task's done-callback can run (it could spin forever).
+
+## 23 — MT5 push ingest (aureon.mt5.push/v1)
+
+- **D-23-1: push, not only pull.** The bot POSTs one `aureon.mt5.push/v1` document per status
+  poll to `POST /api/trading/mt5/ingest`. It is a superset of `aureon.mt5.status/v1`, so the
+  v1 part goes through the SAME `mt5_sync.apply_status` as the pull job (heartbeat, agent_logs,
+  trading_signals, terminals, positions). The pull path is unchanged; configure one or the
+  other (both write the same `mt5-bot` heartbeat row).
+- **D-23-2: bearer token, no session/CSRF, exact-path Access exemption.** `MT5_INGEST_TOKEN`
+  (unset = 503; prod refuses < 32 chars) compared with `hmac.compare_digest` even for a wrong
+  scheme. The route has no session dependency (pinned in tests/test_route_auth.py as the only
+  public trading route) and is exempt from the optional Cloudflare Access middleware by EXACT
+  path (`MACHINE_PATHS`), not by prefix. CSRF in this app is a per-route dependency, so no
+  middleware list had to change.
+- **D-23-3: caps before parsing.** Content-Length and the streamed body are capped at 2 MiB
+  (`MT5_INGEST_MAX_BYTES`, same as nginx `client_max_body_size 2m`, so no nginx change); gzip
+  is decompressed with an output limit (8 MiB), so a gzip bomb stops at the cap (413). Other
+  encodings answer 415.
+- **D-23-4: idempotency in Postgres, not Redis.** `mt5.pushes.push_id` is the PK (INSERT ...
+  ON CONFLICT DO NOTHING; a repeat answers 200 `{"duplicate": true}`) and `mt5.events.id`
+  (the bot's opaque sha1) is the PK for per-event dedupe. One transaction, so a push is either
+  fully stored or not at all and the bot simply retries. Redis is only the rate limiter
+  (`BrokerRateLimiter`, 30/min), which fails open (the token still gates the route).
+- **D-23-5: heartbeat = receive time.** For pushes `agents.agents.last_heartbeat_at` is the
+  server's receive time (not the bot's `generated_at`), with `details.stale_after_s =
+  MT5_STALE_HEARTBEAT_SECONDS`. Stale is computed on read (status card, failures, positions)
+  and stored by the `mt5-ingest-watch` job every minute as a `stale_heartbeat` failure.
+- **D-23-6: failures are rows with an open/resolved lifecycle.** One open row per (kind,
+  symbol) via a partial unique index; a recurrence bumps last_seen/count. Condition kinds
+  (mt5_disconnected, stale_ticks, discord_error, stale_heartbeat) resolve on the first push
+  that no longer shows them; occurrence kinds (exception, guardian_error) resolve after
+  `MT5_FAILURE_QUIET_SECONDS`. Only events first seen in a push are classified, so re-sent
+  tracebacks are not double counted.
+- **D-23-7: candles in `mt5.candles`, not `trading.market_candles`.** The latter needs a
+  registered instrument (FK) and is the broker feed's table; the bot's bars carry its own
+  EMA values. Times are converted from the MT5 server clock to UTC with the agent's offset_h.
+  Retention: 7 days (candles), 30 days (events, push ids, resolved failures).
+- **D-23-8: lenient schema.** Only `schema`, `push_id`, `generated_at` and the v1 basics are
+  strict; extra keys, unknown event names, signal kinds and guardian phases pass through
+  (bot PR #38: phase pre|protect|secured|ride, leg_phase A/B, reentry/partial/locked kinds).
+  Malformed numbers in an `ema` map become null instead of failing the push.
+- **D-23-9: live updates through the existing SSE.** `/api/trading/stream` emits `mt5` when the
+  latest push or the open failures change; the page refetches. No new stream, no pub/sub.
+- **D-23-10: migration id 0018 on top of 0017.** Additive: five new tables in the existing
+  `mt5` schema, created IF NOT EXISTS; downgrade drops only those.
+- **D-23-11: still read-only.** No route here can place, modify or close an order or change an
+  account's mode; tests pin the `/mt5` route set and the no-`order_send` rule still holds.
+
+## 24 — Coding git ops and Actions monitor
+
+See [05-agents.md](05-agents.md) ("Git ops") and
+[20-github-actions-webhooks.md](20-github-actions-webhooks.md) ("Actions monitor").
+
+- **D-24-1: a second allowlist, intersected with the GitHub one.** The only repo allowlist
+  that existed was the GitHub one (D-15-3), which also covers read-only browsing.
+  `GITHUB_CODING_REPO_ALLOWLIST` (default `[]` = nothing) names the repos the coding agent may
+  clone and push to; a repo must be on both, checked at queue time and at run time.
+- **D-24-2: the token reaches git through GIT_ASKPASS and one env var, per invocation.** The
+  remote URL never has credentials (so `.git/config` stays clean), argv never has the token
+  (visible in `ps`), credential helpers are cleared (`-c credential.helper=`), user and system
+  config are off, and the askpass script holds no secret and is deleted after each call.
+  Output and errors are redacted, and `.git/config` is checked for userinfo or token shapes
+  after every network op. `http.extraHeader` was rejected: it would put the token in argv
+  or config.
+- **D-24-3: network git only in the git-ops path; the rest keeps `protocol.allow=never`.**
+  `app/agents/coding/git.py` is unchanged. `remote.py` allows exactly the remote's scheme
+  (https; `file` only with `ENV=test`, for tests against a local bare repo), and prod refuses
+  a non-https `GITHUB_GIT_URL`.
+- **D-24-4: git ops are queued in the DB and run by the coding worker.** The API image has no
+  git, and the worker already owns the clones' volume and the heavy-model lock. New table `agents.code_git_ops` (migration **0019, down_revision 0018**:
+  another branch adds 0018 first). One op per repo at a time; ops left `running` by a crash
+  are failed at startup.
+- **D-24-5: git ops hold HEAVY_MODEL_LOCK.** The token sits in a git child's environment for
+  the length of a clone / fetch / push. Holding the lock the code-task and repair loops hold
+  for their tests means no model-patched process can run at the same time to read it.
+- **D-24-6: push rules.** Allowed only under `CODE_PUSH_BRANCH_PREFIXES` (default
+  `aureon/,feat/`); always refused: main, master, dev01, HEAD (case-insensitive), the repo's
+  default branch (from GitHub at run time; unknown = refuse), `CODE_PROTECTED_BRANCHES`, and a
+  branch GitHub reports as protected. An `aureon/task-*` branch needs its task approved. The
+  push is a single explicit refspec without `--force`, so it is fast-forward only.
+- **D-24-7: secrets are checked per commit, not on the net diff.** `git log --name-only
+  origin/<default>..<branch>` lists every path any pushed commit touches, so a secret added
+  then deleted is still refused. Only the `secrets` category (plus the coding blocklist)
+  refuses; infra / auth / trading paths are normal code changes for this agent and are listed
+  in `result.sensitive` instead.
+- **D-24-8: PRs, never merges.** After a push the worker opens a PR to the default branch
+  (reusing an open one for the same head) through `tracked_write`. No merge path was added;
+  merges stay `github.pr.merge` behind the approval engine.
+- **D-24-9: clones are coding repos.** An allowlisted clone appears as `gh-<owner>-<repo>`
+  (base = its checked-out default branch, no test commands) so tasks run on it. `CODE_REPOS`
+  wins on a name clash. The worker rebuilds its repo list per task, so a new clone needs no
+  restart.
+- **D-24-10: the Actions monitor reads the DB only.** Deploys are `deployer` agent runs;
+  CI runs come from `github.workflow_runs`. No GitHub call, so the frontend can poll every
+  15 s. Deploy targets map to `owner/repo@branch` through `DEPLOY_TARGET_REPOS`, because the
+  run details only carry the target name. CI duration is `updated_at - created_at` of a
+  completed run (the run-started time is not stored); the limit applies after merging.
+- **D-24-11: no compose change was needed for the mount.** The coding worker already mounts
+  `DATA_ROOT` read-write at `/mnt/spasta-data` (worktrees live there), and
+  `CODE_CLONE_ROOT` defaults inside it. It stays off the `aureon` network (D-E12); outbound
+  https to GitHub goes through `private-ai`, like Ollama and the self-repair REST calls.
+- **D-24-12: approving a change task runs no git in the API.** The API image has no `git`,
+  so the Phase 5b approve (which ran `git branch` / `worktree remove` in the API process)
+  failed in prod. `POST /api/code/tasks/{id}/approve` now checks everything that needs no
+  git (status, tests, feature-branch name, protected names, and for a GitHub clone the
+  static push rules), marks the task `approved` and queues a `task` git op
+  (`code_git_ops.op = 'task'`, `task_id`), returned as `git_op`. The coding worker, under
+  HEAVY_MODEL_LOCK, creates the feature branch at the task's commit, removes the worktree and,
+  for a clone of an allowlisted GitHub repo, pushes that branch with every D-24-6/7 rule
+  (re-checked against GitHub's default branch and protection) and opens a PR. A local
+  `CODE_REPOS` checkout is never pushed. A refused push fails the op (the task stays
+  approved, the branch stays local); merging stays `github.pr.merge`. Changing 0019 to add
+  the op kind and column is fine because 0019 is not on main yet. Reject and the diff
+  endpoint still call git in the API (they fall back or fail cleanly) and are left for later.
+
+## 25 — OpenRouter (rule 4 amendment)
+
+See [25-openrouter.md](25-openrouter.md) and "Prompt 0" above.
+
+- **D-25-1: an HTTP client, server side only.** `app/agents/openrouter/client.py` talks to
+  OpenRouter's OpenAI-compatible API. The key is a `SecretStr`, put on each request's
+  Authorization header only; error messages are fixed strings built from the HTTP status, never
+  the upstream body. The SPA has no OpenRouter variable and never calls OpenRouter; it asks
+  `GET /api/models/catalog` for the picker list.
+- **D-25-2: classify the whole outbound payload, every turn.** System prompt, re-sent
+  history and new turns (the SPA's live-data block rides in the system message). A finance
+  turn therefore keeps every later turn of that conversation local, as long as it is still
+  in the re-sent history. Secret detection is reused from the Phase 19 filter
+  (`review_filter.secret_hits` + `entropy`); chat rules add finance, trading, broker,
+  positions and logs. Block broadly: a false positive costs a slower local answer.
+- **D-25-3: `trading` is the only soft category.** With `AI_RESEARCH_EXTERNAL_ALLOWED=true`
+  a `research` conversation (and the research worker) may send trading/strategy text; broker
+  data, positions, finance records, secrets and logs still force local.
+- **D-25-4: a conversation context column, stricter only.** `ai.conversations.context`
+  (general / finance / trading / research). finance and trading are always local; a link
+  can be added to a general conversation but never removed through the API.
+- **D-25-5: the existing `model` column holds the picked model.** Migration 0020 adds only
+  `provider` and `context` to conversations, plus `provider`, `fallback_reason` and
+  `cost_usd` to messages (who actually answered each turn).
+- **D-25-6: fallback in the same stream.** An OpenRouter error (429, 5xx, 4xx, timeout,
+  transport) becomes a `fallback` event and the same request continues on local Ollama
+  (`CHAT_DEFAULT_MODEL`, else the first installed model). Partial OpenRouter text is
+  dropped (`reset: true`). OpenRouter routes admit to the Ollama limiter only when they
+  fall back, so external chats never queue behind the CPU.
+- **D-25-7: budget in Redis, fail closed.** Per-UTC-day hash with micro-dollars from
+  OpenRouter's `usage.cost` (`usage: {include: true}` on every request). Pre-check before each
+  call; an unreadable counter keeps the turn local. Parallel calls can overshoot the cap by
+  their own cost; acceptable for one user. A cap of 0 means no budget, so OpenRouter is
+  never the default until a positive cap is set.
+- **D-25-8: audit metadata only.** One `ai.external_call` audit event per attempt: model,
+  tokens, cost, latency, outcome, conversation/message id (or research subject). Never the
+  prompt or the answer.
+- **D-25-9: migration id 0020.** `down_revision = "0019"`: 0018 (MT5 ingest) and 0019 (coding
+  git ops) merge first. Until they do, the non-DB chain test
+  (`test_the_chain_is_linear_and_every_revision_has_a_downgrade`) fails on this branch.
+

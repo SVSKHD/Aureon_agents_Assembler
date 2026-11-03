@@ -17,7 +17,8 @@ crossover/pullback logic, symbols, timeframes, backtests and Discord notificatio
                                                        └──────────────────────────────────────┘
 ```
 
-No migration: every table used here exists since `0006` (Trading Phase A).
+No migration for the pull mode: every table it uses exists since `0006` (Trading Phase A). The push mode (§3)
+adds migration `0018` (five tables in `mt5`).
 
 ## 1. Bot side (separate PR)
 
@@ -80,7 +81,88 @@ other agent. `GET /api/trading/agents`, `GET /api/agents` and `GET /api/system/s
 net points and win rate from the journal `exit` events in the export window (48 h by default), plus the ema921e USD sum
 from its trade CSV. Backtest summaries are passed through as the bot wrote them. No MT5 deal history is read.
 
-## Deploy and validate
+
+## 3. Push mode (`aureon.mt5.push/v1`)
+
+The bot (bot PR #38, off unless `AUREON_PUSH_ENABLED=1`) POSTs one document per status poll to Aureon. It is a superset
+of `aureon.mt5.status/v1`, so no export file, mount or inbound port on the Windows box is needed.
+
+```
+ bot (Windows) ── HTTPS over Tailscale ──▶ tailscale serve ─▶ nginx :8088 (/api/) ─▶ api :8000
+   POST /api/trading/mt5/ingest
+   Authorization: Bearer <MT5_INGEST_TOKEN>   Content-Encoding: gzip (optional)
+   X-Aureon-Push-Id: <uuid4 == body.push_id>
+```
+
+| Answer | When |
+|---|---|
+| `202 {"accepted":true,"push_id","events_new","events_duplicate"}` | stored |
+| `200 {"duplicate":true,"push_id"}` | push_id already stored (the bot counts any 2xx as ack) |
+| `401` | missing/bad bearer token (constant-time compare) |
+| `413` | body > 2 MiB, or > 8 MiB after gzip |
+| `415` | Content-Encoding other than gzip/identity |
+| `422` | not JSON / not `aureon.mt5.push/v1` / header push id ≠ body / failed validation (`detail.fields` lists paths, never values) |
+| `429` | more than `MT5_INGEST_RATE_PER_MINUTE` pushes per minute |
+| `503` | `MT5_INGEST_TOKEN` unset, or the database is unavailable (retry) |
+
+No session and no CSRF on this one path (machine-to-machine); the optional Cloudflare Access middleware exempts exactly
+`/api/trading/mt5/ingest` (not a prefix). nginx needs no change: `location /api/` already caps bodies at `2m`.
+
+### Storage (one transaction per push, `app/services/mt5_ingest.py`)
+
+| Push part | Table | Rule |
+|---|---|---|
+| `push_id`, `seq` | `mt5.pushes` | PK push_id, ON CONFLICT DO NOTHING → duplicate |
+| v1 part (`bot`, `agents`, `events`, ...) | `agents.agents`, `agents.agent_logs`, `trading.trading_signals`, `mt5.terminals`, `trading.positions_snapshots` | same `mt5_sync.apply_status` as the pull job; heartbeat = **receive time**, stale window `MT5_STALE_HEARTBEAT_SECONDS` |
+| `events[]` + `tracebacks[]` | `mt5.events` | PK = the bot's event id, ON CONFLICT DO NOTHING; `kind` = timeline badge (P, cross, reentry, protected, secured, exit, closed, error, or the raw event name) |
+| `health`, `guardian`, `strategy`, `signals_latest`, `halt`, `console`, `backtests`, `ema921e_trades` | `mt5.bot_snapshots` (one row) | replaced per push; an older `generated_at` never replaces a newer one |
+| `candles[sym][tf][]` | `mt5.candles` | upsert on (symbol, timeframe, UTC open time); bar time − offset_h·3600; EMA keys as sent |
+| classification | `mt5.failures` | see below |
+
+### Failures ("why")
+
+| Kind | Trigger | Resolves |
+|---|---|---|
+| `mt5_disconnected` | `health.mt5.connected` false, or an agent `connected:false` | first push without it |
+| `stale_ticks` | market open and `tick_age_s` > `MT5_STALE_TICK_SECONDS` (120) | first push without it |
+| `discord_error` | `health.discord.ok` false, or a traceback `where == "discord"` | first push without it |
+| `guardian_error` | traceback `where` starts with `guardian`, or an error event mentioning guardian | quiet for `MT5_FAILURE_QUIET_SECONDS` |
+| `exception` | any other traceback / error event (`error`, `agent_crash`) | quiet for `MT5_FAILURE_QUIET_SECONDS` |
+| `stale_heartbeat` | no push for > `MT5_STALE_HEARTBEAT_SECONDS` (90): on read, and stored by job `mt5-ingest-watch` (every minute) | next push |
+
+One open row per (kind, symbol): first_seen, last_seen, count, reason (message / last_error). Only events first seen in
+a push are counted, so a re-sent traceback is not counted twice.
+
+### Dashboard API (session, read-only)
+
+`GET /api/trading/mt5/` `bot-status` (online / stale / error + last heartbeat), `market` (per symbol open/closed, current
+session Asia/London/NY from UTC, last price, candles + EMA; `?timeframe=&limit=`), `positions` (with guardian phase, SL,
+secured level, peak), `signals` (`?kind=` repeatable, `?symbol=`), `failures`, `strategy`, `report` (`?days=`: per-symbol
+points P&L from `exit` events, daily net points, ema921e trades, backtests). `/api/trading/stream` emits `mt5` when a
+push arrives or the open failures change. The frontend page is `/trading/mt5` (ASTRA-FRONTEND).
+
+### Settings
+
+`MT5_INGEST_TOKEN` (unset = off), `MT5_INGEST_MAX_BYTES` (2 MiB), `MT5_INGEST_MAX_DECOMPRESSED_BYTES` (8 MiB),
+`MT5_INGEST_RATE_PER_MINUTE` (30), `MT5_STALE_HEARTBEAT_SECONDS` (90), `MT5_STALE_TICK_SECONDS` (120),
+`MT5_FAILURE_QUIET_SECONDS` (3600), `MT5_CANDLE_RETENTION_DAYS` (7), `MT5_EVENT_RETENTION_DAYS` (30),
+`MT5_INGEST_WATCH_CRON` (`* * * * *`), `MT5_INGEST_PURGE_CRON` (`37 3 * * *`). The two jobs exist only when the token is set.
+
+### Deploy (push mode)
+
+1. Merge, then `docker compose run --rm migrate` (0018) and restart `api` + `scheduler` (the deploy poller does this).
+2. `.env`: `MT5_INGEST_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(48))")`; the bot gets the same
+   value plus `AUREON_PUSH_ENABLED=1` and the URL `https://svskhd8.taila439d5.ts.net/api/trading/mt5/ingest`.
+3. Check: `curl -s -o /dev/null -w '%{http_code}\n' -X POST https://svskhd8.taila439d5.ts.net/api/trading/mt5/ingest`
+   → `401` (route live, token required); `GET /api/trading/mt5/bot-status` → `online` once the bot pushes.
+4. Rollback: unset `MT5_INGEST_TOKEN` (503, jobs no longer created; pause leftovers via `/api/scheduler/jobs/.../pause`),
+   `alembic downgrade 0017` drops only the five new tables.
+
+Tests: `tests/test_mt5_ingest_unit.py` (no DB: token, caps incl. gzip bomb, 415/422, duplicate push_id and event ids at
+the route, classification, stale detection, exact-path exemption, prod check, jobs) and `tests/test_mt5_ingest_db.py`
+(storage, failures lifecycle, watch/purge jobs, every read endpoint, the SSE `mt5` event).
+
+## Deploy and validate (pull mode)
 
 ### Bot (Windows box, after #37 is merged)
 

@@ -18,6 +18,8 @@ _PATTERNS = (
     re.compile(r"gh[pousr]_[A-Za-z0-9]{8,}"),
     re.compile(r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?)(?:bearer|token)\s+[^\s\"',}]+"),
     re.compile(r"\bBearer\s+[A-Za-z0-9_\-.=]{8,}"),
+    # OpenRouter / OpenAI / Anthropic-style API keys (docs/25-openrouter.md)
+    re.compile(r"\bsk-(?:or-v1-|proj-|ant-)?[A-Za-z0-9_-]{16,}"),
 )
 
 

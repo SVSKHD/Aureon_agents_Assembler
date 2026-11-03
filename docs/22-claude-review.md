@@ -4,9 +4,13 @@ Phase 19 of the roadmap. An admin can ask for an automated review of an open pul
 The review runs through the **local Claude CLI** on the server. It is advisory only: it
 never approves a PR on GitHub and never satisfies or bypasses the approval gate.
 
-This is the **only** non-Ollama AI path in the project (brief rule 4). It is off by default
-and stays behind three checks: `CLAUDE_REVIEW_ENABLED`, an availability check, and a
-data-classification filter that decides what may leave the server.
+This was the first non-Ollama AI path in the project. Brief rule 4 was amended on 2026-11-03
+(see "Prompt 0" in [decisions.md](decisions.md)): external inference through OpenRouter is
+now allowed too, opt-in and behind its own classification filter
+([25-openrouter.md](25-openrouter.md), which reuses this filter's secret detection). Local
+Ollama stays the default. The review is off by default and stays behind three checks:
+`CLAUDE_REVIEW_ENABLED`, an availability check, and a data-classification filter that
+decides what may leave the server.
 
 ## What it does
 

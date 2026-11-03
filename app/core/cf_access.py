@@ -5,6 +5,8 @@ request must carry a valid Access token in the `Cf-Access-Jwt-Assertion` header 
 adds it for an Access-protected hostname), except the CF_ACCESS_BYPASS_PATHS prefixes: the
 GitHub webhook receiver (HMAC-verified itself), `/api/public/*` (rate-limited, read-only) and
 `/api/health` (the on-box container healthchecks, which never pass through Cloudflare).
+One machine-to-machine route is also exempt, by EXACT path only (MACHINE_PATHS): the MT5 bot's
+`POST /api/trading/mt5/ingest`, which arrives over Tailscale and carries its own bearer token.
 
 Verification: RS256 only; the signing key is looked up by `kid` in the team's JWKS at
 `https://<team>/cdn-cgi/access/certs` (cached for CF_ACCESS_CERTS_TTL_SECONDS; an unknown
@@ -51,6 +53,15 @@ class AccessDenied(Exception):
 def team_origin(team_domain: str) -> str:
     d = team_domain.strip().removeprefix("https://").removeprefix("http://").strip("/")
     return f"https://{d}"
+
+
+# Exact paths (no prefix match, no trailing slash) that authenticate themselves and never
+# carry an Access JWT: the MT5 bot's push (bearer MT5_INGEST_TOKEN, docs/12-mt5-adapter.md).
+MACHINE_PATHS: frozenset[str] = frozenset({"/api/trading/mt5/ingest"})
+
+
+def is_machine_path(path: str) -> bool:
+    return path in MACHINE_PATHS
 
 
 def is_bypassed(path: str, prefixes: Sequence[str]) -> bool:
@@ -178,7 +189,8 @@ class CloudflareAccessMiddleware:
         )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or is_bypassed(scope.get("path", ""), self.bypass):
+        path = scope.get("path", "")
+        if scope["type"] != "http" or is_machine_path(path) or is_bypassed(path, self.bypass):
             await self.app(scope, receive, send)
             return
         token = ""

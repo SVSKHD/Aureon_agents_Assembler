@@ -9,6 +9,7 @@ outside the allowlist are 404 and GitHub is not called for them.
     GET  …/{owner}/{repo}/actions/jobs/{job_id}/logs   text/plain, sanitised, tail-first
     POST …/{owner}/{repo}/actions/workflows/{workflow}/dispatch   {ref, inputs}
     POST …/{owner}/{repo}/actions/runs/{run_id}/rerun | /rerun-failed | /cancel
+    GET  /api/v1/github/actions/monitor   ?limit&kind&repo   deploys + CI runs, one timeline
 
 Dispatch and re-run need GITHUB_DISPATCH_ALLOWLIST (else 403). Production workflows answer
 202 with an approval request (nothing sent to GitHub until approved); the others answer
@@ -25,9 +26,18 @@ from fastapi import APIRouter, HTTPException, Path, Query, status
 from fastapi.responses import PlainTextResponse
 
 from app.api.v1.github_issues import PageNo, PerPage, RepoDep, errors
+from app.auth.deps import AdminRequired, DbSession, SettingsDep
 from app.integrations.github.logs import LogArchiveError, SanitizedLog
-from app.schemas.github_actions import ActionOut, DispatchRequest, JobOut, RunOut, WorkflowOut
+from app.schemas.github_actions import (
+    ActionOut,
+    DispatchRequest,
+    JobOut,
+    MonitorOut,
+    RunOut,
+    WorkflowOut,
+)
 from app.schemas.github_ops import ListPage
+from app.services import actions_monitor
 from app.services import github_actions as actions
 
 router = APIRouter(prefix="/v1/github", tags=["github"])
@@ -168,3 +178,17 @@ async def rerun_failed(r: RepoDep, run_id: RunId) -> ActionOut:
 async def cancel(r: RepoDep, run_id: RunId) -> ActionOut:
     with actions_errors():
         return await actions.cancel(r.maker, r.client, r.actor, r.full, run_id)
+
+
+@router.get("/actions/monitor", response_model=MonitorOut)
+async def monitor(
+    _: AdminRequired,
+    db: DbSession,
+    settings: SettingsDep,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    kind: Literal["deploy", "ci"] | None = None,
+    repo: Annotated[str | None, Query(max_length=201)] = None,
+) -> MonitorOut:
+    """Host deploys (`deployer` agent runs) and GitHub Actions CI runs, newest first. DB only:
+    never calls GitHub (the webhook worker and the sync job keep the runs fresh)."""
+    return await actions_monitor.monitor(db, settings, limit=limit, kind=kind, repo=repo)

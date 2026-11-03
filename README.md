@@ -1,7 +1,9 @@
 # Aureon_Agentic
 
 Self-hosted backend for Spasta: a FastAPI modular monolith on PostgreSQL 17, Redis and a local
-Ollama. It is offline-first, has no external AI APIs and does no live trading.
+Ollama. It is offline-first and does no live trading. Local Ollama is the default for every AI
+feature; the only external AI paths are opt-in and filtered: the Claude PR review
+([docs/22](docs/22-claude-review.md)) and OpenRouter chat ([docs/25](docs/25-openrouter.md)).
 
 **Status: Phases 1, 2 (auth), 3, 4, 5 (registry, scheduler, monitoring, coding agent) and Trading
 Phases A, B (Dhan, read-only), C (MT5 bot, read-only) and D (research agents) are done; finance is
@@ -27,6 +29,8 @@ Phase 18 adds incidents and self-repair: exceptions, stale heartbeats, Docker he
 Phase 19 adds an advisory Claude PR reviewer via the local Claude CLI (off unless `CLAUDE_REVIEW_ENABLED`): an availability check, a data-classification filter (sensitive paths and secret-shaped content are never sent; emails, IPs and internal hosts are masked), structured verdicts in `agents.reviews`, and publishing as a COMMENT review that never replaces the approval gate ([docs/22-claude-review.md](docs/22-claude-review.md)).
 Phase 20 grows the approval gate into the full approval engine: per-kind policies (N distinct admins, expiry, self-approval, re-auth), multiple artifacts with drift invalidation, a short-lived server-side session re-auth stamp, a hash-chained event log with verification, an admin inbox with an SSE stream, Discord notifications that only deep-link into the app, voice navigation (never an action), and paper-intent approvals through the engine (`trading.paper_intent`) ([docs/23-approval-engine.md](docs/23-approval-engine.md)).
 Phase 22 integrates production: scoped DB roles (`deploy/sql/roles.sql`; the app role has no DDL and an append-only audit trail; `MIGRATIONS_DATABASE_URL` for the migrate one-shot), the MT5 read-only feed confirmed end to end, the integrations health card, Discord alerts (`alerts_dispatch`, deduplicated), a migration rollback drill, Cloudflare Tunnel + Access for spasta.online and api.spasta.online (with optional app-level JWT verification), resource caps, and a 16-step acceptance run with recorded results ([docs/24-production-integration.md](docs/24-production-integration.md)).
+
+OpenRouter (rule 4 amended 2026-11-03) adds opt-in external chat inference: off by default, a per-conversation provider/model, a classification filter over the whole outbound payload (secrets, finance, trading, broker, positions and logs stay local), a daily USD cap in Redis, automatic fallback to the local Ollama model on any error, and metadata-only audit rows ([docs/25-openrouter.md](docs/25-openrouter.md)).
 
 ## Layout
 
@@ -68,7 +72,9 @@ tests/  scripts/  deploy/  docs/
 | POST | `/api/auth/sessions/revoke-all` | Signs out every session of the user (needs `X-CSRF-Token`). |
 | GET | `/api/models` | Installed Ollama models (cached 60 s). |
 | GET | `/api/models/status` | Reachability, loaded models, last use. |
-| POST | `/api/chat` | Streaming chat (SSE); stores both turns. |
+| GET | `/api/models/catalog` | The picker: local models plus allowed OpenRouter models, and the default ([docs/25](docs/25-openrouter.md)). |
+| GET | `/api/ai/usage` | Today's OpenRouter spend, tokens and calls against the daily cap. |
+| POST | `/api/chat` | Streaming chat (SSE); stores both turns. Optional `provider` (`ollama`/`openrouter`) and `context`; falls back to local Ollama. |
 | GET | `/api/conversations` | Your conversations, paginated. |
 | GET / DELETE | `/api/conversations/{id}` | One conversation with messages / delete it. |
 | POST | `/api/images/generate` | Queue an image job (202). |
@@ -162,6 +168,7 @@ Every variable is listed in [.env.example](.env.example).
 | `OLLAMA_QUEUE_RETRY_AFTER` | `15` | `Retry-After` seconds on 429. |
 | `OLLAMA_CONNECT_TIMEOUT` / `OLLAMA_READ_TIMEOUT` | `5` / `300` | Connect timeout; longest silence between chunks. |
 | `OLLAMA_MODEL_CACHE_SECONDS` | `60` | `/api/tags` cache. |
+| `OPENROUTER_ENABLED`, `OPENROUTER_API_KEY`, `OPENROUTER_DEFAULT_MODEL`, `OPENROUTER_ALLOWED_MODELS`, `OPENROUTER_DAILY_LIMIT_USD`, `OPENROUTER_TIMEOUT_SECONDS`, `OPENROUTER_BASE_URL`, `AI_RESEARCH_EXTERNAL_ALLOWED` | `false`, empty, empty, empty, `0`, `60`, `https://openrouter.ai/api/v1`, `false` | Opt-in OpenRouter chat with a filter, a daily USD cap and local fallback ([docs/25](docs/25-openrouter.md)). |
 | `CHAT_TIMEOUT_SECONDS` | `900` | Whole chat request, including queue time. |
 | `CHAT_HEARTBEAT_SECONDS` | `15` | SSE keep-alive interval. |
 | `CHAT_DEFAULT_NUM_CTX` / `CHAT_MAX_NUM_CTX` | `4096` / `8192` | Context window default / cap. |

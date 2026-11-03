@@ -66,10 +66,19 @@ def test_mt5_routes_are_read_only(settings: Settings) -> None:
     routes = {
         (m, r.path) for r in api_routes(create_app(settings)) if "/mt5" in r.path for m in r.methods
     }
-    # GET the status; PUT registers a contract spec in OUR database (admin + CSRF).
+    # GET the status; PUT registers a contract spec in OUR database (admin + CSRF); POST
+    # ingest stores the bot's push (bearer token). Nothing sends anything to the bot or MT5.
     assert routes == {
         ("GET", "/api/trading/mt5/status"),
         ("PUT", "/api/trading/mt5/instruments/{symbol}"),
+        ("POST", "/api/trading/mt5/ingest"),
+        ("GET", "/api/trading/mt5/bot-status"),
+        ("GET", "/api/trading/mt5/market"),
+        ("GET", "/api/trading/mt5/positions"),
+        ("GET", "/api/trading/mt5/signals"),
+        ("GET", "/api/trading/mt5/failures"),
+        ("GET", "/api/trading/mt5/strategy"),
+        ("GET", "/api/trading/mt5/report"),
     }
 
 
@@ -102,6 +111,8 @@ def test_code_tasks_and_repairs_run_under_the_heavy_model_lock() -> None:
     tree = ast.parse((ROOT / "app" / "workers" / "coding.py").read_text())
     assert _inside_lock(tree, "coding.run_task", "HEAVY_MODEL_LOCK") == [True]
     assert _inside_lock(tree, "repairs.run_repair", "HEAVY_MODEL_LOCK") == [True]
+    # Git ops hold the token in a child's env: never while a test process may run.
+    assert _inside_lock(tree, "coding_git.run_op", "HEAVY_MODEL_LOCK") == [True]
 
 
 async def test_repair_loop_holds_the_lock_while_it_runs(monkeypatch: pytest.MonkeyPatch) -> None:

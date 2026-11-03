@@ -192,6 +192,30 @@ class Settings(BaseSettings):
     def mt5_configured(self) -> bool:
         return bool(self.MT5_STATUS_FILE or self.MT5_STATUS_URL)
 
+    # --- MT5 push ingest (schema aureon.mt5.push/v1, docs/12-mt5-adapter.md §3) ---
+    # Bearer token the bot sends to POST /api/trading/mt5/ingest. Unset = ingest off (503).
+    # Prod refuses to start when it is set and shorter than 32 characters.
+    MT5_INGEST_TOKEN: SecretStr | None = None
+    MT5_INGEST_MAX_BYTES: int = Field(default=2 * 1024 * 1024, ge=1024)
+    MT5_INGEST_MAX_DECOMPRESSED_BYTES: int = Field(default=8 * 1024 * 1024, ge=1024)
+    # Pushes per minute accepted from the bot (it pushes every ~15 s and retries next poll).
+    MT5_INGEST_RATE_PER_MINUTE: int = Field(default=30, ge=1, le=6000)
+    # No push for longer than this = stale (status card, failures, agents.agents "mt5-bot").
+    MT5_STALE_HEARTBEAT_SECONDS: float = Field(default=90.0, gt=0)
+    # Market open but the newest tick older than this = a `stale_ticks` failure.
+    MT5_STALE_TICK_SECONDS: float = Field(default=120.0, gt=0)
+    # An exception / guardian_error failure with no new occurrence for this long is resolved.
+    MT5_FAILURE_QUIET_SECONDS: float = Field(default=3600.0, gt=0)
+    # Retention of pushed candles, and of events / push ids / resolved failures.
+    MT5_CANDLE_RETENTION_DAYS: int = Field(default=7, ge=1, le=3650)
+    MT5_EVENT_RETENTION_DAYS: int = Field(default=30, ge=1, le=3650)
+    MT5_INGEST_WATCH_CRON: str = "* * * * *"
+    MT5_INGEST_PURGE_CRON: str = "37 3 * * *"
+
+    @property
+    def mt5_ingest_enabled(self) -> bool:
+        return bool(self.MT5_INGEST_TOKEN and self.MT5_INGEST_TOKEN.get_secret_value())
+
     # --- research agents (Trading Phase D, docs/13-research-agents.md) ---
     RESEARCH_TICK_SECONDS: float = Field(default=60.0, ge=5)
     RESEARCH_QUEUE_MAX: int = Field(default=200, ge=1, le=10_000)
@@ -237,6 +261,19 @@ class Settings(BaseSettings):
     CODE_MAX_FILE_BYTES: int = Field(default=400_000, ge=1000)
     CODE_MAX_PATCH_BYTES: int = Field(default=200_000, ge=1000)
     CODE_POLL_SECONDS: float = Field(default=3.0, gt=0)
+    # --- coding agent git ops (clone / pull / push + PR; docs/05-agents.md "Git ops") ---
+    # JSON list of GitHub "owner/repo" the coding worker may clone, pull and push feature
+    # branches to. Empty = none. Each must ALSO pass the GitHub allowlist (D-15-3).
+    GITHUB_CODING_REPO_ALLOWLIST: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # Where clones live (inside CODE_WORKTREE_ROOT's volume): <root>/<owner>/<repo>.
+    CODE_CLONE_ROOT: Path = Path("/mnt/spasta-data/code-worktrees/repos")
+    # Pushes are refused unless the branch starts with one of these (comma list).
+    CODE_PUSH_BRANCH_PREFIXES: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["aureon/", "feat/"]
+    )
+    # The git host clones and pushes talk to (https only; the token goes via GIT_ASKPASS).
+    GITHUB_GIT_URL: str = "https://github.com"
+    CODE_GIT_TIMEOUT_SECONDS: float = Field(default=600.0, gt=0)
 
     # --- paper trading (Trading Phase F, docs/15-paper-trading.md) ---
     # Notional starting equity of every PAPER account, in its base currency.
@@ -339,6 +376,14 @@ class Settings(BaseSettings):
     GITHUB_WEBHOOK_POLL_SECONDS: float = Field(default=5.0, gt=0, le=300)
     GITHUB_ACTIONS_SYNC_CRON: str = "*/15 * * * *"
     GITHUB_ACTIONS_SYNC_RUNS: int = Field(default=30, ge=1, le=100)
+    # Actions monitor (docs/20, "Actions monitor"): which repo + branch each host deploy
+    # target (deploy_record --target) builds, as JSON {"target": "owner/repo@branch"}.
+    DEPLOY_TARGET_REPOS: Annotated[dict[str, str], NoDecode] = Field(
+        default_factory=lambda: {
+            "backend": "SVSKHD/Aureon_agents_Assembler@main",
+            "frontend": "SVSKHD/ASTRA-FRONTEND@dev01",
+        }
+    )
 
     # --- Approval gate (docs/19-github-issues-prs.md; grown by the Phase 20 engine). ---
     # A pending approval request expires this many minutes after it was created.
@@ -403,8 +448,9 @@ class Settings(BaseSettings):
     # POST /containers/{name}/restart (the shipped proxy does not: restarts are "manual").
     INCIDENT_DOCKER_PROXY_ALLOWS_RESTART: bool = False
     INCIDENT_RESTART_CONTAINERS: Annotated[list[str], NoDecode] = Field(default_factory=list)
-    # --- Claude review (docs/22-claude-review.md). The one non-Ollama AI path: the local
-    # Claude CLI, only when enabled, available, and the diff passes the classification filter.
+    # --- Claude review (docs/22-claude-review.md). A non-Ollama AI path (the other is OpenRouter,
+    # docs/25): the local Claude CLI, only when enabled, available, and the diff passes the
+    # classification filter.
     CLAUDE_REVIEW_ENABLED: bool = False
     # The CLI binary: a name looked up on PATH, or an absolute path.
     CLAUDE_CLI_PATH: str = "claude"
@@ -433,6 +479,25 @@ class Settings(BaseSettings):
     CLAUDE_REVIEW_INTERNAL_DOMAINS: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["spasta.online"]
     )
+
+    # --- OpenRouter (docs/25-openrouter.md): opt-in external inference for chat. Off by default;
+    # local Ollama stays the default and the fallback. A data-classification filter decides per
+    # request whether anything may leave the server (app/services/chat_filter.py).
+    OPENROUTER_ENABLED: bool = False
+    # Server-side only. Never logged, never returned, never given to the SPA (no VITE_ var).
+    OPENROUTER_API_KEY: SecretStr | None = None
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    # The model new conversations use when OpenRouter is usable (always allowed).
+    OPENROUTER_DEFAULT_MODEL: str = ""
+    # Comma list of extra OpenRouter model ids the picker offers. Empty = only the default.
+    OPENROUTER_ALLOWED_MODELS: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # USD per UTC day, from OpenRouter's reported cost. 0 = no budget: every call stays local.
+    OPENROUTER_DAILY_LIMIT_USD: Decimal = Field(default=Decimal("0"), ge=0, le=Decimal("10000"))
+    # Connect timeout and the longest silence allowed between streamed chunks.
+    OPENROUTER_TIMEOUT_SECONDS: float = Field(default=60.0, gt=0, le=600)
+    # Research / AI trading explanations stay on local Ollama unless this is true (and even
+    # then the content filter still applies).
+    AI_RESEARCH_EXTERNAL_ALLOWED: bool = False
 
     # --- Production integration (docs/24-production-integration.md) ---
     # Alerts: open incidents (severity >= warning), stale heartbeats, failed/old backups and
@@ -474,6 +539,28 @@ class Settings(BaseSettings):
         return url or None
 
     @property
+    def openrouter_key(self) -> str:
+        s = self.OPENROUTER_API_KEY
+        return s.get_secret_value().strip() if s else ""
+
+    @property
+    def openrouter_models(self) -> list[str]:
+        """The OpenRouter model ids a conversation may use: the default, then the allowlist."""
+        extra = (m.strip() for m in self.OPENROUTER_ALLOWED_MODELS)
+        ids = [self.OPENROUTER_DEFAULT_MODEL.strip(), *extra]
+        return list(dict.fromkeys(m for m in ids if m))
+
+    def openrouter_unusable_reason(self) -> str | None:
+        """None when OpenRouter may be tried at all; else why not (a fallback reason code)."""
+        if not self.OPENROUTER_ENABLED:
+            return "disabled"
+        if not self.openrouter_key or not self.OPENROUTER_DEFAULT_MODEL.strip():
+            return "not_configured"
+        if self.OPENROUTER_DAILY_LIMIT_USD <= 0:
+            return "no_budget"
+        return None
+
+    @property
     def github_webhook_configured(self) -> bool:
         s = self.GITHUB_WEBHOOK_SECRET
         return bool(s and s.get_secret_value().strip())
@@ -489,6 +576,8 @@ class Settings(BaseSettings):
         "GITHUB_LOG_HOSTS",
         "GITHUB_DISPATCH_ALLOWLIST",
         "GITHUB_PROD_WORKFLOWS",
+        "GITHUB_CODING_REPO_ALLOWLIST",
+        "DEPLOY_TARGET_REPOS",
         "CLAUDE_CLI_ARGS",
         mode="before",
     )
@@ -505,6 +594,7 @@ class Settings(BaseSettings):
                 "GITHUB_LOG_HOSTS",
                 "GITHUB_DISPATCH_ALLOWLIST",
                 "GITHUB_PROD_WORKFLOWS",
+                "GITHUB_CODING_REPO_ALLOWLIST",
                 "CLAUDE_CLI_ARGS",
             )
             return [] if info.field_name in lists else {}
@@ -526,9 +616,11 @@ class Settings(BaseSettings):
         "DHAN_BACKFILL_TIMEFRAMES",
         "RESEARCH_EMA_PERIODS",
         "CODE_PROTECTED_BRANCHES",
+        "CODE_PUSH_BRANCH_PREFIXES",
         "INCIDENT_RESTART_CONTAINERS",
         "CLAUDE_CLI_ENV_PASSTHROUGH",
         "CLAUDE_REVIEW_INTERNAL_DOMAINS",
+        "OPENROUTER_ALLOWED_MODELS",
         "CF_ACCESS_AUD",
         "CF_ACCESS_BYPASS_PATHS",
         mode="before",

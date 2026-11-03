@@ -167,10 +167,31 @@ Admin only, GETs included; POSTs need CSRF. Without `GITHUB_TOKEN` they answer 5
 | POST | `R/actions/runs/{run_id}/rerun-failed` | Re-run the failed jobs. |
 | POST | `R/actions/runs/{run_id}/cancel` | Cancel (tracked). |
 | POST | `/api/v1/github/webhooks` | **Public**, HMAC-verified receiver (see above). |
+| GET | `/api/v1/github/actions/monitor?limit=&kind=&repo=` | The Actions monitor (below): deploys + CI runs on one timeline. |
 
 The 202 answer of dispatch / re-run / cancel is `{status: "sent" | "pending_approval",
 action, repo, target, approval}`; `approval` is the Phase 16 `GatedOut` when gated.
 Approve or deny it with `POST /api/v1/approvals/{id}/approve|deny` as in Phase 16.
+
+### Actions monitor
+
+`GET /api/v1/github/actions/monitor` (admin) puts two sources on one timeline, newest first:
+
+- **deploys**: runs of the `deployer` agent, which `scripts/ops/deploy-poll.sh` records
+  around every host deploy (`app/workers/deploy_record.py`, see
+  [deploy-automation.md](deploy-automation.md)). The target (`backend` / `frontend`) maps to
+  a repo and branch through `DEPLOY_TARGET_REPOS` (`{"backend":"owner/repo@main", ...}`);
+  the link is the deployed commit on GitHub. `rolled_back` and the short error are shown.
+- **CI**: `github.workflow_runs` (webhooks + the sync job), filtered by the GitHub allowlist
+  at read time. Duration = `updated_at - created_at` of a completed run (GitHub's own
+  run-started time is not stored); running runs have none.
+
+Each row: `kind` (`deploy` | `ci`), `id`, `name`, `repo`, `branch`, `sha`, `status`
+(normalised: `running`, `queued`, `success`, `failure`, `cancelled`, `unknown`) plus the raw
+status/conclusion, `event`, `started_at`, `finished_at`, `duration_ms`, `url`. `limit`
+(1–200, default 50) applies to the merged list; `kind` and `repo` filter. The endpoint reads
+the database only and never calls GitHub, so the frontend's Actions module polls it every
+15 s (the same cadence as its run list) at no rate-limit cost.
 
 ## Tables (migration 0014, additive)
 
