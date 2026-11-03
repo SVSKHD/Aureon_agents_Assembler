@@ -7,7 +7,7 @@
 # Nothing from GitHub executes here except the merged code of the two repos themselves.
 #
 # Pause: `touch /mnt/spasta-data/logs/DEPLOY_PAUSED` (or stop aureon-deploy.timer).
-set -uo pipefail
+set -euo pipefail
 
 LOG_DIR="${DEPLOY_LOG_DIR:-/mnt/spasta-data/logs}"
 LOG_FILE="$LOG_DIR/deploy.log"
@@ -21,8 +21,8 @@ TARGETS=(
 log() { printf '%s poll %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG_FILE"; }
 
 record() { # best effort: never blocks or fails a deploy
-  (cd "$BACKEND_DIR" && timeout 120 docker compose run --rm --no-deps -T api \
-    python -m app.workers.deploy_record "$@") 2>>"$LOG_FILE" | tail -n 1
+  { (cd "$BACKEND_DIR" && timeout 120 docker compose run --rm --no-deps -T api \
+    python -m app.workers.deploy_record "$@") 2>>"$LOG_FILE" | tail -n 1; } || true
 }
 
 if [[ -e "$LOG_DIR/DEPLOY_PAUSED" ]]; then
@@ -33,19 +33,20 @@ rc=0
 for t in "${TARGETS[@]}"; do
   IFS='|' read -r name dir branch <<<"$t"
   [[ -d "$dir/.git" ]] || { log "$name: $dir is not a git checkout, skipped"; continue; }
-  remote="$(git -C "$dir" ls-remote --quiet origin "refs/heads/$branch" | cut -f1)"
+  remote="$(git -C "$dir" ls-remote --quiet origin "refs/heads/$branch" | cut -f1)" || remote=""
   [[ "$remote" =~ ^[0-9a-f]{40}$ ]] || { log "$name: cannot read origin/$branch, skipped"; continue; }
   deployed="$(cat "$LOG_DIR/.deployed-$name" 2>/dev/null || true)"
   [[ "$remote" == "$deployed" ]] && continue
   # A commit that failed (and was rolled back) is not retried every minute; the next commit,
   # or `scripts/deploy.sh --force` by hand, tries again.
-  [[ "$remote" == "$(cat "$LOG_DIR/.failed-$name" 2>/dev/null)" ]] && continue
+  failed="$(cat "$LOG_DIR/.failed-$name" 2>/dev/null || true)"
+  [[ "$remote" == "$failed" ]] && continue
 
   script="$dir/scripts/deploy.sh"
-  [[ -x "$script" ]] || git -C "$dir" fetch --quiet origin "$branch"
+  [[ -x "$script" ]] || git -C "$dir" fetch --quiet origin "$branch" || true
   if [[ ! -x "$script" ]] && git -C "$dir" cat-file -e "origin/$branch:scripts/deploy.sh" 2>/dev/null; then
     # First deploy of a repo whose deploy script only exists upstream so far.
-    git -C "$dir" checkout --quiet "$branch" && git -C "$dir" reset --quiet --hard "origin/$branch"
+    { git -C "$dir" checkout --quiet "$branch" && git -C "$dir" reset --quiet --hard "origin/$branch"; } || true
   fi
   [[ -x "$script" ]] || { log "$name: no scripts/deploy.sh on $branch, skipped"; continue; }
 
@@ -56,12 +57,14 @@ for t in "${TARGETS[@]}"; do
   if "$script"; then
     log "$name: deployed ${remote:0:12}"
     rm -f "$LOG_DIR/.failed-$name"
-    [[ -n "$run_id" ]] && record finish --run-id "$run_id" --status succeeded >/dev/null
+    if [[ -n "$run_id" ]]; then record finish --run-id "$run_id" --status succeeded >/dev/null; fi
   else
     log "$name: deploy FAILED for ${remote:0:12} (see $LOG_FILE)"
     echo "$remote" >"$LOG_DIR/.failed-$name"
-    [[ -n "$run_id" ]] && record finish --run-id "$run_id" --status failed \
-      --error "deploy.sh failed for ${remote:0:12}; see $LOG_FILE" --rolled-back >/dev/null
+    if [[ -n "$run_id" ]]; then
+      record finish --run-id "$run_id" --status failed \
+        --error "deploy.sh failed for ${remote:0:12}; see $LOG_FILE" --rolled-back >/dev/null
+    fi
     rc=1
   fi
 done
