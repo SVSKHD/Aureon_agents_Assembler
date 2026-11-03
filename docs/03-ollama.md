@@ -38,6 +38,27 @@ with that model, kept in `ai.model_inventory`; Ollama doesn't record it.
 - **`conversation_id`** may be omitted to start a new conversation. Its title is the first 80
   characters of the first user message.
 - **`num_ctx`** defaults to `CHAT_DEFAULT_NUM_CTX` (4096). Above `CHAT_MAX_NUM_CTX` (8192) the request gets a 422.
+- **History:** with `CHAT_HISTORY_MAX_MESSAGES=N` only the system messages and the newest N
+  stored turns are re-sent (the conversation is still stored in full). 0 = everything.
+
+### Speed on a CPU-only box
+
+Generation speed is set by the model size; time to the first token by the model load (cold)
+and the prompt length. The server's settings (Ryzen 3, 4 cores, no GPU):
+
+| Setting | Where | Value | Why |
+| --- | --- | --- | --- |
+| `CHAT_DEFAULT_MODEL` | `.env` | `qwen2.5:3b` | ~3x the tokens/s of a 7B model; listed first, preselected by the SPA |
+| `CHAT_WARMUP` | `.env` | `true` | loads the default model at API start (background), so the first chat is warm |
+| `CHAT_DEFAULT_NUM_CTX` | `.env` | `2048` | smaller KV cache, less prompt processing |
+| `CHAT_NUM_THREAD` | `.env` | `4` | one thread per core |
+| `CHAT_HISTORY_MAX_MESSAGES` | `.env` | `12` | bounded prompt per turn |
+| `OLLAMA_KEEP_ALIVE` | `.env` and the Ollama container | `24h` | the model stays loaded |
+| `OLLAMA_MAX_LOADED_MODELS` / `OLLAMA_NUM_PARALLEL` | Ollama container | `1` / `1` | one resident model, one KV cache |
+
+The warm-up loads with the same `num_ctx`/`num_thread` as chats (a different `num_ctx` makes
+Ollama reload the model). Another model requested by a worker (coding, research, voice)
+replaces the chat model while `OLLAMA_MAX_LOADED_MODELS=1`; the next chat reloads it.
 - **`max_tokens`** maps to Ollama's `num_predict`.
 - The model must appear in `/api/tags`. Otherwise the response is a 404 with an `available` list
   and nothing is stored.

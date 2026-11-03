@@ -27,10 +27,29 @@ from app.db.session import build_engine, build_sessionmaker
 from app.integrations.claude_cli import ClaudeCLI
 from app.integrations.github import build_github_client
 from app.services import incidents
+from app.services.chat import chat_options
 from app.services.claude_review import ReviewRunner
 from app.services.health import HealthService
 
 log = get_logger(__name__)
+
+
+async def warm_up_chat_model(ollama: OllamaClient, settings: Settings) -> None:
+    """Load CHAT_DEFAULT_MODEL once at startup so the first chat skips the cold load (20-60 s
+    on this CPU). Best effort: an absent model or a busy/unreachable Ollama is only logged."""
+    model = settings.CHAT_DEFAULT_MODEL
+    try:
+        installed = {m.name for m in await ollama.list_models(force=True)}
+        if model not in installed:
+            log.warning("chat_warmup_skipped", model=model, reason="not installed")
+            return
+        options = chat_options(settings.CHAT_DEFAULT_NUM_CTX, settings.CHAT_NUM_THREAD)
+        seconds = await ollama.warm_up(model, options)
+        log.info("chat_warmup_done", model=model, seconds=round(seconds, 1))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.warning("chat_warmup_failed", model=model, error=type(exc).__name__)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -57,8 +76,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             connect_timeout=settings.OLLAMA_CONNECT_TIMEOUT,
             read_timeout=settings.OLLAMA_READ_TIMEOUT,
             cache_ttl=settings.OLLAMA_MODEL_CACHE_SECONDS,
+            keep_alive=settings.OLLAMA_KEEP_ALIVE or None,
         )
         app.state.ollama = ollama
+        warmup: asyncio.Task[None] | None = None
+        if settings.CHAT_WARMUP and settings.CHAT_DEFAULT_MODEL:
+            # In the background: startup and /api/health never wait for a CPU model load.
+            warmup = asyncio.create_task(warm_up_chat_model(ollama, settings))
         app.state.chat_limiter = GenerationLimiter(
             settings.OLLAMA_MAX_CONCURRENT,
             settings.OLLAMA_MAX_QUEUE,
@@ -131,6 +155,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await mt5.aclose()
             if github is not None:
                 await github.aclose()
+            if warmup is not None:
+                warmup.cancel()
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await warmup
             await ollama.aclose()
             await http.aclose()
             await redis.aclose()

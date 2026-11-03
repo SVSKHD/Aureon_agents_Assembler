@@ -29,6 +29,7 @@ from app.services.chat import (
     ChatStream,
     ChatStreamingResponse,
     ConversationService,
+    chat_options,
     sync_inventory,
 )
 
@@ -52,12 +53,20 @@ async def _models_synced(request: Request, db: DbSession) -> list[Any]:
 
 
 @router.get("/models", response_model=ModelList)
-async def list_models(request: Request, db: DbSession, _: Current) -> ModelList:
+async def list_models(
+    request: Request, db: DbSession, _: Current, settings: SettingsDep
+) -> ModelList:
     try:
         models = await _models_synced(request, db)
     except OllamaUnavailable as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, exc.message) from exc
+    default = settings.CHAT_DEFAULT_MODEL
+    if default not in {m.name for m in models}:
+        default = ""
+    # The default first: the SPA preselects the first model when none is chosen yet.
+    models = sorted(models, key=lambda m: m.name != default)
     return ModelList(
+        default_model=default or None,
         models=[
             ModelOut(
                 name=m.name,
@@ -68,7 +77,7 @@ async def list_models(request: Request, db: DbSession, _: Current) -> ModelList:
                 modified_at=m.modified_at,
             )
             for m in models
-        ]
+        ],
     )
 
 
@@ -146,13 +155,14 @@ async def chat(
             body.conversation_id,
             body.model,
             [{"role": m.role, "content": m.content} for m in body.messages],
+            settings.CHAT_HISTORY_MAX_MESSAGES,
         )
         if started is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "conversation not found")
         conv, prompt, message_ids = started
         await db.commit()
 
-        options: dict[str, Any] = {"num_ctx": num_ctx}
+        options = chat_options(num_ctx, settings.CHAT_NUM_THREAD)
         if body.temperature is not None:
             options["temperature"] = body.temperature
         if body.max_tokens is not None:

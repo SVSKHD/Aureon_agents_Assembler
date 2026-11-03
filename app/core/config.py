@@ -76,6 +76,18 @@ class Settings(BaseSettings):
     CHAT_HEARTBEAT_SECONDS: float = Field(default=15.0, gt=0)
     CHAT_DEFAULT_NUM_CTX: int = Field(default=4096, ge=256)
     CHAT_MAX_NUM_CTX: int = Field(default=8192, ge=256)
+    # Model the SPA preselects (listed first in GET /api/models, `default_model`) and the API
+    # loads at startup (CHAT_WARMUP). Empty = none: the first installed model.
+    CHAT_DEFAULT_MODEL: str = ""
+    CHAT_WARMUP: bool = True
+    # CPU threads per generation (Ollama `num_thread`); 0 = Ollama decides.
+    CHAT_NUM_THREAD: int = Field(default=0, ge=0, le=256)
+    # Stored turns re-sent per request: system messages plus the newest N others (the new
+    # turns are always sent). 0 = the whole conversation. Less history = less prompt to
+    # process on a CPU before the first token.
+    CHAT_HISTORY_MAX_MESSAGES: int = Field(default=0, ge=0)
+    # Ollama `keep_alive` for API chats ("24h", "30m", "-1" = forever); empty = Ollama default.
+    OLLAMA_KEEP_ALIVE: str = Field(default="", pattern=r"^(|-1|0|[0-9]{1,6}[smh]?)$")
 
     # --- imaging (docs/04-imaging.md) ---
     # "subprocess" runs IMAGE_AGENT_COMMAND; "stub" writes a placeholder PNG (tests/dev only).

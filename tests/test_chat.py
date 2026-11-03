@@ -496,3 +496,50 @@ async def test_user_isolation(make_env: EnvFactory) -> None:
         )
         assert r.status_code == 204
         assert await env.messages() == []
+
+
+@respx.mock
+async def test_default_model_first_keep_alive_threads_and_trimmed_history(
+    make_env: EnvFactory,
+) -> None:
+    """The CPU tuning knobs: default model listed first (the SPA preselects it), keep_alive
+    and num_thread sent to Ollama, and only the newest stored turns re-sent."""
+    respx.get(f"{OLLAMA}/api/tags").mock(return_value=httpx.Response(200, json=TAGS))
+    chat = respx.post(f"{OLLAMA}/api/chat").mock(
+        side_effect=lambda req: httpx.Response(200, content=ndjson(tok("ok"), DONE))
+    )
+    async with make_env(
+        CHAT_DEFAULT_MODEL="mistral:7b",
+        CHAT_WARMUP=False,
+        OLLAMA_KEEP_ALIVE="24h",
+        CHAT_NUM_THREAD=4,
+        CHAT_HISTORY_MAX_MESSAGES=2,
+    ) as env:
+        r = await env.a.get("/api/models")
+        assert r.json()["default_model"] == "mistral:7b"
+        assert [m["name"] for m in r.json()["models"]] == ["mistral:7b", MODEL]
+
+        r = await env.chat(
+            messages=[
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "one"},
+            ]
+        )
+        conv = parse_sse(r.text)[0][1]["conversation_id"]
+        await env.chat(conversation_id=conv, messages=[{"role": "user", "content": "two"}])
+        await env.chat(conversation_id=conv, messages=[{"role": "user", "content": "three"}])
+        sent = json.loads(chat.calls[-1].request.content)
+        assert sent["keep_alive"] == "24h"
+        assert sent["options"] == {"num_ctx": 4096, "num_thread": 4}
+        # Stored: system, one, ok, two, ok. Re-sent: the system message + the newest 2.
+        assert [m["content"] for m in sent["messages"]] == ["be brief", "two", "ok", "three"]
+        assert len(await env.messages()) == 7  # everything is still stored
+
+
+@respx.mock
+async def test_unknown_default_model_is_ignored(make_env: EnvFactory) -> None:
+    respx.get(f"{OLLAMA}/api/tags").mock(return_value=httpx.Response(200, json=TAGS))
+    async with make_env(CHAT_DEFAULT_MODEL="qwen2.5:3b", CHAT_WARMUP=False) as env:
+        r = await env.a.get("/api/models")
+        assert r.json()["default_model"] is None
+        assert [m["name"] for m in r.json()["models"]] == [MODEL, "mistral:7b"]
