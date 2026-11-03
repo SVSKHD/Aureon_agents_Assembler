@@ -29,7 +29,16 @@ The steps below assume a slightly different box. On the Spasta server:
   check): `sudo chgrp 10001 /mnt/spasta-data && sudo chmod 775 /mnt/spasta-data`.
 - **Nginx** is the host package (`apt install nginx`), not the frontend container. Enable
   `deploy/nginx/spasta-online.conf` and `deploy/nginx/api-spasta-online.conf`; both listen on
-  `127.0.0.1:8088`, where cloudflared sends both hostnames.
+  `127.0.0.1:8088`, where cloudflared sends both hostnames. Also enable
+  `deploy/nginx/default-8088.conf` (an explicit `default_server` that answers an unknown Host
+  with 444; without it the first file read, `api-spasta-online.conf`, caught every unknown
+  name).
+- **Tailscale** (private access from tailnet devices): `tailscale serve` sends
+  `https://svskhd8.taila439d5.ts.net/` to `127.0.0.1:8088`, served by
+  `deploy/nginx/spasta-tailscale.conf` (same SPA and same-origin `/api/` as spasta.online, no
+  Cloudflare JWT gate; the app's session + CSRF still apply). If `CF_ACCESS_TEAM_DOMAIN` +
+  `CF_ACCESS_AUD` are ever set in `.env`, the app's Access check would refuse this hostname
+  (it has no Access token), so it must become host-aware first.
 - **cloudflared** runs with `--token-file` (a dashboard-managed tunnel): set the public
   hostnames in Zero Trust → Networks → Tunnels → the tunnel → Public Hostname, not in
   `/etc/cloudflared/config.yml`.
