@@ -175,12 +175,14 @@ class CodeTask(Base):
 
 
 class CodeGitOp(Base):
-    """A network git operation of the coding agent (clone / pull / push + PR), queued by an
-    admin and run by the coding worker. See docs/05-agents.md, "Git ops"."""
+    """A git operation of the coding agent, queued by an admin and run by the coding worker:
+    clone / pull / push + PR, or `task` = the git half of approving a change task (keep the
+    branch, optional feature branch, worktree cleanup, and for a GitHub clone push + PR).
+    See docs/05-agents.md, "Git ops"."""
 
     __tablename__ = "code_git_ops"
     __table_args__ = (
-        CheckConstraint("op IN ('clone','pull','push')", name="op"),
+        CheckConstraint("op IN ('clone','pull','push','task')", name="op"),
         CheckConstraint("status IN ('queued','running','done','failed')", name="status"),
         Index("ix_agents_code_git_ops_status_created_at", "status", "created_at"),
         {"schema": "agents"},
@@ -188,8 +190,12 @@ class CodeGitOp(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     op: Mapped[str] = mapped_column(String(8))
-    # GitHub "owner/repo", lower-case.
+    # GitHub "owner/repo", lower-case; for a `task` op on a local CODE_REPOS checkout, the
+    # coding repo name.
     repo: Mapped[str] = mapped_column(String(201))
+    task_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("agents.code_tasks.id", ondelete="SET NULL")
+    )
     branch: Mapped[str | None] = mapped_column(String(200))
     # push: the PR's title and body (body capped by the schema).
     title: Mapped[str | None] = mapped_column(String(200))

@@ -135,7 +135,7 @@ endpoint is **admin-only** (`AdminRequired`); writes also need CSRF and are audi
 | `POST /api/code/analyze` | queue a question about the code (local Ollama, read-only); the answer lands in the task |
 | `POST /api/code/tasks` | queue a change (below) |
 | `GET /api/code/tasks[/{id}]`, `GET /api/code/tasks/{id}/diff` | status, test results, the diff |
-| `POST /api/code/tasks/{id}/approve` | keep the change on its branch, optionally also as `feature/<name>` or `fix/<name>` |
+| `POST /api/code/tasks/{id}/approve` | approve; queues a `task` git op (returned as `git_op`) that keeps the branch, optionally also as `feature/<name>` or `fix/<name>`, and for a GitHub clone pushes it + opens a PR |
 | `POST /api/code/tasks/{id}/reject` | delete the task branch and its worktree |
 | `GET /api/code/git/repos` | `GITHUB_CODING_REPO_ALLOWLIST` with each repo's clone state (see "Git ops") |
 | `POST /api/code/git/clone`, `/pull` | `{repo: "owner/name"}`: queue a clone / fetch + fast-forward |
@@ -164,8 +164,11 @@ endpoint is **admin-only** (`AdminRequired`); writes also need CSRF and are audi
    (`link`) so tests run offline; they are never committed.
 6. **Review:** the task is `ready` with its diff and test results. **Approve** needs every
    test to pass and never accepts a protected branch (`CODE_PROTECTED_BRANCHES`: main,
-   master, dev01, …). It keeps `aureon/task-<id>` and can add a `feature/…` name. **Nothing is
-   merged or deployed**, and nothing is pushed unless an admin queues a push (below).
+   master, dev01, …). The approval is recorded at once; the git work is a `task` git op the
+   coding worker runs (poll `GET /api/code/git/ops/{id}`): it keeps `aureon/task-<id>`, can
+   add a `feature/…` name, removes the worktree and, **for a clone of an allowlisted GitHub
+   repo only**, pushes that branch under the push rules below and opens a PR. **Nothing is
+   merged or deployed.**
 
 A crash mid-task marks it failed and removes its worktree on the next start.
 
@@ -185,6 +188,8 @@ The coding worker can also talk to GitHub, for **allowlisted repos only**:
   model-written test process runs while a git child holds the token. One op per repo at a
   time (409 `op_in_progress`).
 - **Pull** = `git fetch --prune` + a fast-forward-only update of the default branch.
+- **Approval of a task on a clone** pushes too (the `task` op above); the same rules apply,
+  checked by the API where it can and again by the worker against GitHub.
 - **Push rules** (refused before any git runs; 409 `push_refused`): the branch must start with
   one of `CODE_PUSH_BRANCH_PREFIXES` (default `aureon/,feat/`), must be a plain branch name,
   and is never `main`, `master`, `dev01`, the repo's default branch, a
@@ -248,11 +253,9 @@ curl -sS -b $J -H "x-csrf-token: $CSRF" -H 'content-type: application/json' $B/a
   self-repair. The process is non-dumpable (D-E12), test processes get a scrubbed env, and git
   ops never overlap a test run (`HEAVY_MODEL_LOCK`). Use a fine-grained token limited to the
   allowlisted repos.
-- **The API image has no `git`.** Approving / rejecting a change task runs git in the API
-  process (unchanged from Phase 5b), so on the stock image approval of a task fails with
-  `git_error`. Pushing a task branch needs the task approved, so the clone → task → approve →
-  push flow needs git in the API image (or approval moved into the worker) first. Clone,
-  pull and the push rules themselves do not depend on it.
+- **The API image has no `git`.** Approval therefore runs no git in the API (D-24-12): it
+  queues a `task` git op for the worker. Reject and the read-only `/api/repos/*` endpoints
+  still call git in the API process (unchanged from Phase 5b).
 - **Partial replacement for the GitHub proxy:** `/api/repos/*` covers trees, files, commits and
   branches of local checkouts. GitHub issues, pull requests and comments are not served,
   because Aureon makes no external API calls. Stage 5 of the frontend migration uses these

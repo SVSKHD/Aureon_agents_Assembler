@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Any
 
 import pytest
 import structlog
+from pydantic import SecretStr
 
 from app.agents.coding import remote as remote_mod
 from app.agents.coding.git import GitError
@@ -25,7 +27,11 @@ from app.agents.coding.remote import (
     secret_paths,
 )
 from app.core.config import Settings
+from app.integrations.github.client import GitHubNotFound
+from app.models.agents import CodeGitOp, CodeTask
+from app.models.auth import AuditEvent
 from app.services import coding, coding_git
+from app.services.audit import ClientInfo
 
 TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0" * 2
 PREFIXES = ("aureon/", "feat/")
@@ -394,3 +400,195 @@ async def test_a_clone_becomes_a_coding_repo(git_settings: Settings) -> None:
     assert repo.base == "trunk"
     assert repo.path == cfg.clone_path("svskhd/demo")
     assert repo.tests == ()
+
+
+# --- approval: recorded by the API, git work queued for the worker (D-24-12) ----------------
+
+
+class FakeSession:
+    """Just enough of an AsyncSession for approve() / run_op() without a database."""
+
+    def __init__(self, store: dict[Any, Any]) -> None:
+        self.store = store
+
+    async def __aenter__(self) -> FakeSession:
+        return self
+
+    async def __aexit__(self, *a: Any) -> None:
+        return None
+
+    def begin(self) -> FakeSession:
+        return self
+
+    def add(self, obj: Any) -> None:
+        self.store.setdefault("added", []).append(obj)
+
+    async def flush(self) -> None:
+        for obj in self.store.get("added", []):
+            if getattr(obj, "id", 1) is None:
+                obj.id = uuid.uuid4()
+
+    async def scalar(self, _stmt: Any) -> int:
+        return 0  # no git op in progress
+
+    async def get(self, cls: Any, oid: Any) -> Any:
+        return self.store.get((cls.__name__, oid))
+
+    async def execute(self, stmt: Any) -> Any:
+        self.store.setdefault("updates", []).append(stmt.compile().params)
+
+
+def ready_task(repo: str, sha: str = "a" * 40) -> CodeTask:
+    return CodeTask(
+        id=uuid.uuid4(),
+        kind="change",
+        repo=repo,
+        title="Greet",
+        instruction="say hello",
+        status="ready",
+        branch="aureon/task-0123abcd4567",
+        commit_sha=sha,
+        tests=[{"ok": True}],
+        result={"diff_stat": " a | 1 +"},
+        worktree=None,
+    )
+
+
+@pytest.fixture
+def no_git_here(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Any subprocess (git or otherwise) started from now on fails the test."""
+
+    async def refuse(*argv: Any, **kw: Any) -> Any:
+        raise AssertionError(f"the API process started a subprocess: {argv[:3]}")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", refuse)
+    monkeypatch.setattr(subprocess, "run", refuse)
+    monkeypatch.setattr(subprocess, "Popen", refuse)
+
+
+async def test_approve_runs_no_git_and_queues_the_task_op(
+    settings: Settings, tmp_path: Path, no_git_here: None
+) -> None:
+    s = settings.model_copy(
+        update={"CODE_REPOS": {"demo": {"path": str(tmp_path / "nowhere"), "base": "dev01"}}}
+    )
+    store: dict[Any, Any] = {}
+    task = ready_task("demo")
+    user = uuid.uuid4()
+    op = await coding.approve(FakeSession(store), s, task, user, "feature/greet", ClientInfo())  # type: ignore[arg-type]
+    assert op.op == "task" and op.task_id == task.id and op.repo == "demo"
+    assert op.branch == "feature/greet" and op.requested_by == user
+    assert op.result["push"] is False  # a local CODE_REPOS checkout: nothing to push
+    assert task.status == "approved" and task.result["git_op_id"] == str(op.id)
+    events = [a.event_type for a in store["added"] if isinstance(a, AuditEvent)]
+    assert events == ["code_git_task_queued"]
+    # without a feature name the task branch itself is kept
+    op2 = await coding.approve(FakeSession({}), s, ready_task("demo"), user, None, ClientInfo())  # type: ignore[arg-type]
+    assert op2.branch == "aureon/task-0123abcd4567"
+
+
+async def test_approve_refuses_protected_names_before_queueing(
+    settings: Settings, tmp_path: Path, no_git_here: None
+) -> None:
+    s = settings.model_copy(
+        update={"CODE_REPOS": {"demo": {"path": str(tmp_path / "nowhere"), "base": "dev01"}}}
+    )
+    store: dict[Any, Any] = {}
+    for bad in ("dev01", "main", "release/x"):
+        with pytest.raises(coding.DecisionRefused):
+            await coding.approve(
+                FakeSession(store), s, ready_task("demo"), uuid.uuid4(), bad, ClientInfo()
+            )  # type: ignore[arg-type]
+    assert "added" not in store
+
+
+async def test_approving_a_clone_task_queues_a_push_with_the_rules_checked(
+    git_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    s = git_settings.model_copy(update={"GITHUB_TOKEN": SecretStr(TOKEN)})
+    cfg = coding_git.GitOpsConfig.from_settings(s)
+    await remote_for(s).clone("svskhd/demo", cfg.clone_path("svskhd/demo"))
+
+    async def refuse(*argv: Any, **kw: Any) -> Any:
+        raise AssertionError("no git in the API process")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", refuse)
+    op = await coding.approve(
+        FakeSession({}), s, ready_task("gh-svskhd-demo"), uuid.uuid4(), None, ClientInfo()
+    )  # type: ignore[arg-type]
+    assert op.repo == "svskhd/demo" and op.branch == "aureon/task-0123abcd4567"
+    assert op.result["push"] is True and op.title == "aureon: Greet"
+    # fix/x is a valid local feature name but not a push prefix: refused up front
+    with pytest.raises(coding_git.GitOpRefused) as ei:
+        await coding.approve(
+            FakeSession({}), s, ready_task("gh-svskhd-demo"), uuid.uuid4(), "fix/x", ClientInfo()
+        )  # type: ignore[arg-type]
+    assert ei.value.code == "push_refused"
+
+
+class FakeGitHub:
+    def __init__(self, protected: bool = False) -> None:
+        self.protected = protected
+        self.paths: list[str] = []
+
+    async def get_json(self, path: str, params: Any = None, *, cache: bool = True) -> Any:
+        self.paths.append(path)
+        if path == "/repos/svskhd/demo":
+            return {
+                "id": 1, "full_name": "SVSKHD/demo", "owner": {"login": "SVSKHD"},
+                "name": "demo", "private": False, "default_branch": "trunk",
+                "html_url": "https://github.com/SVSKHD/demo",
+            }  # fmt: skip
+        if path.startswith("/repos/svskhd/demo/branches/"):
+            if self.protected:
+                return {"name": path.rsplit("/", 1)[-1], "protected": True}
+            raise GitHubNotFound("branch not found")
+        raise AssertionError(f"unexpected GitHub call {path}")
+
+
+async def _worker_task_op(
+    s: Settings, branch: str, client: FakeGitHub
+) -> tuple[str, CodeGitOp, str]:
+    """A clone with an approved task commit, and the worker running its `task` op."""
+    cfg = coding_git.GitOpsConfig.from_settings(s)
+    path = cfg.clone_path("svskhd/demo")
+    await remote_for(s).clone("svskhd/demo", path)
+    sh("switch", "-q", "-c", "aureon/task-0123abcd4567", cwd=path)
+    (path / "src.txt").write_text("change\n")
+    sh("add", "src.txt", cwd=path)
+    sh("commit", "-q", "-m", "change", cwd=path)
+    sha = sh("rev-parse", "HEAD", cwd=path)
+    sh("switch", "-q", "trunk", cwd=path)
+    task = ready_task("gh-svskhd-demo", sha)
+    task.status = "approved"
+    row = CodeGitOp(
+        id=uuid.uuid4(), op="task", repo="svskhd/demo", task_id=task.id, branch=branch,
+        title="t", body="b", status="running", result={}, requested_by=None,
+    )  # fmt: skip
+    store: dict[Any, Any] = {("CodeGitOp", row.id): row, ("CodeTask", task.id): task}
+
+    def maker() -> FakeSession:
+        return FakeSession(store)
+
+    status = await coding_git.run_op(maker, s, client, row.id, remote=remote_for(s))  # type: ignore[arg-type]
+    err = next(u["error"] for u in store["updates"] if "error" in u)
+    return status, row, str(err)
+
+
+@pytest.mark.parametrize(
+    ("branch", "protected", "why"),
+    [
+        ("fix/x", False, "must start with"),  # a local feature name, not a push prefix
+        ("aureon/task-0123abcd4567", True, "protected on GitHub"),  # only GitHub knows
+    ],
+)
+async def test_a_refused_branch_is_still_refused_in_the_worker(
+    git_settings: Settings, github: Path, branch: str, protected: bool, why: str
+) -> None:
+    s = git_settings.model_copy(update={"GITHUB_ALLOWED_REPOS": ["svskhd/demo"]})
+    client = FakeGitHub(protected=protected)
+    status, _row, err = await _worker_task_op(s, branch, client)
+    assert status == "failed" and why in str(err)
+    bare = github / "svskhd" / "demo.git"
+    assert sh("branch", "--list", cwd=bare) == "* trunk"  # nothing reached "GitHub"
+    assert not any(p.endswith("/pulls") for p in client.paths)  # no PR either

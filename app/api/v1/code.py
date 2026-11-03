@@ -23,6 +23,7 @@ from app.models.agents import CodeGitOp, CodeTask
 from app.schemas.code import (
     AnalyzeIn,
     ApproveIn,
+    ApproveOut,
     CodeTaskOut,
     CommitOut,
     DiffOut,
@@ -270,7 +271,7 @@ async def get_diff(
     )
 
 
-@router.post("/code/tasks/{task_id}/approve", response_model=CodeTaskOut)
+@router.post("/code/tasks/{task_id}/approve", response_model=ApproveOut)
 async def approve_task(
     task_id: uuid.UUID,
     request: Request,
@@ -278,17 +279,23 @@ async def approve_task(
     admin: AdminRequired,
     settings: SettingsDep,
     body: ApproveIn | None = None,
-) -> CodeTaskOut:
-    """Keep the tested change on its own branch (optionally also named feature/... or
-    fix/...). Never main/dev01, never pushed, never deployed."""
+) -> ApproveOut:
+    """Approve a tested change. The git work (keep the branch, optional feature/... or fix/...
+    name, worktree cleanup, and for a GitHub clone push + PR) is queued as a `task` git op for
+    the coding worker; poll GET /api/code/git/ops/{git_op.id}. Never main/dev01, never merged,
+    never deployed: merging a PR stays behind the approval gate."""
     task = await _task(db, task_id)
     feature = body.feature_branch if body else None
     try:
-        await coding.approve(db, _cfg(settings), task, admin.user.id, feature)
+        op = await coding.approve(
+            db, settings, task, admin.user.id, feature, ClientInfo.from_request(request)
+        )
     except coding.DecisionRefused as exc:
         raise HTTPException(409, detail={"code": "not_approvable", "detail": str(exc)}) from exc
-    except GitError as exc:
-        raise HTTPException(409, detail={"code": "git_error", "detail": str(exc)[:300]}) from exc
+    except coding_git.GitOpRefused as exc:
+        raise HTTPException(exc.status, detail={"code": exc.code, "detail": str(exc)}) from exc
+    except RepoNotAllowed as exc:
+        raise HTTPException(404, "repository not allowlisted") from exc
     audit.record(
         db,
         "code_task_approved",
@@ -300,11 +307,15 @@ async def approve_task(
             "branch": task.branch,
             "feature_branch": feature,
             "commit": task.commit_sha,
+            "git_op": str(op.id),
         },
     )
     await db.commit()
     await db.refresh(task)
-    return CodeTaskOut.model_validate(task)
+    await db.refresh(op)
+    return ApproveOut(
+        **CodeTaskOut.model_validate(task).model_dump(), git_op=GitOpOut.model_validate(op)
+    )
 
 
 @router.post("/code/tasks/{task_id}/reject", response_model=CodeTaskOut)

@@ -2,7 +2,7 @@
 repos (docs/05-agents.md, "Git ops"). Everything else in the agent keeps
 `protocol.allow=never` (app/agents/coding/git.py).
 
-Token handling (D-23-2):
+Token handling (D-24-2):
 - the remote URL is always `<GITHUB_GIT_URL>/<owner>/<repo>.git`, never with credentials in
   it, so nothing secret is written to `.git/config` (clone stores the URL it was given);
 - the token reaches git only through the environment of that one invocation

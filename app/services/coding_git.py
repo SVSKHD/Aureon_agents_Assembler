@@ -48,7 +48,7 @@ from app.services.audit import ClientInfo
 
 log = get_logger(__name__)
 
-OPS = ("clone", "pull", "push")
+OPS = ("clone", "pull", "push")  # queued through queue(); `task` through queue_task()
 WORKER_CLIENT = ClientInfo(user_agent="aureon-coding-git")
 HEAD_FILE = re.compile(r"^ref: refs/heads/([A-Za-z0-9._/-]{1,200})\s*$")
 
@@ -136,6 +136,18 @@ def clone_repos(settings: Settings) -> dict[str, RepoConfig]:
     return out
 
 
+def clone_full_name(settings: Settings, coding_repo: str) -> str | None:
+    """The GitHub "owner/repo" a coding repo is a clone of, or None (a CODE_REPOS checkout).
+    CODE_REPOS wins on a name clash, exactly as in CodingConfig."""
+    if coding_repo in settings.CODE_REPOS:
+        return None
+    cfg = GitOpsConfig.from_settings(settings)
+    for full in cfg.allowlist:
+        if clone_repo_name(full) == coding_repo:
+            return full
+    return None
+
+
 # --- queueing (API) ------------------------------------------------------------------------
 
 
@@ -210,6 +222,68 @@ async def queue(
         client,
         actor_user_id=user_id,
         details={"op_id": str(row.id), "repo": full, "branch": row.branch},
+    )
+    return row
+
+
+async def queue_task(
+    db: AsyncSession,
+    settings: Settings,
+    task: CodeTask,
+    *,
+    branch: str,
+    feature: str | None,
+    user_id: uuid.UUID | None,
+    client: ClientInfo,
+) -> CodeGitOp:
+    """The git half of approving a change task, for the coding worker (the API process has
+    no git). The caller has validated the task and commits. For a GitHub clone the push
+    rules are checked here as well and again by the worker, against GitHub's data."""
+    full = clone_full_name(settings, task.repo)
+    if full is not None:
+        cfg = GitOpsConfig.from_settings(settings)
+        if not settings.github_configured:
+            raise GitOpRefused("github_not_configured", "GITHUB_TOKEN is not set", 503)
+        try:
+            check_push_branch(
+                branch,
+                default_branch=head_branch(cfg.clone_path(full)),
+                protected=cfg.protected,
+                prefixes=cfg.prefixes,
+            )
+        except PushRefused as exc:
+            raise GitOpRefused("push_refused", str(exc)) from exc
+    repo = full or task.repo
+    busy = await db.scalar(
+        select(func.count())
+        .select_from(CodeGitOp)
+        .where(CodeGitOp.repo == repo, CodeGitOp.status.in_(("queued", "running")))
+    )
+    if busy:
+        raise GitOpRefused("op_in_progress", "another git op on this repository is in progress")
+    stat = str((task.result or {}).get("diff_stat") or "")
+    row = CodeGitOp(
+        op="task",
+        repo=repo,
+        task_id=task.id,
+        branch=branch,
+        title=f"aureon: {task.title}"[:200],
+        body=(
+            f"{task.instruction[:4000]}\n\n```\n{stat[:4000]}\n```"
+            if stat
+            else task.instruction[:4000]
+        ),
+        requested_by=user_id,
+        result={"feature_branch": feature, "task_branch": task.branch, "push": full is not None},
+    )
+    db.add(row)
+    await db.flush()
+    audit.record(
+        db,
+        "code_git_task_queued",
+        client,
+        actor_user_id=user_id,
+        details={"op_id": str(row.id), "task": str(task.id), "repo": repo, "branch": branch},
     )
     return row
 
@@ -322,6 +396,138 @@ async def _open_pr(
     return number, pr.get("html_url"), True
 
 
+async def _github_push(
+    maker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    client: GitHubClient | None,
+    cfg: GitOpsConfig,
+    remote: RemoteGit,
+    row: CodeGitOp,
+    full: str,
+    branch: str,
+) -> dict[str, Any]:
+    """Allowlists again, GitHub's default branch + protection, every push rule, the push,
+    then the PR. Shared by `push` and `task` ops."""
+    if client is None:
+        raise GitOpRefused("github_not_configured", "GITHUB_TOKEN is not set", 503)
+    async with maker() as db:  # the GitHub allowlist too, again at run time
+        owner, name = full.split("/", 1)
+        await gh.require_allowed(db, client, settings, owner, name)
+    detail = await gh.repository(client, full)
+    result = await push_checked(
+        cfg, remote, client, full, branch, default_branch=detail.default_branch
+    )
+    number, url, created = await _open_pr(maker, client, row, str(detail.default_branch))
+    return {
+        "head_sha": result["head_sha"],
+        "pr_number": number,
+        "pr_url": url,
+        "result": {**result, "pr_created": created},
+    }
+
+
+async def push_checked(
+    cfg: GitOpsConfig,
+    remote: RemoteGit,
+    client: Any,
+    full: str,
+    branch: str,
+    *,
+    default_branch: str | None,
+) -> dict[str, Any]:
+    """GitHub's protection flag for the branch, then push_branch (every rule)."""
+    protected = False
+    try:
+        b = await client.get_json(f"/repos/{full}/branches/{branch}", cache=False)
+        protected = bool(isinstance(b, dict) and b.get("protected"))
+    except GitHubNotFound:
+        protected = False  # a new branch
+    return await push_branch(
+        cfg, remote, full, branch, default_branch=default_branch, remote_protected=protected
+    )
+
+
+async def finish_task_branch(settings: Settings, task: Any, branch: str) -> dict[str, Any]:
+    """The local part of an approval, in the worker: create the feature branch at the task's
+    commit (if one was asked for) and remove the task's worktree. Never pushes."""
+    from app.agents.coding.git import FEATURE_BRANCH, Git
+    from app.agents.coding.repos import get_repo
+    from app.services import coding
+
+    ccfg = coding.CodingConfig.from_settings(settings)
+    repo = get_repo(ccfg.repos, task.repo)
+    git = Git(repo.path)
+    if branch != task.branch:
+        if not FEATURE_BRANCH.match(branch) or branch in ccfg.protected:
+            raise PushRefused(f"{branch} is not an allowed feature branch")
+        if branch in await git.branches():
+            if (await git.head(branch)) != task.commit_sha:
+                raise GitError(f"{branch} already exists at another commit")
+        else:
+            await git.create_branch(branch, str(task.commit_sha))
+    if task.worktree:
+        await coding._cleanup(git, Path(task.worktree), None, delete_branch=False)
+    return {"branch": branch, "commit": task.commit_sha}
+
+
+async def _run_task_op(
+    maker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    client: GitHubClient | None,
+    cfg: GitOpsConfig,
+    remote: RemoteGit | None,
+    token: str | None,
+    row: CodeGitOp,
+) -> dict[str, Any]:
+    async with maker() as db:
+        task = await db.get(CodeTask, row.task_id) if row.task_id else None
+    if task is None or task.status != "approved":
+        raise GitOpRefused("task_not_approved", "the task is missing or not approved")
+    branch = str(row.branch or "")
+    local = await finish_task_branch(settings, task, branch)
+    async with maker() as db, db.begin():
+        await db.execute(update(CodeTask).where(CodeTask.id == task.id).values(worktree=None))
+    full = clone_full_name(settings, task.repo)
+    if full is None:  # a local CODE_REPOS checkout: keep the branch, nothing to push
+        return {"head_sha": task.commit_sha, "result": {**row.result, **local, "pushed": False}}
+    cfg.require(full)
+    remote = remote or RemoteGit(cfg.git_url, token, timeout=cfg.timeout, allow_file=cfg.allow_file)
+    out = await _github_push(maker, settings, client, cfg, remote, row, full, branch)
+    return {**out, "result": {**row.result, **local, **out["result"], "pushed": True}}
+
+
+async def _run_repo_op(
+    maker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    client: GitHubClient | None,
+    cfg: GitOpsConfig,
+    remote: RemoteGit | None,
+    token: str | None,
+    row: CodeGitOp,
+) -> dict[str, Any]:
+    full = cfg.require(row.repo)
+    if client is None:
+        raise GitOpRefused("github_not_configured", "GITHUB_TOKEN is not set", 503)
+    async with maker() as db:  # the GitHub allowlist too, again at run time
+        owner, name = full.split("/", 1)
+        await gh.require_allowed(db, client, settings, owner, name)
+    remote = remote or RemoteGit(cfg.git_url, token, timeout=cfg.timeout, allow_file=cfg.allow_file)
+    path = cfg.clone_path(full)
+    if row.op == "clone":
+        await remote.clone(full, path)
+        default = await remote.default_branch(path)
+        return {"result": {"default_branch": default, "path": str(path)}}
+    if row.op == "pull":
+        default = await remote.default_branch(path)
+        if not default:
+            raise GitError("cannot tell the default branch of the clone")
+        sha = await remote.pull(full, path, default)
+        return {"head_sha": sha, "result": {"default_branch": default}}
+    return await _github_push(
+        maker, settings, client, cfg, remote, row, full, str(row.branch or "")
+    )
+
+
 async def run_op(
     maker: async_sessionmaker[AsyncSession],
     settings: Settings,
@@ -339,46 +545,10 @@ async def run_op(
     values: dict[str, Any] = {}
     try:
         cfg = GitOpsConfig.from_settings(settings)
-        full = cfg.require(row.repo)
-        if client is None:
-            raise GitOpRefused("github_not_configured", "GITHUB_TOKEN is not set", 503)
-        async with maker() as db:  # the GitHub allowlist too, again at run time
-            owner, name = full.split("/", 1)
-            await gh.require_allowed(db, client, settings, owner, name)
-        remote = remote or RemoteGit(
-            cfg.git_url, token, timeout=cfg.timeout, allow_file=cfg.allow_file
-        )
-        path = cfg.clone_path(full)
-        if row.op == "clone":
-            await remote.clone(full, path)
-            default = await remote.default_branch(path)
-            values = {"result": {"default_branch": default, "path": str(path)}}
-        elif row.op == "pull":
-            default = await remote.default_branch(path)
-            if not default:
-                raise GitError("cannot tell the default branch of the clone")
-            sha = await remote.pull(full, path, default)
-            values = {"head_sha": sha, "result": {"default_branch": default}}
+        if row.op == "task":
+            values = await _run_task_op(maker, settings, client, cfg, remote, token, row)
         else:
-            detail = await gh.repository(client, full)
-            branch = str(row.branch or "")
-            protected = False
-            try:
-                b = await client.get_json(f"/repos/{full}/branches/{branch}", cache=False)
-                protected = bool(isinstance(b, dict) and b.get("protected"))
-            except GitHubNotFound:
-                protected = False  # a new branch
-            result = await push_branch(
-                cfg, remote, full, branch,
-                default_branch=detail.default_branch, remote_protected=protected,
-            )  # fmt: skip
-            number, url, created = await _open_pr(maker, client, row, str(detail.default_branch))
-            values = {
-                "head_sha": result["head_sha"],
-                "pr_number": number,
-                "pr_url": url,
-                "result": {**result, "pr_created": created},
-            }
+            values = await _run_repo_op(maker, settings, client, cfg, remote, token, row)
         status, error = "done", None
     except Exception as exc:  # every failure ends the op; nothing is left `running`
         known = (GitOpRefused, PushRefused, GitError, OSError, ValueError)
@@ -404,6 +574,7 @@ async def run_op(
             actor_user_id=row.requested_by,
             details={
                 "op_id": str(oid),
+                "task": str(row.task_id) if row.task_id else None,
                 "repo": row.repo,
                 "branch": row.branch,
                 "head_sha": values.get("head_sha"),

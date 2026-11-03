@@ -118,6 +118,7 @@ class GitOpOut(BaseModel):
     id: uuid.UUID
     op: str
     repo: str
+    task_id: uuid.UUID | None = None
     branch: str | None
     title: str | None
     status: str
@@ -139,3 +140,9 @@ class GitRepoStateOut(BaseModel):
     coding_repo: str
     default_branch: str | None
     push_prefixes: list[str]
+
+
+class ApproveOut(CodeTaskOut):
+    """The approved task plus the queued `task` git op (poll GET /api/code/git/ops/{id})."""
+
+    git_op: GitOpOut

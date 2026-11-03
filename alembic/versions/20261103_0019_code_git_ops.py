@@ -1,4 +1,4 @@
-"""Coding agent git ops: agents.code_git_ops (clone / pull / push + PR queue).
+"""Coding agent git ops: agents.code_git_ops (clone / pull / push + PR / task approval queue).
 
 Additive only: one NEW table in the existing agents schema. Downgrade drops exactly it.
 Numbered 0019 on top of 0018 (another branch adds 0018 first).
@@ -27,6 +27,7 @@ def upgrade() -> None:
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("op", sa.String(length=8), nullable=False),
         sa.Column("repo", sa.String(length=201), nullable=False),
+        sa.Column("task_id", sa.Uuid(), nullable=True),
         sa.Column("branch", sa.String(length=200), nullable=True),
         sa.Column("title", sa.String(length=200), nullable=True),
         sa.Column("body", sa.Text(), nullable=True),
@@ -45,13 +46,17 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
-        sa.CheckConstraint("op IN ('clone','pull','push')", name=op.f("ck_code_git_ops_op")),
+        sa.CheckConstraint("op IN ('clone','pull','push','task')", name=op.f("ck_code_git_ops_op")),
         sa.CheckConstraint(
             "status IN ('queued','running','done','failed')", name=op.f("ck_code_git_ops_status")
         ),
         sa.ForeignKeyConstraint(
             ["requested_by"], ["core.users.id"],
             name=op.f("fk_code_git_ops_requested_by_users"), ondelete="SET NULL",
+        ),  # fmt: skip
+        sa.ForeignKeyConstraint(
+            ["task_id"], ["agents.code_tasks.id"],
+            name=op.f("fk_code_git_ops_task_id_code_tasks"), ondelete="SET NULL",
         ),  # fmt: skip
         sa.PrimaryKeyConstraint("id", name=op.f("pk_code_git_ops")),
         schema="agents",
