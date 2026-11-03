@@ -305,6 +305,10 @@ services:
     # container's env (every secret), so no worker may reach it. NO ports.
     networks: [aureon-docker]
     <<: *hardened
+    # The image's entrypoint renders /usr/local/etc/haproxy/haproxy.cfg from its template at
+    # every start, so the root filesystem cannot be read-only (it exits "Read-only file system").
+    # A tmpfs there would hide the template. Caps stay dropped; no-new-privileges stays on.
+    read_only: false
     # HAProxy runs as root inside (to read the socket) and binds 2375 (> 1024): no caps needed.
     tmpfs: [/run, /tmp]
     mem_limit: 64m
