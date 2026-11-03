@@ -36,7 +36,7 @@ from app.agents.trading.mt5.adapter import MT5Adapter
 from app.agents.trading.paper import accounting as acc
 from app.agents.trading.types import session_for
 from app.core.config import Settings
-from app.models.brokers import Mt5Symbol
+from app.models.brokers import MANUAL_MT5_SERVER, Mt5Symbol
 from app.models.trading import (
     BrokerAccount,
     Execution,
@@ -140,7 +140,11 @@ async def instrument_spec(db: AsyncSession, inst: Instrument) -> acc.Spec:
             inst.tick_size,
         )
     sym = await db.scalar(
-        select(Mt5Symbol).where(Mt5Symbol.trading_instrument_id == inst.id).limit(1)
+        select(Mt5Symbol)
+        .where(Mt5Symbol.trading_instrument_id == inst.id)
+        # A spec synced for a real broker server first; an admin-registered one otherwise.
+        .order_by(Mt5Symbol.server == MANUAL_MT5_SERVER, Mt5Symbol.server)
+        .limit(1)
     )
     if sym is None or sym.contract_size is None:
         raise acc.AccountingError(

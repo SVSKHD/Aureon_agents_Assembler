@@ -441,11 +441,19 @@ class Acceptance:
         conn = _json(self.s.post("/api/v1/github/connection/check"))
         check(conn.get("ok") is True, f"connection check: ok={conn.get('ok')} {conn.get('detail')}")
         repos = _json(self.s.get("/api/v1/github/repositories"))["items"]
-        check(repos, "no repositories visible")
+        synced = ""
+        if not repos:
+            # The list is the stored sync (GITHUB_SYNC_CRON, every 20 min; none yet right after
+            # the token is added): sync once now, as the UI's refresh does.
+            repos = _json(self.s.get("/api/v1/github/repositories", params={"refresh": "true"}))[
+                "items"
+            ]
+            synced = " (synced now)"
+        check(repos, "no repositories visible (check GITHUB_ALLOWED_OWNERS / _REPOS)")
         owner, name = repos[0]["full_name"].split("/", 1)
         tree = self.s.get(f"/api/v1/github/repositories/{owner}/{name}/tree")
         check(tree.status_code == 200, f"tree answered {tree.status_code}")
-        return f"{len(repos)} repo(s); browsed {owner}/{name}"
+        return f"{len(repos)} repo(s){synced}; browsed {owner}/{name}"
 
     def step_pr_merge_gate(self) -> str:
         if self.integrations()["github"]["status"] == "not_configured":

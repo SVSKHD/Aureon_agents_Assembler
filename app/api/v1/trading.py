@@ -26,7 +26,7 @@ from app.agents.trading.mt5.adapter import MT5Adapter
 from app.agents.trading.types import Broker, SignalSide, Timeframe
 from app.auth.deps import AdminRequired, CsrfProtected, Current, DbSession, SettingsDep
 from app.models.agents import Agent, AgentLog
-from app.models.brokers import Mt5Symbol
+from app.models.brokers import MANUAL_MT5_SERVER, Mt5Symbol
 from app.models.trading import (
     AiAnalysis,
     BacktestRun,
@@ -733,24 +733,26 @@ async def put_mt5_instrument(
             },
         ).returning(Instrument.id)
     )
-    if settings.MT5_SERVER:
-        spec = {
-            "digits": body.digits,
-            "point": body.tick_size,
-            "contract_size": body.contract_size,
-            "volume_min": body.volume_min,
-            "volume_step": body.volume_step,
-            "volume_max": body.volume_max,
-            "currency_profit": body.currency,
-            "trading_instrument_id": inst_id,
-            "raw": {"source": "admin"},
-        }
-        s_ins = insert(Mt5Symbol).values(server=settings.MT5_SERVER, symbol=sym, **spec)
-        await db.execute(
-            s_ins.on_conflict_do_update(
-                constraint="pk_symbols", set_={k: s_ins.excluded[k] for k in spec}
-            )
+    # Always stored: paper accounting needs contract_size even without an MT5 bot (it used to
+    # be dropped silently when MT5_SERVER was unset, so every MT5 paper intent got 422).
+    spec = {
+        "digits": body.digits,
+        "point": body.tick_size,
+        "contract_size": body.contract_size,
+        "volume_min": body.volume_min,
+        "volume_step": body.volume_step,
+        "volume_max": body.volume_max,
+        "currency_profit": body.currency,
+        "trading_instrument_id": inst_id,
+        "raw": {"source": "admin"},
+    }
+    server = settings.MT5_SERVER or MANUAL_MT5_SERVER
+    s_ins = insert(Mt5Symbol).values(server=server, symbol=sym, **spec)
+    await db.execute(
+        s_ins.on_conflict_do_update(
+            constraint="pk_symbols", set_={k: s_ins.excluded[k] for k in spec}
         )
+    )
     audit.record(
         db,
         "trading_mt5_instrument_set",
@@ -761,6 +763,8 @@ async def put_mt5_instrument(
             "lot_size": str(body.lot_size),
             "tick_size": str(body.tick_size),
             "currency": body.currency,
+            "contract_size": None if body.contract_size is None else str(body.contract_size),
+            "server": server,
         },
     )
     await db.commit()
