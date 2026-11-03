@@ -1,7 +1,8 @@
 # 03 — Ollama integration
 
 **Status:** done (revision `0003`). It talks only to the existing Ollama container over the private
-Docker network (`OLLAMA_BASE_URL`), with no external model fallback. Every endpoint below
+Docker network (`OLLAMA_BASE_URL`). Ollama is the default and the fallback; OpenRouter is an
+opt-in, filtered alternative per conversation ([25-openrouter.md](25-openrouter.md)). Every endpoint below
 requires a session cookie. `POST` and `DELETE` also require `X-CSRF-Token`
 (see [02-auth-and-finance.md](02-auth-and-finance.md)).
 
@@ -70,12 +71,13 @@ keep-alive comments: ignore them.
 
 | Event | Data | When |
 | --- | --- | --- |
-| `meta` | `{conversation_id, user_message_ids, model}` | First, always |
+| `meta` | `{conversation_id, user_message_ids, model, provider, …route}` | First, always (route fields: [25-openrouter.md](25-openrouter.md#stream-events)) |
 | `queued` | `{}` | Another generation holds the slot, so this request waits |
-| `start` | `{}` | The slot was acquired and Ollama was called |
+| `start` | `{}` | The slot was acquired and Ollama (or OpenRouter) was called |
+| `fallback` | `{provider, model, reason, local_only, reset}` | OpenRouter failed; local Ollama answers instead (OpenRouter routes only) |
 | `token` | `{content}` | Each streamed piece of the reply |
-| `done` | `{message_id, prompt_tokens, completion_tokens}` | Finished normally |
-| `error` | `{message_id, code, message}` | Ended early. `code` is `model_error`, `model_not_found`, `upstream_unavailable` or `timeout` |
+| `done` | `{message_id, prompt_tokens, completion_tokens, cost_usd, …route}` | Finished normally |
+| `error` | `{message_id, code, message, …route}` | Ended early. `code` is `model_error`, `model_not_found`, `upstream_unavailable`, `timeout`, `queue_full` or `fallback_unavailable` |
 | `: ping` | none | After `CHAT_HEARTBEAT_SECONDS` (15 s) of silence, for example during a cold model load |
 
 The stream always ends with exactly one `done` or `error`. Either way, the assistant message

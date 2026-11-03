@@ -147,7 +147,9 @@ Query: `GET /api/trading/risk-decisions?account_id=&signal_id=`. Users only see 
 - **Queue:** requests go on the bounded Redis list `research:ai:queue` (`RESEARCH_AI_QUEUE_MAX`; 429 when full). The
   API returns 503 when `RESEARCH_AI_MODEL` is not set.
 - **What the model sees:** the agent sends **only stored rows** (the signal with its inputs and risk decisions, or the
-  run's params, costs and metrics) to the **local Ollama** model. There is no external API. The system prompt forbids
+  run's params, costs and metrics) to the **local Ollama** model. OpenRouter is used only when
+  `AI_RESEARCH_EXTERNAL_ALLOWED=true` and the payload passes the classification filter
+  ([25-openrouter.md](25-openrouter.md)); otherwise, and on any error, it stays local. The system prompt forbids
   inventing figures and forbids order recommendations.
 - **Output:** a summary line plus the full text go to `trading.ai_analyses`; read them with
   `GET /api/trading/ai-analyses?signal_id=|backtest_run_id=`.

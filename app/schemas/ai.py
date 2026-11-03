@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -41,12 +42,25 @@ class ChatMessageIn(BaseModel):
     content: str = Field(min_length=1, max_length=32_000)
 
 
+Provider = Literal["ollama", "openrouter"]
+ConversationContext = Literal["general", "finance", "trading", "research"]
+
+
 class ChatRequest(BaseModel):
     """`messages` are the NEW turns only; for an existing conversation the server prepends
-    its stored history before calling Ollama."""
+    its stored history before calling the model.
+
+    `provider`/`model` pick who should answer (docs/25-openrouter.md). Both may be omitted:
+    an existing conversation keeps its own, a new one gets the server default (OpenRouter's
+    default model when it is usable, else the local default). A `model` without a
+    `provider` means OpenRouter only when it is one of the allowed OpenRouter ids.
+    `context` links a conversation to finance/trading/research (forces local inference);
+    a link only ever gets stricter."""
 
     conversation_id: uuid.UUID | None = None
-    model: str = Field(min_length=1, max_length=200)
+    provider: Provider | None = None
+    model: str | None = Field(default=None, min_length=1, max_length=200)
+    context: ConversationContext | None = None
     messages: list[ChatMessageIn] = Field(min_length=1, max_length=20)
     temperature: float | None = Field(default=None, ge=0, le=2)
     num_ctx: int | None = Field(default=None, ge=256)
@@ -70,12 +84,18 @@ class MessageOut(BaseModel):
     completion_tokens: int | None
     duration_ms: int | None
     created_at: datetime
+    # Assistant turns: who answered, why it was not OpenRouter (when that was picked), cost.
+    provider: str | None = None
+    fallback_reason: str | None = None
+    cost_usd: Decimal | None = None
 
 
 class ConversationOut(BaseModel):
     id: uuid.UUID
     title: str
     model: str
+    provider: str = "ollama"
+    context: str = "general"
     created_at: datetime
     updated_at: datetime
 
@@ -89,3 +109,49 @@ class ConversationPage(BaseModel):
 
 class ConversationDetail(ConversationOut):
     messages: list[MessageOut]
+
+
+class CatalogModel(BaseModel):
+    provider: Provider
+    id: str
+    label: str
+
+
+class CatalogTarget(BaseModel):
+    provider: Provider
+    model: str | None
+
+
+class OpenRouterStatus(BaseModel):
+    enabled: bool
+    # None = usable. Else disabled | not_configured | no_budget (why every turn stays local).
+    unavailable_reason: str | None
+    research_external_allowed: bool
+
+
+class ModelCatalog(BaseModel):
+    """Everything the SPA's picker offers. OpenRouter ids come from the server's allowlist;
+    the browser never talks to OpenRouter."""
+
+    default: CatalogTarget
+    local_fallback_model: str | None
+    ollama_reachable: bool
+    models: list[CatalogModel]
+    openrouter: OpenRouterStatus
+
+
+class AiUsage(BaseModel):
+    """Today's (UTC) OpenRouter spend against OPENROUTER_DAILY_LIMIT_USD."""
+
+    day: date
+    provider: Literal["openrouter"] = "openrouter"
+    spent_usd: Decimal
+    limit_usd: Decimal
+    remaining_usd: Decimal
+    prompt_tokens: int
+    completion_tokens: int
+    calls: int
+    failures: int
+    cap_reached: bool
+    # False when the counter could not be read (external calls then stay local).
+    available: bool = True

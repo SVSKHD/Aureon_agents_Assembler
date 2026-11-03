@@ -542,3 +542,22 @@ See [24-production-integration.md](24-production-integration.md). In order:
    (the password is prompted on the tty; nothing is passed in argv).
    Add `--skip-heavy` to avoid starting chat/image/coding jobs. Through Cloudflare instead,
    use `--base-url https://api.spasta.online` with `CF_ACCESS_CLIENT_ID/SECRET`.
+
+## 25 — OpenRouter (optional)
+
+See [25-openrouter.md](25-openrouter.md). Without these steps every chat stays on local
+Ollama, exactly as before.
+
+1. **Merge order.** Migration `0020` sits on top of `0019` (and `0018`) from the other open PRs. Merge
+   those first; the migrate one-shot applies `0020` on the next deploy.
+2. **Create a key** at openrouter.ai/keys. Give it a credit limit on the OpenRouter side too
+   (belt and braces with `OPENROUTER_DAILY_LIMIT_USD`).
+3. **Server `.env` only** (never the SPA's env, and never a `VITE_` variable):
+   `OPENROUTER_ENABLED=true`, `OPENROUTER_API_KEY=…`,
+   `OPENROUTER_DEFAULT_MODEL=google/gemini-2.5-flash-lite`,
+   `OPENROUTER_ALLOWED_MODELS=qwen/qwen3.7-flash,openai/gpt-4.1-nano`,
+   `OPENROUTER_DAILY_LIMIT_USD=0.50`. Keep `CHAT_DEFAULT_MODEL=qwen2.5:3b`: it is the fallback.
+4. **Restart the API** so it reads the settings, then check `GET /api/models/catalog`
+   (`default.provider` = `openrouter`) and `GET /api/ai/usage`.
+5. **The API container needs outbound HTTPS** to `openrouter.ai`. If egress is firewalled,
+   allow it. Otherwise every turn falls back with `unavailable`.

@@ -2,7 +2,9 @@
 
 Streaming design
 ----------------
-A *producer* task talks to Ollama (inside the request timeout) and puts events on a queue.
+A *producer* task talks to the model (inside the request timeout) and puts events on a queue.
+With an OpenRouter route (docs/25-openrouter.md) it tries OpenRouter first and, on any
+error, falls back to local Ollama in the same stream (a `fallback` event says so).
 The SSE generator (*consumer*) reads that queue, sending a keep-alive comment whenever it
 has been quiet for CHAT_HEARTBEAT_SECONDS. A long CPU model load therefore never looks idle
 to Nginx or Cloudflare, and a disconnected client is noticed within one heartbeat.
@@ -21,6 +23,7 @@ import time
 import uuid
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import delete, func, select, update
@@ -30,10 +33,14 @@ from starlette.responses import StreamingResponse
 from starlette.types import Receive, Scope, Send
 
 from app.agents.ollama.client import ModelInfo, OllamaClient, OllamaError
-from app.agents.ollama.limiter import Ticket
+from app.agents.ollama.limiter import GenerationLimiter, QueueFull, Ticket
+from app.agents.openrouter.client import OpenRouterClient, OpenRouterError
 from app.agents.registry import AgentRegistry
 from app.core.logging import get_logger
 from app.models.ai import Conversation, Message, ModelInventory
+from app.services import audit
+from app.services.ai_usage import UsageTracker
+from app.services.inference import LOCAL_ONLY_REASONS
 
 log = get_logger(__name__)
 
@@ -113,6 +120,49 @@ class ConversationService:
         )
         return bool(result.rowcount)  # type: ignore[attr-defined]
 
+    async def history(self, conv: Conversation) -> list[dict[str, str]]:
+        """Stored turns to re-send. Failed or cancelled assistant turns are kept for the
+        record, not re-sent."""
+        return [
+            {"role": m.role, "content": m.content}
+            for m in await self.messages(conv.id)
+            if m.role != "assistant" or m.status == "complete"
+        ]
+
+    async def store_turn(
+        self,
+        conv: Conversation | None,
+        new: list[dict[str, str]],
+        *,
+        model: str,
+        provider: str = "ollama",
+        context: str | None = None,
+    ) -> tuple[Conversation, list[int]]:
+        """Create the conversation if needed, record the picked provider/model (and a
+        stricter context), store the new turns. Returns (conversation, new message ids)."""
+        if conv is None:
+            first_user = next(m["content"] for m in new if m["role"] == "user")
+            conv = Conversation(
+                user_id=self.user_id,
+                title=" ".join(first_user.split())[:TITLE_LEN],
+                model=model,
+                provider=provider,
+                context=context or "general",
+            )
+            self.db.add(conv)
+            await self.db.flush()
+        else:
+            conv.model = model
+            conv.provider = provider
+            # A link only ever gets stricter: general -> finance/trading/research.
+            if context and context != "general" and conv.context == "general":
+                conv.context = context
+        rows = [Message(conversation_id=conv.id, role=m["role"], content=m["content"]) for m in new]
+        self.db.add_all(rows)
+        conv.updated_at = func.now()
+        await self.db.flush()
+        return conv, [r.id for r in rows]
+
     async def start_turn(
         self,
         conversation_id: uuid.UUID | None,
@@ -120,36 +170,22 @@ class ConversationService:
         new: list[dict[str, str]],
         max_history: int = 0,
     ) -> tuple[Conversation, list[dict[str, str]], list[int]] | None:
-        """Store the new turns and return (conversation, prompt for Ollama, new message ids).
+        """Store the new turns and return (conversation, prompt, new message ids).
         The prompt re-sends at most `max_history` stored turns (plus system ones; 0 = all).
 
         Returns None if conversation_id is not one of this user's conversations.
         """
-        if conversation_id is None:
-            first_user = next(m["content"] for m in new if m["role"] == "user")
-            conv = Conversation(
-                user_id=self.user_id, title=" ".join(first_user.split())[:TITLE_LEN], model=model
-            )
-            self.db.add(conv)
-            await self.db.flush()
-            history: list[dict[str, str]] = []
-        else:
-            found = await self.get(conversation_id)
-            if found is None:
+        conv: Conversation | None = None
+        history: list[dict[str, str]] = []
+        if conversation_id is not None:
+            conv = await self.get(conversation_id)
+            if conv is None:
                 return None
-            conv = found
-            # Failed or cancelled assistant turns are kept for the record, not re-sent.
-            history = [
-                {"role": m.role, "content": m.content}
-                for m in await self.messages(conv.id)
-                if m.role != "assistant" or m.status == "complete"
-            ]
-            conv.model = model
-        rows = [Message(conversation_id=conv.id, role=m["role"], content=m["content"]) for m in new]
-        self.db.add_all(rows)
-        conv.updated_at = func.now()
-        await self.db.flush()
-        return conv, trim_history(history, max_history) + new, [r.id for r in rows]
+            history = await self.history(conv)
+        conv, ids = await self.store_turn(
+            conv, new, model=model, provider=conv.provider if conv else "ollama"
+        )
+        return conv, trim_history(history, max_history) + new, ids
 
 
 async def sync_inventory(db: AsyncSession, models: list[ModelInfo]) -> None:
@@ -193,6 +229,25 @@ class _Turn:
     error: str | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    # Who is answering now (changes on a fallback) and why the turn is not on OpenRouter.
+    provider: str = "ollama"
+    model: str = ""
+    fallback_reason: str | None = None
+    cost_usd: Decimal | None = None
+
+
+@dataclass(slots=True)
+class _External:
+    """One OpenRouter attempt, for the audit row and the daily counter. Never content."""
+
+    model: str
+    started: float
+    outcome: str = "running"
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost_usd: Decimal | None = None
+    latency_ms: int | None = None
+    recorded: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +257,19 @@ class ChatJob:
     model: str
     prompt: list[dict[str, str]]
     options: dict[str, Any]
+    # Routing (docs/25-openrouter.md). `provider`/`model` are the first attempt.
+    provider: str = "ollama"
+    requested_provider: str = "ollama"
+    requested_model: str = ""
+    # Local Ollama model used when OpenRouter is skipped or fails (None = no fallback).
+    fallback_model: str | None = None
+    # Why the turn starts on Ollama although OpenRouter was requested (None = it did not).
+    route_reason: str | None = None
+    filter_categories: tuple[str, ...] = ()
+    temperature: float | None = None
+    max_tokens: int | None = None
+    user_id: uuid.UUID | None = None
+    client: audit.ClientInfo = field(default_factory=audit.ClientInfo)
 
 
 class ChatStream:
@@ -211,68 +279,175 @@ class ChatStream:
         *,
         ollama: OllamaClient,
         maker: async_sessionmaker[AsyncSession],
-        ticket: Ticket,
+        ticket: Ticket | None,
         timeout: float,
         heartbeat: float,
         registry: AgentRegistry | None = None,
+        limiter: GenerationLimiter | None = None,
+        openrouter: OpenRouterClient | None = None,
+        usage: UsageTracker | None = None,
     ) -> None:
         self.registry = registry
         self.job = job
         self.ollama = ollama
         self.maker = maker
+        # An OpenRouter route admits to the Ollama limiter only if it has to fall back.
         self.ticket = ticket
+        self.limiter = limiter
+        self.openrouter = openrouter
+        self.usage = usage
         self.timeout = timeout
         self.heartbeat = heartbeat
-        self.turn = _Turn()
+        self.turn = _Turn(provider=job.provider, model=job.model, fallback_reason=job.route_reason)
+        self.external: _External | None = None
         self._queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
         self._started = time.monotonic()
         self._persisted: int | None = None
+
+    def release(self) -> None:
+        if self.ticket is not None:
+            self.ticket.release()
+
+    # --- producers ----------------------------------------------------------------------
 
     async def _produce(self) -> None:
         q, turn = self._queue, self.turn
         try:
             async with asyncio.timeout(self.timeout):
-                if not self.ticket.slot_free():
-                    await q.put(("queued", None))
-                await self.ticket.acquire_slot()
-                await q.put(("start", None))
-                async for chunk in self.ollama.chat_stream(
-                    self.job.model, self.job.prompt, self.job.options
-                ):
-                    piece = (chunk.get("message") or {}).get("content") or ""
-                    if piece:
-                        turn.parts.append(piece)
-                        await q.put(("token", piece))
-                    if chunk.get("done"):
-                        turn.prompt_tokens = chunk.get("prompt_eval_count")
-                        turn.completion_tokens = chunk.get("eval_count")
-                        break
+                if turn.provider == "openrouter":
+                    if await self._produce_openrouter():
+                        turn.status = "complete"
+                        return
+                    if not self.job.fallback_model:
+                        turn.status, turn.error_code = "error", "fallback_unavailable"
+                        turn.error = "OpenRouter failed and no local model is available"
+                        return
+                    turn.provider, turn.model = "ollama", self.job.fallback_model
+                    await q.put(
+                        (
+                            "fallback",
+                            {
+                                "provider": "ollama",
+                                "model": turn.model,
+                                "reason": turn.fallback_reason,
+                                "local_only": False,
+                                "reset": True,
+                            },
+                        )
+                    )
+                await self._produce_ollama()
             turn.status = "complete"
         except TimeoutError:
             turn.status, turn.error_code = "timeout", "timeout"
             turn.error = f"generation exceeded {self.timeout:g}s"
         except OllamaError as exc:
             turn.status, turn.error_code, turn.error = "error", exc.code, exc.message
+        except QueueFull:
+            turn.status, turn.error_code = "error", "queue_full"
+            turn.error = "the local generation queue is full"
         finally:
             # Free the Ollama slot as soon as generation ends (or is cancelled).
-            self.ticket.release_slot()
+            if self.ticket is not None:
+                self.ticket.release_slot()
             q.put_nowait(("end", None))
+
+    async def _produce_ollama(self) -> None:
+        q, turn = self._queue, self.turn
+        if self.ticket is None:
+            if self.limiter is None:
+                raise QueueFull(0)
+            self.ticket = self.limiter.admit()
+        if not self.ticket.slot_free():
+            await q.put(("queued", None))
+        await self.ticket.acquire_slot()
+        await q.put(("start", None))
+        async for chunk in self.ollama.chat_stream(turn.model, self.job.prompt, self.job.options):
+            piece = (chunk.get("message") or {}).get("content") or ""
+            if piece:
+                turn.parts.append(piece)
+                await q.put(("token", piece))
+            if chunk.get("done"):
+                turn.prompt_tokens = chunk.get("prompt_eval_count")
+                turn.completion_tokens = chunk.get("eval_count")
+                break
+
+    async def _produce_openrouter(self) -> bool:
+        """True when OpenRouter answered in full. False after any OpenRouter error, with
+        turn.fallback_reason set and the partial text dropped (the SPA resets it)."""
+        q, turn = self._queue, self.turn
+        ext = self.external = _External(turn.model, time.monotonic())
+        if self.openrouter is None:
+            turn.fallback_reason = ext.outcome = "not_configured"
+            return False
+        await q.put(("start", None))
+        try:
+            async for chunk in self.openrouter.chat_stream(
+                turn.model,
+                self.job.prompt,
+                temperature=self.job.temperature,
+                max_tokens=self.job.max_tokens,
+            ):
+                if chunk.get("done"):
+                    u = chunk.get("usage") or {}
+                    ext.prompt_tokens = int(u.get("prompt_tokens") or 0)
+                    ext.completion_tokens = int(u.get("completion_tokens") or 0)
+                    ext.cost_usd = u.get("cost_usd")
+                    break
+                piece = str(chunk.get("content") or "")
+                if piece:
+                    turn.parts.append(piece)
+                    await q.put(("token", piece))
+        except OpenRouterError as exc:
+            ext.outcome = f"error:{exc.code}"
+            turn.fallback_reason = exc.code
+            turn.parts.clear()
+            await self._record_external()
+            log.warning("openrouter_fallback", reason=exc.code, status=exc.status)
+            return False
+        ext.outcome = "ok"
+        turn.prompt_tokens, turn.completion_tokens = ext.prompt_tokens, ext.completion_tokens
+        turn.cost_usd = ext.cost_usd
+        await self._record_external()
+        return True
+
+    async def _record_external(self) -> None:
+        ext = self.external
+        if ext is None or ext.recorded:
+            return
+        ext.recorded = True
+        ext.latency_ms = int((time.monotonic() - ext.started) * 1000)
+        if self.usage is not None and ext.outcome != "not_configured":
+            await self.usage.record(
+                cost_usd=ext.cost_usd,
+                prompt_tokens=ext.prompt_tokens,
+                completion_tokens=ext.completion_tokens,
+                failed=ext.outcome != "ok",
+            )
+
+    # --- persistence --------------------------------------------------------------------
 
     async def _persist(self) -> int:
         if self._persisted is not None:
             return self._persisted
         t = self.turn
+        ext = self.external
+        if ext is not None and not ext.recorded:  # cancelled or timed out mid-call
+            ext.outcome = "cancelled" if t.status in ("running", "cancelled") else t.status
+            await self._record_external()
         async with self.maker() as db, db.begin():
             msg = Message(
                 conversation_id=self.job.conversation_id,
                 role="assistant",
                 content="".join(t.parts),
-                model=self.job.model,
+                model=t.model,
                 status=t.status,
                 error=t.error,
                 prompt_tokens=t.prompt_tokens,
                 completion_tokens=t.completion_tokens,
                 duration_ms=int((time.monotonic() - self._started) * 1000),
+                provider=t.provider,
+                fallback_reason=t.fallback_reason,
+                cost_usd=t.cost_usd,
             )
             db.add(msg)
             await db.execute(
@@ -280,22 +455,44 @@ class ChatStream:
                 .where(Conversation.id == self.job.conversation_id)
                 .values(updated_at=func.now())
             )
-            if t.status == "complete":
+            if t.status == "complete" and t.provider == "ollama":
                 await db.execute(
                     update(ModelInventory)
-                    .where(ModelInventory.name == self.job.model)
+                    .where(ModelInventory.name == t.model)
                     .values(last_used_at=func.now())
                 )
             await db.flush()
+            if ext is not None and ext.outcome != "not_configured":
+                # Metadata only: never the prompt or the answer.
+                audit.record(
+                    db,
+                    "ai.external_call",
+                    self.job.client,
+                    actor_user_id=self.job.user_id,
+                    details={
+                        "provider": "openrouter",
+                        "model": ext.model,
+                        "conversation_id": str(self.job.conversation_id),
+                        "message_id": msg.id,
+                        "outcome": ext.outcome,
+                        "prompt_tokens": ext.prompt_tokens,
+                        "completion_tokens": ext.completion_tokens,
+                        "cost_usd": str(ext.cost_usd) if ext.cost_usd is not None else None,
+                        "latency_ms": ext.latency_ms,
+                        "fell_back_to": t.model if t.provider == "ollama" else None,
+                    },
+                )
             self._persisted = msg.id
         log.info(
             "chat_turn",
             conversation_id=str(self.job.conversation_id),
-            model=self.job.model,
+            model=t.model,
+            provider=t.provider,
+            fallback_reason=t.fallback_reason,
             status=t.status,
             chars=sum(map(len, t.parts)),
         )
-        if self.registry is not None:
+        if self.registry is not None and t.provider == "ollama":
             try:  # best-effort: never fail the chat over the registry
                 await self.registry.record_run(
                     "ollama",
@@ -306,13 +503,28 @@ class ChatStream:
                     details={
                         "conversation_id": str(self.job.conversation_id),
                         "message_id": msg.id,
-                        "model": self.job.model,
+                        "model": t.model,
                         "completion_tokens": t.completion_tokens,
                     },
                 )
             except Exception as exc:
                 log.warning("agent_run_record_failed", error=type(exc).__name__)
         return msg.id
+
+    # --- the SSE stream -----------------------------------------------------------------
+
+    def _route(self) -> dict[str, Any]:
+        """Who is answering and why, on `meta`, `done` and `error`."""
+        t = self.turn
+        return {
+            "provider": t.provider,
+            "model": t.model,
+            "requested_provider": self.job.requested_provider,
+            "requested_model": self.job.requested_model or self.job.model,
+            "fallback_reason": t.fallback_reason,
+            "local_only": t.fallback_reason in LOCAL_ONLY_REASONS,
+            "filter_categories": list(self.job.filter_categories),
+        }
 
     async def events(self) -> AsyncGenerator[str, None]:
         producer = asyncio.create_task(self._produce())
@@ -322,7 +534,7 @@ class ChatStream:
                 {
                     "conversation_id": str(self.job.conversation_id),
                     "user_message_ids": self.job.user_message_ids,
-                    "model": self.job.model,
+                    **self._route(),
                 },
             )
             while True:
@@ -335,6 +547,8 @@ class ChatStream:
                     break
                 if kind == "token":
                     yield sse("token", {"content": data})
+                elif kind == "fallback":
+                    yield sse("fallback", data)
                 else:
                     yield sse(kind, {})
             message_id = await asyncio.shield(self._persist())
@@ -346,11 +560,19 @@ class ChatStream:
                         "message_id": message_id,
                         "prompt_tokens": t.prompt_tokens,
                         "completion_tokens": t.completion_tokens,
+                        "cost_usd": str(t.cost_usd) if t.cost_usd is not None else None,
+                        **self._route(),
                     },
                 )
             else:
                 yield sse(
-                    "error", {"message_id": message_id, "code": t.error_code, "message": t.error}
+                    "error",
+                    {
+                        "message_id": message_id,
+                        "code": t.error_code,
+                        "message": t.error,
+                        **self._route(),
+                    },
                 )
         finally:
             if not producer.done():
@@ -367,9 +589,9 @@ class ChatStreamingResponse(StreamingResponse):
     """Always closes the event generator and releases the ticket, however the response ends
     (completion, client disconnect seen via receive() or via a failed send(), or shutdown)."""
 
-    def __init__(self, stream: ChatStream, on_close: Callable[[], None]) -> None:
+    def __init__(self, stream: ChatStream, on_close: Callable[[], None] | None = None) -> None:
         self._gen = stream.events()
-        self._on_close = on_close
+        self._on_close = on_close or stream.release
         super().__init__(
             self._gen,
             media_type="text/event-stream",

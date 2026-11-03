@@ -41,6 +41,8 @@ from app.core.logging import configure_logging, get_logger
 from app.db.session import build_engine, build_sessionmaker
 from app.models.trading import Instrument
 from app.services import research
+from app.services.ai_usage import UsageTracker
+from app.services.inference import ExternalGate, build_openrouter
 
 log = get_logger("worker.research")
 
@@ -108,8 +110,11 @@ class ResearchWorker:
         *,
         redis: Redis | None = None,
         ollama: OllamaClient | None = None,
+        external: ExternalGate | None = None,
     ) -> None:
         self.settings = settings
+        # Only when AI_RESEARCH_EXTERNAL_ALLOWED=true (docs/25-openrouter.md); else None.
+        self.external = external
         self.maker = maker
         self.adapters = adapters
         self.redis = redis
@@ -193,6 +198,7 @@ class ResearchWorker:
             req["kind"],
             uuid.UUID(req["id"]),
             limit_s=self.settings.RESEARCH_AI_TIMEOUT_SECONDS,
+            external=self.external,
         )
 
     # --- loops ---------------------------------------------------------------------------
@@ -301,7 +307,13 @@ async def main() -> int:
         read_timeout=settings.OLLAMA_READ_TIMEOUT,
         cache_ttl=0,
     )
-    worker = ResearchWorker(settings, maker, adapters, redis=redis, ollama=ollama)
+    openrouter = build_openrouter(settings) if settings.AI_RESEARCH_EXTERNAL_ALLOWED else None
+    external = (
+        ExternalGate(settings, openrouter, UsageTracker(redis)) if openrouter is not None else None
+    )
+    worker = ResearchWorker(
+        settings, maker, adapters, redis=redis, ollama=ollama, external=external
+    )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -344,6 +356,8 @@ async def main() -> int:
         if mt5 is not None:
             await mt5.aclose()
         await ollama.aclose()
+        if openrouter is not None:
+            await openrouter.aclose()
         await redis.aclose()
         await engine.dispose()
         log.info("research_worker_stopped")
