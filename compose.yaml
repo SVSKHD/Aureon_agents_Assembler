@@ -233,6 +233,36 @@ services:
   # Opt-in: `docker compose --profile coding up -d --build`.
   # CODE_REPOS paths must live under CODE_REPOS_ROOT (mounted read-write at the same path,
   # because git records worktrees and task branches inside each repo's .git).
+  # Gate for the coding profile only (it must not block the API): the repos dir exists and both
+  # it and the HDD worktree dir are writable by the worker's uid (10001). A missing repos dir is
+  # refused by the bind itself (create_host_path: false), so compose names the path.
+  coding-mount-check:
+    image: busybox:1.36.1
+    user: "10001"
+    command:
+      - sh
+      - -c
+      - >
+        test -f /mnt/spasta-data/${DATA_ROOT_MARKER:-.spasta-data-mounted}
+        || { echo "FATAL: /mnt/spasta-data is not mounted (marker missing)"; exit 1; };
+        for d in "${CODE_REPOS_ROOT:-/opt/private-ai/repos}" /mnt/spasta-data/code-worktrees; do
+        t="$$d/.aureon-write-check";
+        touch "$$t" 2>/dev/null && rm -f "$$t"
+        || { echo "FATAL: $$d is not writable by uid 10001 (docs/manual-setup.md, step 0)"; exit 1; };
+        done; echo "coding mounts OK"
+    volumes:
+      - *data-root
+      - type: bind
+        source: ${CODE_REPOS_ROOT:-/opt/private-ai/repos}
+        target: ${CODE_REPOS_ROOT:-/opt/private-ai/repos}
+        bind: { create_host_path: false }
+    network_mode: none
+    <<: *hardened
+    mem_limit: 32m
+    cpus: "0.1"
+    profiles: [coding]
+    restart: "no"
+
   coding-worker:
     build:
       context: .
@@ -259,7 +289,9 @@ services:
     mem_limit: 3g
     healthcheck: *worker-health
     stop_grace_period: 30s
-    depends_on: *after-api
+    depends_on:
+      <<: *after-api
+      coding-mount-check: { condition: service_completed_successfully }
     profiles: [coding]
     restart: unless-stopped
 
