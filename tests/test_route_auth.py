@@ -66,6 +66,13 @@ ADMIN = {
     ("GET", "/api/code/tasks/{task_id}/diff"),
     ("POST", "/api/code/tasks/{task_id}/approve"),
     ("POST", "/api/code/tasks/{task_id}/reject"),
+    ("GET", "/api/v1/github/actions/monitor"),
+    ("GET", "/api/code/git/repos"),
+    ("POST", "/api/code/git/clone"),
+    ("POST", "/api/code/git/pull"),
+    ("POST", "/api/code/git/push"),
+    ("GET", "/api/code/git/ops"),
+    ("GET", "/api/code/git/ops/{op_id}"),
     # Phase 15 GitHub foundation: admin only, GETs included (docs/18-github-foundation.md).
     ("GET", "/api/v1/github/connection"),
     ("POST", "/api/v1/github/connection/check"),

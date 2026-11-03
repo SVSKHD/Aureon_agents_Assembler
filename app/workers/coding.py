@@ -6,7 +6,10 @@
 - Registers as agent `coding` (kind "coding"), heartbeats, and stops taking work while an
   admin has it paused. Each task is recorded as an agent run.
 - At startup, tasks left `running` by a crash are marked failed (their worktree is removed).
-- Never pushes, never merges into a protected branch, never deploys: see app/services/coding.py.
+- Never merges, never deploys: see app/services/coding.py. Its only network git is the
+  git-ops loop (app/services/coding_git.py): clone / pull allowlisted repos and push feature
+  branches + open a PR, one op at a time under HEAVY_MODEL_LOCK, so no model-written test
+  process runs while a git child holds the token in its environment.
 - Also runs the self-repair loop (agent `repair`, docs/21-self-repair.md): one repair at a
   time. Both loops hold HEAVY_MODEL_LOCK for a whole task, so a code task and a repair never
   run a model (or a test suite) at the same time. Repairs reach GitHub only through the REST
@@ -35,7 +38,7 @@ from app.db.session import build_engine, build_sessionmaker
 from app.integrations.github import build_github_client
 from app.integrations.github.client import GitHubClient
 from app.models.agents import CodeTask
-from app.services import coding, incidents, repairs
+from app.services import coding, coding_git, incidents, repairs
 
 log = get_logger("worker.coding")
 CODING = AgentSpec("coding", "Coding agent", "coding")
@@ -96,6 +99,42 @@ async def repair_loop(
         state["repair"] = None
 
 
+async def git_loop(
+    maker: Any,
+    settings: Any,
+    github: GitHubClient | None,
+    registry: AgentRegistry,
+    stop: asyncio.Event,
+    state: dict[str, Any],
+) -> None:
+    while not stop.is_set():
+        oid = None
+        if not state["paused"]:
+            try:
+                oid = await coding_git.claim(maker)
+            except Exception as exc:  # DB hiccup: back off
+                log.warning("git_op_claim_failed", error=type(exc).__name__)
+        if oid is None:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), settings.CODE_POLL_SECONDS)
+            continue
+        state["git"] = str(oid)
+        started = time.monotonic()
+        status = "failed"
+        async with HEAVY_MODEL_LOCK:
+            with contextlib.suppress(Exception):  # e.g. the DB went away mid-op: keep looping
+                status = await coding_git.run_op(maker, settings, github, oid)
+        with contextlib.suppress(Exception):
+            await registry.record_run(
+                CODING.id,
+                "code_git_op",
+                "succeeded" if status == "done" else "failed",
+                int((time.monotonic() - started) * 1000),
+                details={"op_id": str(oid)},
+            )
+        state["git"] = None
+
+
 async def main() -> int:
     settings = get_settings()
     configure_logging(settings.LOG_LEVEL)
@@ -123,6 +162,7 @@ async def main() -> int:
             "running": state["running"],
             "repos": sorted(cfg.repos),
             "model": cfg.model,
+            "git_op": state.get("git"),
         }
 
     def on_paused(p: bool) -> None:
@@ -154,6 +194,10 @@ async def main() -> int:
         repair_loop(maker, settings, rcfg, ollama, github, registry, stop, state),
         name="repair-loop",
     )
+    await coding_git.recover(maker)
+    git_task = asyncio.create_task(
+        git_loop(maker, settings, github, registry, stop, state), name="git-ops-loop"
+    )
     flusher = incidents.start_exception_flusher(maker, settings, "coding-worker")
     try:
         while not stop.is_set():
@@ -164,6 +208,9 @@ async def main() -> int:
                 continue
             state["running"] = str(tid)
             started = time.monotonic()
+            # Rebuilt per task: a clone made since startup is a coding repo too.
+            with contextlib.suppress(ValueError):
+                cfg = coding.CodingConfig.from_settings(settings)
             async with HEAVY_MODEL_LOCK:
                 status = await coding.run_task(maker, cfg, ollama, tid)
             with contextlib.suppress(Exception):
@@ -179,6 +226,8 @@ async def main() -> int:
         stop.set()
         with contextlib.suppress(Exception, asyncio.CancelledError):
             await asyncio.wait_for(repair_task, 60)
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(git_task, 60)
         await incidents.stop_exception_flusher(flusher)
         await repair_hb.stop()
         await hb.stop()

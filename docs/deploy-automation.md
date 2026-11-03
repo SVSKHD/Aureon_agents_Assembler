@@ -26,7 +26,9 @@ GitHub (merge)                 server (pulls; nothing pushes to it)
 - **Deploy history in Spasta.** Each deploy is an agent run of the `deployer` agent
   (`python -m app.workers.deploy_record`, run in a one-shot api container): task
   `deploy:backend` / `deploy:frontend`, `details` = target, SHA, previous SHA, log path,
-  `rolled_back`. It shows in the agent monitor (`GET /api/agents`). Recording is best effort:
+  `rolled_back`. It shows in the agent monitor (`GET /api/agents`) and, next to the GitHub
+  Actions CI runs, in the Actions monitor (`GET /api/v1/github/actions/monitor`, the
+  "Deploys and CI" card of the control center's Actions module; docs/20). Recording is best effort:
   if the DB or image is unavailable the deploy still runs (logged as "not recorded").
 
 ### Backend: `scripts/deploy.sh`

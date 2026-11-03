@@ -261,6 +261,19 @@ class Settings(BaseSettings):
     CODE_MAX_FILE_BYTES: int = Field(default=400_000, ge=1000)
     CODE_MAX_PATCH_BYTES: int = Field(default=200_000, ge=1000)
     CODE_POLL_SECONDS: float = Field(default=3.0, gt=0)
+    # --- coding agent git ops (clone / pull / push + PR; docs/05-agents.md "Git ops") ---
+    # JSON list of GitHub "owner/repo" the coding worker may clone, pull and push feature
+    # branches to. Empty = none. Each must ALSO pass the GitHub allowlist (D-15-3).
+    GITHUB_CODING_REPO_ALLOWLIST: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # Where clones live (inside CODE_WORKTREE_ROOT's volume): <root>/<owner>/<repo>.
+    CODE_CLONE_ROOT: Path = Path("/mnt/spasta-data/code-worktrees/repos")
+    # Pushes are refused unless the branch starts with one of these (comma list).
+    CODE_PUSH_BRANCH_PREFIXES: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["aureon/", "feat/"]
+    )
+    # The git host clones and pushes talk to (https only; the token goes via GIT_ASKPASS).
+    GITHUB_GIT_URL: str = "https://github.com"
+    CODE_GIT_TIMEOUT_SECONDS: float = Field(default=600.0, gt=0)
 
     # --- paper trading (Trading Phase F, docs/15-paper-trading.md) ---
     # Notional starting equity of every PAPER account, in its base currency.
@@ -363,6 +376,14 @@ class Settings(BaseSettings):
     GITHUB_WEBHOOK_POLL_SECONDS: float = Field(default=5.0, gt=0, le=300)
     GITHUB_ACTIONS_SYNC_CRON: str = "*/15 * * * *"
     GITHUB_ACTIONS_SYNC_RUNS: int = Field(default=30, ge=1, le=100)
+    # Actions monitor (docs/20, "Actions monitor"): which repo + branch each host deploy
+    # target (deploy_record --target) builds, as JSON {"target": "owner/repo@branch"}.
+    DEPLOY_TARGET_REPOS: Annotated[dict[str, str], NoDecode] = Field(
+        default_factory=lambda: {
+            "backend": "SVSKHD/Aureon_agents_Assembler@main",
+            "frontend": "SVSKHD/ASTRA-FRONTEND@dev01",
+        }
+    )
 
     # --- Approval gate (docs/19-github-issues-prs.md; grown by the Phase 20 engine). ---
     # A pending approval request expires this many minutes after it was created.
@@ -513,6 +534,8 @@ class Settings(BaseSettings):
         "GITHUB_LOG_HOSTS",
         "GITHUB_DISPATCH_ALLOWLIST",
         "GITHUB_PROD_WORKFLOWS",
+        "GITHUB_CODING_REPO_ALLOWLIST",
+        "DEPLOY_TARGET_REPOS",
         "CLAUDE_CLI_ARGS",
         mode="before",
     )
@@ -529,6 +552,7 @@ class Settings(BaseSettings):
                 "GITHUB_LOG_HOSTS",
                 "GITHUB_DISPATCH_ALLOWLIST",
                 "GITHUB_PROD_WORKFLOWS",
+                "GITHUB_CODING_REPO_ALLOWLIST",
                 "CLAUDE_CLI_ARGS",
             )
             return [] if info.field_name in lists else {}
@@ -550,6 +574,7 @@ class Settings(BaseSettings):
         "DHAN_BACKFILL_TIMEFRAMES",
         "RESEARCH_EMA_PERIODS",
         "CODE_PROTECTED_BRANCHES",
+        "CODE_PUSH_BRANCH_PREFIXES",
         "INCIDENT_RESTART_CONTAINERS",
         "CLAUDE_CLI_ENV_PASSTHROUGH",
         "CLAUDE_REVIEW_INTERNAL_DOMAINS",
