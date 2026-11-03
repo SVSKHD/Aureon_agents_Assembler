@@ -333,3 +333,36 @@ def test_acceptance_script_has_16_steps_and_no_credential_args() -> None:
     src = path.read_text()
     assert "--password" not in src and "--email" not in src  # env/stdin only
     assert mod.main(["--base-url", "http://127.0.0.1:1"]) == 2  # no email set -> refuses
+
+
+def _nginx_body(name: str) -> str:
+    conf = (ROOT / "deploy" / "nginx" / name).read_text()
+    return "\n".join(line.split("#", 1)[0] for line in conf.splitlines())
+
+
+def test_nginx_tailscale_host_serves_spa_and_same_origin_api() -> None:
+    body = _nginx_body("spasta-tailscale.conf")
+    assert "listen 127.0.0.1:8088;" in body and "default_server" not in body
+    assert "server_name svskhd8.taila439d5.ts.net;" in body
+    assert "root /srv/www/spasta/current;" in body
+    assert "include /opt/private-ai/aureon/deploy/nginx/security-headers.conf;" in body
+    assert "include /opt/private-ai/aureon/deploy/nginx/aureon-api.conf;" in body
+    assert "try_files $uri $uri/ /index.html;" in body
+    # No upstream of its own: /api/ goes only through aureon-api.conf (-> 127.0.0.1:8000).
+    assert "proxy_pass" not in body
+    api = _nginx_body("aureon-api.conf")
+    assert re.search(r"location = /api/health/ready \{\s*return 404;", api)
+    assert set(re.findall(r"proxy_pass\s+(\S+);", api)) == {"http://127.0.0.1:8000"}
+    assert "connect-src 'self'" in _nginx_body("security-headers.conf")
+
+
+def test_nginx_unknown_host_on_8088_gets_444() -> None:
+    body = _nginx_body("default-8088.conf")
+    assert "listen 127.0.0.1:8088 default_server;" in body
+    assert "return 444;" in body and "location" not in body
+    # Only one default_server for the port, and every listener stays on loopback.
+    confs = sorted((ROOT / "deploy" / "nginx").glob("*.conf"))
+    assert sum("default_server" in _nginx_body(p.name) for p in confs) == 1
+    for p in confs:
+        for addr in re.findall(r"^\s*listen\s+([^\s;]+)", _nginx_body(p.name), re.M):
+            assert addr == "127.0.0.1:8088", (p.name, addr)
