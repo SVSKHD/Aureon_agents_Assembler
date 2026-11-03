@@ -27,6 +27,14 @@ The steps below assume a slightly different box. On the Spasta server:
   move to `aureon_migrator`), then switch `.env.migrate` to `aureon_migrator`.
 - **HDD permissions.** The API (uid 10001) must be able to write `DATA_ROOT` itself (prod
   check): `sudo chgrp 10001 /mnt/spasta-data && sudo chmod 775 /mnt/spasta-data`.
+- **Coding repos dir.** The coding worker bind-mounts `CODE_REPOS_ROOT` (default
+  `/opt/private-ai/repos`) with `create_host_path: false`, so it must exist before
+  `docker compose --profile coding up`: owner uid 10001 (the containers' `aureon` user), group
+  `svskhd8`, mode `2770` (setgid, so files you add keep the group). Step 0 below creates it. Clones
+  made through the git-ops API go to `CODE_CLONE_ROOT` on the HDD
+  (`/mnt/spasta-data/code-worktrees/repos`), which the worker creates itself. The
+  `coding-mount-check` one-shot (profile `coding`) checks both are writable by uid 10001
+  before the worker starts, and prints `FATAL: … not writable` if not.
 - **Nginx** is the host package (`apt install nginx`), not the frontend container. Enable
   `deploy/nginx/spasta-online.conf` and `deploy/nginx/api-spasta-online.conf`; both listen on
   `127.0.0.1:8088`, where cloudflared sends both hostnames. Also enable
@@ -111,6 +119,8 @@ Run these in order. Each step is copy-pasteable, and each one is safe to re-run.
    findmnt /mnt/spasta-data && test -f /mnt/spasta-data/.spasta-data-mounted && echo HDD-OK
    sudo chown -R 999:999 /mnt/spasta-data/redis
    sudo install -d -o svskhd8 -g svskhd8 -m 700 /mnt/spasta-data/backups /mnt/spasta-data/backups/aureon
+   # Only with the coding profile: the repos the coding worker works in (uid 10001 = aureon).
+   sudo install -d -o 10001 -g svskhd8 -m 2770 /opt/private-ai/repos
    ```
 
 1. **Install the stack unit**, which runs `docker compose up -d` after `docker.service` and the

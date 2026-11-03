@@ -13,7 +13,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ROOT / "compose.yaml"
-ONE_SHOTS = {"mount-check", "migrate"}
+ONE_SHOTS = {"mount-check", "coding-mount-check", "migrate"}
 WORKERS = {
     "scheduler",
     "dhan-feed",
@@ -72,7 +72,7 @@ def test_hardening_on_every_service(services: dict[str, dict[str, Any]]) -> None
         assert s.get("mem_limit") and s.get("cpus"), name
         opts = s["logging"]["options"]
         assert s["logging"]["driver"] == "json-file" and opts["max-size"] and opts["max-file"], name
-        if name != "mount-check":
+        if name not in ("mount-check", "coding-mount-check"):
             assert s.get("tmpfs"), name
 
 
@@ -106,6 +106,19 @@ def test_start_order(services: dict[str, dict[str, Any]]) -> None:
     for w in WORKERS:
         assert deps(w)["api"] == "service_healthy", w
         assert deps(w)["migrate"] == "service_completed_successfully", w
+    # The coding worker also waits for its own mount gate (repos dir + HDD worktrees writable).
+    assert deps("coding-worker")["coding-mount-check"] == "service_completed_successfully"
+    assert "coding-mount-check" not in deps("api")  # never blocks the API
+
+
+def test_coding_mount_check_is_scoped_and_unprivileged(services: dict[str, dict[str, Any]]) -> None:
+    gate = services["coding-mount-check"]
+    assert tuple(gate.get("profiles", ())) == ("coding",)
+    assert gate["network_mode"] == "none"
+    assert gate["user"] == "10001"  # the workers' uid: the check is what the worker can write
+    worker_mounts = [v for v in services["coding-worker"]["volumes"] if isinstance(v, dict)]
+    for v in worker_mounts:
+        assert v in gate["volumes"], v  # same binds, so the gate checks what the worker gets
 
 
 def test_no_docker_socket_except_the_read_only_proxy(services: dict[str, dict[str, Any]]) -> None:
