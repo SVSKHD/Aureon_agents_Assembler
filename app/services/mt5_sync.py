@@ -95,13 +95,19 @@ def _level(event: str) -> str:
 
 
 async def _heartbeat(
-    db: AsyncSession, status: BotStatus, adapter: MT5Adapter, settings: Settings
+    db: AsyncSession,
+    status: BotStatus,
+    *,
+    ok: bool,
+    why: str | None,
+    source: str,
+    stale_after_s: float,
+    heartbeat_at: datetime,
 ) -> None:
-    ok, why = adapter.assess(status)
     details = {
-        "source": adapter.source.kind,
+        "source": source,
         "generated_at": status.generated_at.isoformat(),
-        "stale_after_s": settings.MT5_STALE_SECONDS,
+        "stale_after_s": stale_after_s,
         "mode": status.bot.mode,
         "symbols": status.bot.symbols,
         "exec_tf": status.bot.exec_tf,
@@ -132,7 +138,7 @@ async def _heartbeat(
         "host": "aureon-mt5-bot",
         "pid": status.bot.pid,
         "details": details,
-        "last_heartbeat_at": status.generated_at,
+        "last_heartbeat_at": heartbeat_at,
         "last_activity_at": func.now(),
     }
     ins = insert(Agent).values(**values)
@@ -277,7 +283,7 @@ async def _account(db: AsyncSession, settings: Settings) -> BrokerAccount | None
 async def _account_rows(
     db: AsyncSession,
     status: BotStatus,
-    adapter: MT5Adapter,
+    ok: bool,
     account: BrokerAccount,
     settings: Settings,
 ) -> int:
@@ -302,7 +308,6 @@ async def _account_rows(
             },
         )
     )
-    ok, _ = adapter.assess(status)
     if not ok:  # a stale or disconnected bot's positions are not "as of now"
         return 0
     positions = positions_from(status, account.account_id, account.base_currency)
@@ -332,16 +337,58 @@ async def _account_rows(
     return len(positions)
 
 
+async def apply_status(
+    db: AsyncSession,
+    status: BotStatus,
+    settings: Settings,
+    *,
+    ok: bool,
+    why: str | None,
+    source: str,
+    stale_after_s: float,
+    heartbeat_at: datetime,
+) -> dict[str, Any]:
+    """Write one status/v1 document (pulled, or the v1 part of a push) inside the caller's
+    transaction: heartbeat, journal logs, signals, terminal and positions."""
+    await _heartbeat(
+        db,
+        status,
+        ok=ok,
+        why=why,
+        source=source,
+        stale_after_s=stale_after_s,
+        heartbeat_at=heartbeat_at,
+    )
+    logs = await _logs(db, status)
+    signals = await _signals(db, status)
+    account = await _account(db, settings)
+    positions = await _account_rows(db, status, ok, account, settings) if account else None
+    return {
+        "logs_inserted": logs,
+        "signals": signals,
+        "positions": positions,
+        "account": "registered" if account else "not registered (MT5_ACCOUNT_ID)",
+    }
+
+
 async def sync_status(
     maker: async_sessionmaker[AsyncSession], adapter: MT5Adapter, settings: Settings
 ) -> dict[str, Any]:
     status = await adapter.status()  # raises BrokerError / StatusInvalid: nothing is written
+    ok, why = adapter.assess(status)
     async with maker() as db, db.begin():
-        await _heartbeat(db, status, adapter, settings)
-        logs = await _logs(db, status)
-        signals = await _signals(db, status)
-        account = await _account(db, settings)
-        positions = await _account_rows(db, status, adapter, account, settings) if account else None
+        res = await apply_status(
+            db,
+            status,
+            settings,
+            ok=ok,
+            why=why,
+            source=adapter.source.kind,
+            stale_after_s=settings.MT5_STALE_SECONDS,
+            heartbeat_at=status.generated_at,  # a bot that stops exporting goes stale
+        )
+    logs, signals, positions = res["logs_inserted"], res["signals"], res["positions"]
+    account = res["account"] == "registered"
     out = {
         "generated_at": status.generated_at.isoformat(),
         "age_s": int(status.age().total_seconds()),
@@ -363,9 +410,19 @@ async def sync_status(
 
 def performance(status: BotStatus, now: datetime | None = None) -> dict[str, Any]:
     """Per-symbol stats from journal `exit` events (points) and ema921e trade rows (USD)."""
+    return performance_from(status.events, status.ema921e_trades, status.generated_at, now)
+
+
+def performance_from(
+    events: list[dict[str, Any]],
+    ema921e_trades: list[dict[str, Any]],
+    window_end: datetime,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """`performance` over any event list (the pull export's window or stored pushed events)."""
     now = now or datetime.now(UTC)
     by_symbol: dict[str, dict[str, Any]] = {}
-    for ev in status.events:
+    for ev in events:
         if ev.get("event") != "exit" or ev.get("points") is None:
             continue
         try:
@@ -385,7 +442,7 @@ def performance(status: BotStatus, now: datetime | None = None) -> dict[str, Any
         s["win_rate"] = _jsonable(s["win_rate"])
     e_pnl = Decimal(0)
     e_n = 0
-    for row in status.ema921e_trades:
+    for row in ema921e_trades:
         raw = row.get("pnl_usd")
         if raw in (None, ""):
             continue
@@ -394,11 +451,11 @@ def performance(status: BotStatus, now: datetime | None = None) -> dict[str, Any
             e_n += 1
         except ArithmeticError:
             continue
-    first = min((e["t"] for e in status.events if isinstance(e.get("t"), int)), default=None)
+    first = min((e["t"] for e in events if isinstance(e.get("t"), int)), default=None)
     return {
         "source": "calculated",
         "window_start": datetime.fromtimestamp(first, UTC).isoformat() if first else None,
-        "window_end": status.generated_at.isoformat(),
+        "window_end": window_end.isoformat(),
         "exits_by_symbol": by_symbol,
         "ema921e": {"trades": e_n, "net_usd": _jsonable(e_pnl)} if e_n else None,
         "note": "points are price points as the bot reports them; no MT5 deal history is read",

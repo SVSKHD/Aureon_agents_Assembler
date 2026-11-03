@@ -30,6 +30,7 @@ from app.services import incidents
 from app.services.chat import chat_options
 from app.services.claude_review import ReviewRunner
 from app.services.health import HealthService
+from app.services.mt5_ingest import DbIngestStore
 
 log = get_logger(__name__)
 
@@ -96,6 +97,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         mt5 = build_mt5_adapter(settings)
         if mt5 is not None:
             app.state.trading_adapters["mt5"] = mt5
+        # MT5 push ingest (docs/12-mt5-adapter.md §3): POST /api/trading/mt5/ingest stores here.
+        app.state.mt5_ingest_store = DbIngestStore(app.state.sessionmaker)
         # GitHub REST client (docs/18-github-foundation.md); None without GITHUB_TOKEN.
         github = build_github_client(settings)
         app.state.github = github

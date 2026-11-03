@@ -41,21 +41,7 @@ class MT5Adapter(BrokerAdapter):
 
     def assess(self, status: BotStatus, now: datetime | None = None) -> tuple[bool, str | None]:
         """(ok, why-not). ok = fresh export, not a dry run, and every agent connected to MT5."""
-        now = now or datetime.now(UTC)
-        age = status.age(now)
-        if age > self.stale_after:
-            return False, f"bot export is stale ({int(age.total_seconds())} s old)"
-        if status.bot.dry:
-            return False, "bot is running --dry (no MT5 terminal)"
-        if not status.agents:
-            return False, "bot reports no symbol agents"
-        down = sorted(s for s, a in status.agents.items() if a.mt5 != "CONNECTED")
-        if down:
-            return False, "MT5 not connected for " + ", ".join(down)
-        dead = sorted(s for s, a in status.agents.items() if a.alive is False)
-        if dead:
-            return False, "agent thread not alive for " + ", ".join(dead)
-        return True, None
+        return assess_status(status, self.stale_after, now)
 
     async def health(self) -> AdapterHealth:
         now = datetime.now(UTC)
@@ -97,6 +83,28 @@ class MT5Adapter(BrokerAdapter):
 
     async def aclose(self) -> None:
         await self.source.aclose()
+
+
+def assess_status(
+    status: BotStatus, stale_after: timedelta | None, now: datetime | None = None
+) -> tuple[bool, str | None]:
+    """Shared by the pull adapter and the push ingest. `stale_after=None` skips the age check
+    (a push is fresh by definition; push staleness is the time since the last push)."""
+    now = now or datetime.now(UTC)
+    age = status.age(now)
+    if stale_after is not None and age > stale_after:
+        return False, f"bot export is stale ({int(age.total_seconds())} s old)"
+    if status.bot.dry:
+        return False, "bot is running --dry (no MT5 terminal)"
+    if not status.agents:
+        return False, "bot reports no symbol agents"
+    down = sorted(s for s, a in status.agents.items() if a.mt5 != "CONNECTED")
+    if down:
+        return False, "MT5 not connected for " + ", ".join(down)
+    dead = sorted(s for s, a in status.agents.items() if a.alive is False)
+    if dead:
+        return False, "agent thread not alive for " + ", ".join(dead)
+    return True, None
 
 
 def positions_from(status: BotStatus, account_id: str, currency: str) -> list[Position]:

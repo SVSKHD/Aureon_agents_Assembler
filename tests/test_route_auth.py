@@ -25,9 +25,11 @@ PUBLIC = {
     ("GET", "/api/public/forex"),
     # GitHub webhook receiver: authenticated by its HMAC signature instead (docs/20).
     ("POST", "/api/v1/github/webhooks"),
+    # MT5 bot push: machine-to-machine, bearer MT5_INGEST_TOKEN instead (docs/12 §3).
+    ("POST", "/api/trading/mt5/ingest"),
 }
 # Public routes that change state, each with its own authentication.
-PUBLIC_UNSAFE = {"/api/auth/login", "/api/v1/github/webhooks"}
+PUBLIC_UNSAFE = {"/api/auth/login", "/api/v1/github/webhooks", "/api/trading/mt5/ingest"}
 # Public routes that must carry the per-IP limiter dependency.
 PUBLIC_RATE_LIMITED = {p for m, p in PUBLIC if p.startswith("/api/public/")}
 

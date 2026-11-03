@@ -66,10 +66,19 @@ def test_mt5_routes_are_read_only(settings: Settings) -> None:
     routes = {
         (m, r.path) for r in api_routes(create_app(settings)) if "/mt5" in r.path for m in r.methods
     }
-    # GET the status; PUT registers a contract spec in OUR database (admin + CSRF).
+    # GET the status; PUT registers a contract spec in OUR database (admin + CSRF); POST
+    # ingest stores the bot's push (bearer token). Nothing sends anything to the bot or MT5.
     assert routes == {
         ("GET", "/api/trading/mt5/status"),
         ("PUT", "/api/trading/mt5/instruments/{symbol}"),
+        ("POST", "/api/trading/mt5/ingest"),
+        ("GET", "/api/trading/mt5/bot-status"),
+        ("GET", "/api/trading/mt5/market"),
+        ("GET", "/api/trading/mt5/positions"),
+        ("GET", "/api/trading/mt5/signals"),
+        ("GET", "/api/trading/mt5/failures"),
+        ("GET", "/api/trading/mt5/strategy"),
+        ("GET", "/api/trading/mt5/report"),
     }
 
 

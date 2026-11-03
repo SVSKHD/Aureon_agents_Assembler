@@ -535,3 +535,50 @@ See [23-approval-engine.md](23-approval-engine.md).
   serve loop died on it (no more jobs processed), the research AI lane would too, and the
   webhook worker logged it as an outage. `ReviewRunner.drain()` yields after each gather so a
   finished task's done-callback can run (it could spin forever).
+
+## 23 — MT5 push ingest (aureon.mt5.push/v1)
+
+- **D-23-1: push, not only pull.** The bot POSTs one `aureon.mt5.push/v1` document per status
+  poll to `POST /api/trading/mt5/ingest`. It is a superset of `aureon.mt5.status/v1`, so the
+  v1 part goes through the SAME `mt5_sync.apply_status` as the pull job (heartbeat, agent_logs,
+  trading_signals, terminals, positions). The pull path is unchanged; configure one or the
+  other (both write the same `mt5-bot` heartbeat row).
+- **D-23-2: bearer token, no session/CSRF, exact-path Access exemption.** `MT5_INGEST_TOKEN`
+  (unset = 503; prod refuses < 32 chars) compared with `hmac.compare_digest` even for a wrong
+  scheme. The route has no session dependency (pinned in tests/test_route_auth.py as the only
+  public trading route) and is exempt from the optional Cloudflare Access middleware by EXACT
+  path (`MACHINE_PATHS`), not by prefix. CSRF in this app is a per-route dependency, so no
+  middleware list had to change.
+- **D-23-3: caps before parsing.** Content-Length and the streamed body are capped at 2 MiB
+  (`MT5_INGEST_MAX_BYTES`, same as nginx `client_max_body_size 2m`, so no nginx change); gzip
+  is decompressed with an output limit (8 MiB), so a gzip bomb stops at the cap (413). Other
+  encodings answer 415.
+- **D-23-4: idempotency in Postgres, not Redis.** `mt5.pushes.push_id` is the PK (INSERT ...
+  ON CONFLICT DO NOTHING; a repeat answers 200 `{"duplicate": true}`) and `mt5.events.id`
+  (the bot's opaque sha1) is the PK for per-event dedupe. One transaction, so a push is either
+  fully stored or not at all and the bot simply retries. Redis is only the rate limiter
+  (`BrokerRateLimiter`, 30/min), which fails open (the token still gates the route).
+- **D-23-5: heartbeat = receive time.** For pushes `agents.agents.last_heartbeat_at` is the
+  server's receive time (not the bot's `generated_at`), with `details.stale_after_s =
+  MT5_STALE_HEARTBEAT_SECONDS`. Stale is computed on read (status card, failures, positions)
+  and stored by the `mt5-ingest-watch` job every minute as a `stale_heartbeat` failure.
+- **D-23-6: failures are rows with an open/resolved lifecycle.** One open row per (kind,
+  symbol) via a partial unique index; a recurrence bumps last_seen/count. Condition kinds
+  (mt5_disconnected, stale_ticks, discord_error, stale_heartbeat) resolve on the first push
+  that no longer shows them; occurrence kinds (exception, guardian_error) resolve after
+  `MT5_FAILURE_QUIET_SECONDS`. Only events first seen in a push are classified, so re-sent
+  tracebacks are not double counted.
+- **D-23-7: candles in `mt5.candles`, not `trading.market_candles`.** The latter needs a
+  registered instrument (FK) and is the broker feed's table; the bot's bars carry its own
+  EMA values. Times are converted from the MT5 server clock to UTC with the agent's offset_h.
+  Retention: 7 days (candles), 30 days (events, push ids, resolved failures).
+- **D-23-8: lenient schema.** Only `schema`, `push_id`, `generated_at` and the v1 basics are
+  strict; extra keys, unknown event names, signal kinds and guardian phases pass through
+  (bot PR #38: phase pre|protect|secured|ride, leg_phase A/B, reentry/partial/locked kinds).
+  Malformed numbers in an `ema` map become null instead of failing the push.
+- **D-23-9: live updates through the existing SSE.** `/api/trading/stream` emits `mt5` when the
+  latest push or the open failures change; the page refetches. No new stream, no pub/sub.
+- **D-23-10: migration id 0018 on top of 0017.** Additive: five new tables in the existing
+  `mt5` schema, created IF NOT EXISTS; downgrade drops only those.
+- **D-23-11: still read-only.** No route here can place, modify or close an order or change an
+  account's mode; tests pin the `/mt5` route set and the no-`order_send` rule still holds.
