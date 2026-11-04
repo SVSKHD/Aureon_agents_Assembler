@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 import structlog
@@ -24,10 +24,29 @@ _BEARER = re.compile(r"(?P<p>\b(?:bearer|token)\s+)[A-Za-z0-9._~+/=-]{8,}", re.I
 _GITHUB_TOKEN = re.compile(r"github_pat_[A-Za-z0-9_]{8,}|gh[pousr]_[A-Za-z0-9]{8,}")
 # OpenRouter (sk-or-v1-...), OpenAI and Anthropic-style API keys in free text.
 _API_KEY = re.compile(r"\bsk-(?:or-v1-|proj-|ant-)?[A-Za-z0-9_-]{16,}")
+# Discord webhook URLs carry their credential in the path.
+_DISCORD_WEBHOOK = re.compile(
+    r"(?P<p>discord(?:app)?\.com/api/webhooks/\d+/)[A-Za-z0-9._-]+", re.IGNORECASE
+)
 _MAX_DEPTH = 6
+# Secret VALUES known to this process (core.app_settings and their .env fallbacks), replaced
+# wherever they appear: a token's shape is not always recognisable, its exact value is.
+_known_secrets: tuple[str, ...] = ()
+_MIN_SECRET_LEN = 8
+
+
+def register_secret_values(values: Iterable[str | None]) -> None:
+    """Replace the set of exact secret values scrubbed from logs, incidents and AI briefs."""
+    global _known_secrets
+    found = {v.strip() for v in values if v and len(v.strip()) >= _MIN_SECRET_LEN}
+    _known_secrets = tuple(sorted(found, key=len, reverse=True))
 
 
 def _scrub_text(value: str) -> str:
+    for secret in _known_secrets:
+        if secret in value:
+            value = value.replace(secret, REDACTED)
+    value = _DISCORD_WEBHOOK.sub(lambda m: f"{m['p']}{REDACTED}", value)
     value = _URL_CREDS.sub(lambda m: f"{m['scheme']}{m['user']}:{REDACTED}@", value)
     value = _BEARER.sub(lambda m: f"{m['p']}{REDACTED}", value)
     value = _GITHUB_TOKEN.sub(REDACTED, value)
@@ -52,6 +71,15 @@ def _scrub(value: Any, depth: int = 0) -> Any:
 def scrub(value: Any) -> Any:
     """Public redaction helper: secret-looking keys masked, credentials in text removed."""
     return _scrub(value)
+
+
+def scrub_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Chat messages with known secret values and credential shapes removed from their text,
+    applied to every prompt before it reaches a model (OpenRouter or Ollama)."""
+    return [
+        {**m, "content": _scrub_text(m["content"])} if isinstance(m.get("content"), str) else m
+        for m in messages
+    ]
 
 
 def redact_secrets(

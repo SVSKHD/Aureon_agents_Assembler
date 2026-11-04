@@ -29,11 +29,11 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.registry import AgentRegistry, AgentSpec, Heartbeat
-from app.core.config import Settings, get_settings
+from app.core.config import Settings
 from app.core.logging import configure_logging, get_logger
 from app.db.session import build_engine, build_sessionmaker
+from app.services import app_settings, incidents
 from app.services import github_webhooks as hooks
-from app.services import incidents
 from app.services.github_webhooks import WorkflowFailure, on_workflow_failed
 
 log = get_logger("worker.github_webhooks")
@@ -112,7 +112,7 @@ class WebhookWorker:
 
 
 async def main() -> int:
-    settings = get_settings()
+    settings = await app_settings.worker_settings()
     configure_logging(settings.LOG_LEVEL)
     engine = build_engine(settings)
     maker = build_sessionmaker(engine)
@@ -125,6 +125,8 @@ async def main() -> int:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
+    # A change to its keys from Spasta re-execs this worker (docs/settings.md).
+    app_settings.start_worker_watch(settings, maker, stop, ("GITHUB_",), redis)
 
     def on_paused(p: bool) -> None:
         worker.paused = p
@@ -169,4 +171,4 @@ __all__ = ["GITHUB_WEBHOOKS", "WebhookWorker", "WorkflowFailure", "main", "on_wo
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main()))
+    app_settings.run_worker(main, "app.workers.github_webhooks")

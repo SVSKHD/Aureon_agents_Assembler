@@ -3,6 +3,7 @@
 from app.models import brokers, trading  # noqa: F401  (registers trading/dhan/mt5 tables)
 from app.models.agents import Agent, AgentLog, AgentRun, ScheduledJob
 from app.models.ai import Conversation, Message, ModelInventory
+from app.models.app_settings import AppSetting
 from app.models.approvals import (
     ApprovalArtifact,
     ApprovalEvent,
@@ -29,6 +30,7 @@ __all__ = [
     "Agent",
     "AgentLog",
     "AgentRun",
+    "AppSetting",
     "ApprovalArtifact",
     "ApprovalEvent",
     "ApprovalPolicy",

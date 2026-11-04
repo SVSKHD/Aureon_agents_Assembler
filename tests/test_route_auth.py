@@ -34,6 +34,10 @@ PUBLIC_UNSAFE = {"/api/auth/login", "/api/v1/github/webhooks", "/api/trading/mt5
 PUBLIC_RATE_LIMITED = {p for m, p in PUBLIC if p.startswith("/api/public/")}
 
 ADMIN = {
+    ("GET", "/api/v1/settings"),
+    ("PUT", "/api/v1/settings/{key}"),
+    ("DELETE", "/api/v1/settings/{key}"),
+    ("POST", "/api/v1/settings/{key}/test"),
     ("PUT", "/api/finance/portfolio-profiles/{profile_id}"),
     ("POST", "/api/finance/claim"),
     ("GET", "/api/agents/{agent_id}/logs"),

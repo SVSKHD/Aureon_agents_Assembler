@@ -5,6 +5,7 @@ from fastapi import APIRouter
 from app.api.v1 import (
     agents,
     ai,
+    app_settings,
     approvals,
     audit_events,
     auth,
@@ -49,4 +50,5 @@ api_router.include_router(audit_events.router)  # /api/v1/audit/events
 api_router.include_router(voice.router)  # /api/v1/voice/intent (navigation only)
 api_router.include_router(repairs.router)  # /api/v1/repairs (Phase 18 self-repair)
 api_router.include_router(reviews.router)  # /api/v1/reviews + …/pulls/{n}/claude-review
+api_router.include_router(app_settings.router)  # /api/v1/settings (runtime settings + secrets)
 api_router.include_router(system.router)  # /api/v1/system (Phase 22 integrations card)

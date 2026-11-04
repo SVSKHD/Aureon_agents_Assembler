@@ -19,14 +19,14 @@ from app.agents.trading.dhan import build_dhan_adapter
 from app.agents.trading.mt5 import build_mt5_adapter
 from app.api.router import api_router
 from app.core.cf_access import CloudflareAccessMiddleware
-from app.core.config import Settings, get_settings
+from app.core.config import Settings, get_env_settings
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import RequestIdMiddleware, SecurityHeadersMiddleware
 from app.core.prod_checks import assert_production_ready
 from app.db.session import build_engine, build_sessionmaker
 from app.integrations.claude_cli import ClaudeCLI
 from app.integrations.github import build_github_client
-from app.services import incidents
+from app.services import app_settings, app_settings_runtime, incidents
 from app.services.ai_usage import UsageTracker
 from app.services.chat import chat_options
 from app.services.claude_review import ReviewRunner
@@ -56,7 +56,7 @@ async def warm_up_chat_model(ollama: OllamaClient, settings: Settings) -> None:
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    settings = settings or get_settings()
+    settings = settings or get_env_settings()
     configure_logging(settings.LOG_LEVEL)
 
     @asynccontextmanager
@@ -72,6 +72,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.engine = engine
         app.state.sessionmaker = build_sessionmaker(engine)
         app.state.redis = redis
+        # Runtime settings (docs/settings.md): .env overlaid with core.app_settings. `settings`
+        # stays the .env view; `live` is what routes and clients see, swapped on change.
+        app.state.env_settings = settings
+        live = await app_settings.effective(app.state.sessionmaker, settings)
+        app_settings.install(live)
+        app.state.settings = live
         app.state.http = http
         app.state.health = HealthService(settings, engine, redis, http)
         ollama = OllamaClient(
@@ -84,7 +90,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.ollama = ollama
         # OpenRouter (docs/25-openrouter.md): a client only when enabled and keyed; the daily
         # spend counter lives in Redis.
-        openrouter = build_openrouter(settings)
+        openrouter = build_openrouter(live)
         app.state.openrouter = openrouter
         app.state.ai_usage = UsageTracker(redis)
         warmup: asyncio.Task[None] | None = None
@@ -98,7 +104,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         # Read-only broker adapters by broker name: Dhan (Phase B), the MT5 bot export (Phase C).
         app.state.trading_adapters = {}
-        dhan = build_dhan_adapter(settings, redis, app.state.sessionmaker)
+        dhan = build_dhan_adapter(live, redis, app.state.sessionmaker)
         if dhan is not None:
             app.state.trading_adapters["dhan"] = dhan
         mt5 = build_mt5_adapter(settings)
@@ -107,7 +113,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # MT5 push ingest (docs/12-mt5-adapter.md §3): POST /api/trading/mt5/ingest stores here.
         app.state.mt5_ingest_store = DbIngestStore(app.state.sessionmaker)
         # GitHub REST client (docs/18-github-foundation.md); None without GITHUB_TOKEN.
-        github = build_github_client(settings)
+        github = build_github_client(live)
         app.state.github = github
         # Claude PR reviews (docs/22-claude-review.md): off unless CLAUDE_REVIEW_ENABLED.
         app.state.claude_cli = ClaudeCLI(settings)
@@ -147,31 +153,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ),
                 name="incident-docker-monitor",
             )
+        settings_stop = asyncio.Event()
+        settings_task = None
+        if app_settings.cipher_for(settings) is not None:
+            settings_task = app_settings_runtime.start_listener(app, settings_stop)
         log.info("startup", env=settings.ENV.value)
         try:
             yield
         finally:
             log.info("shutdown")
             docker_stop.set()
+            settings_stop.set()
+            if settings_task is not None:  # a listener: nothing to finish, just stop it
+                settings_task.cancel()
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await settings_task
             if docker_task is not None:
                 with contextlib.suppress(Exception, asyncio.CancelledError):
                     await asyncio.wait_for(docker_task, 5)
             await incidents.stop_exception_flusher(flusher)
             await heartbeat.stop()
             await app.state.review_runner.aclose()
-            if dhan is not None:
-                await dhan.aclose()
-            if mt5 is not None:
-                await mt5.aclose()
-            if github is not None:
-                await github.aclose()
+            # The current clients: a settings change may have replaced the startup ones.
+            await app_settings_runtime.close_clients(app)
             if warmup is not None:
                 warmup.cancel()
                 with contextlib.suppress(Exception, asyncio.CancelledError):
                     await warmup
             await ollama.aclose()
-            if openrouter is not None:
-                await openrouter.aclose()
             await http.aclose()
             await redis.aclose()
             await engine.dispose()
