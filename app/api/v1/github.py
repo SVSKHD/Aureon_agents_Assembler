@@ -164,7 +164,8 @@ async def list_repositories(
     refresh: bool = False,
     q: Annotated[str | None, Query(max_length=100)] = None,
 ) -> Page[RepositoryOut]:
-    if refresh:
+    # A retried GET (client timeout while a slow sync runs) must not start another one.
+    if refresh and not await gh.sync_in_progress(db):
         try:
             run = await gh.sync_repositories(
                 _maker(request), client, settings, trigger="api", actor_user_id=admin.user.id

@@ -12,7 +12,7 @@ import binascii
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Literal
 from urllib.parse import quote, unquote
 
@@ -330,6 +330,22 @@ async def sync_repositories(
         final = await db.get(GitHubSyncRun, run_id)
         assert final is not None
         return final
+
+
+SYNC_RUNNING_WINDOW_SECONDS = 300
+
+
+async def sync_in_progress(db: AsyncSession) -> bool:
+    """A sync run started in the last few minutes is still 'running'. Lets a retried
+    GET ?refresh=true reuse it instead of starting a parallel sync. Older 'running'
+    rows (a crashed process) don't block."""
+    since = func.now() - timedelta(seconds=SYNC_RUNNING_WINDOW_SECONDS)
+    row = await db.scalar(
+        select(GitHubSyncRun.id)
+        .where(GitHubSyncRun.status == "running", GitHubSyncRun.started_at > since)
+        .limit(1)
+    )
+    return row is not None
 
 
 async def last_sync(db: AsyncSession) -> GitHubSyncRun | None:

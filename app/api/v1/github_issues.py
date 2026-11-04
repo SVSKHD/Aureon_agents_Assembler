@@ -284,7 +284,8 @@ async def add_labels(r: RepoDep, n: Number, body: LabelsAdd) -> list[str]:
     return _labels(data)
 
 
-@router.delete(ISSUES + "/{n}/labels/{name}", response_model=list[str])
+# {name:path}: label names may contain "/" (sent as %2F, which the server decodes).
+@router.delete(ISSUES + "/{n}/labels/{name:path}", response_model=list[str])
 async def remove_label(
     r: RepoDep, n: Number, name: Annotated[str, Path(min_length=1, max_length=100)]
 ) -> list[str]:
