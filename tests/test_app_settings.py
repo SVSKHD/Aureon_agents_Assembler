@@ -274,8 +274,21 @@ async def test_unset_credentials_fail_without_a_request(env: Settings) -> None:
         raise AssertionError("no request expected")
 
     async with _client(httpx.MockTransport(boom)) as http:
-        for category in svc.CATEGORIES:
+        # "agents" holds no credential: its test only asks Ollama which models are installed.
+        for category in (c for c in svc.CATEGORIES if c != "agents"):
             assert not (await svc.run_test(category, env, http)).ok
+
+
+async def test_agents_test_reports_missing_local_models(env: Settings) -> None:
+    def tags(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/api/tags"
+        return httpx.Response(200, json={"models": [{"name": "qwen2.5:3b"}]})
+
+    async with _client(httpx.MockTransport(tags)) as http:
+        assert (await svc.run_test("agents", env, http)).ok
+        s = env.model_copy(update={"AGENT_VOICE_LOCAL_MODEL": "llama3.2:1b"})
+        out = await svc.run_test("agents", s, http)
+        assert not out.ok and "llama3.2:1b" in out.detail
 
 
 async def test_discord_payload_is_scrubbed_before_sending(monkeypatch: pytest.MonkeyPatch) -> None:

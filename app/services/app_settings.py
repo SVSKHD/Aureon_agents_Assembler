@@ -79,11 +79,49 @@ def _s(
     return Spec(key, cat, kind, desc, reauth or kind == "secret", managed)
 
 
-CATEGORIES = ("openrouter", "dhan", "github", "discord", "mt5")
+CATEGORIES = ("openrouter", "agents", "dhan", "github", "discord", "mt5")
 
 REGISTRY: dict[str, Spec] = {
     s.key: s
     for s in (
+        *(
+            spec
+            for agent, label in (
+                ("NEWS", "News"),
+                ("VOICE", "Voice answers"),
+                ("RESEARCH", "Trading research"),
+            )
+            for spec in (
+                _s(f"AGENT_{agent}_ENABLED", "agents", "bool", f"{label}: enabled"),
+                _s(
+                    f"AGENT_{agent}_PROVIDER",
+                    "agents",
+                    "str",
+                    f"{label}: auto (OpenRouter when allowed) | ollama | openrouter",
+                ),
+                _s(
+                    f"AGENT_{agent}_MODEL",
+                    "agents",
+                    "str",
+                    f"{label}: OpenRouter model (blank = default)",
+                ),
+                _s(f"AGENT_{agent}_LOCAL_MODEL", "agents", "str", f"{label}: local Ollama model"),
+            )
+        ),
+        _s("AGENT_IMAGE_ENABLED", "agents", "bool", "Image generation: enabled"),
+        _s(
+            "OPENROUTER_IMAGE_MODEL",
+            "agents",
+            "str",
+            "OpenRouter image model (blank = local SD only; never personal/finance prompts)",
+        ),
+        _s(
+            "MODEL_ROUTER_EXTERNAL_TIMEOUT_SECONDS",
+            "agents",
+            "float",
+            "Agents: OpenRouter timeout before local fallback (s)",
+        ),
+        _s("MODEL_ROUTER_LOCAL_QUEUE", "agents", "int", "Agents: local Ollama queue size"),
         _s("OPENROUTER_ENABLED", "openrouter", "bool", "Allow external models via OpenRouter"),
         _s("OPENROUTER_API_KEY", "openrouter", "secret", "OpenRouter API key"),
         _s("OPENROUTER_DEFAULT_MODEL", "openrouter", "str", "Default OpenRouter model id"),
@@ -655,7 +693,22 @@ async def _mt5(s: Settings, http: httpx.AsyncClient) -> TestOutcome:
     return TestOutcome(True, "MT5_INGEST_TOKEN is set (the bot proves it on its next push)")
 
 
+async def _agents(s: Settings, http: httpx.AsyncClient) -> TestOutcome:
+    """The agents' local models are installed in Ollama (GET /api/tags; nothing is pulled)."""
+    resp = await http.get(f"{s.OLLAMA_BASE_URL.rstrip('/')}/api/tags", timeout=10.0)
+    if resp.status_code != 200:
+        return TestOutcome(False, f"Ollama answered HTTP {resp.status_code}")
+    installed = {m.get("name") for m in resp.json().get("models", []) if isinstance(m, dict)}
+    names = (current_value(s, f"AGENT_{a}_LOCAL_MODEL") for a in ("NEWS", "VOICE", "RESEARCH"))
+    wanted: set[str] = {n for n in names if n}
+    missing = sorted(m for m in wanted if m not in installed)
+    if missing:
+        return TestOutcome(False, f"not installed in Ollama: {', '.join(missing)}")
+    return TestOutcome(True, f"local models installed: {', '.join(sorted(wanted))}")
+
+
 _TESTS: dict[str, Callable[[Settings, httpx.AsyncClient], Awaitable[TestOutcome]]] = {
+    "agents": _agents,
     "openrouter": _openrouter,
     "dhan": _dhan,
     "github": _github,

@@ -541,6 +541,33 @@ class Settings(BaseSettings):
     # then the content filter still applies).
     AI_RESEARCH_EXTERNAL_ALLOWED: bool = False
 
+    # --- Model routing for the agents (docs/model-routing.md, app/services/model_router.py) ---
+    # Per agent: enabled, provider ("auto" = OpenRouter when the gate allows, else local;
+    # "ollama" = always local; "openrouter" = prefer it, still gated and with local fallback),
+    # the OpenRouter model ("" = OPENROUTER_DEFAULT_MODEL) and the local Ollama model.
+    AGENT_NEWS_ENABLED: bool = True
+    AGENT_NEWS_PROVIDER: Literal["auto", "ollama", "openrouter"] = "auto"
+    AGENT_NEWS_MODEL: str = ""
+    AGENT_NEWS_LOCAL_MODEL: str = "qwen2.5:3b"
+    AGENT_VOICE_ENABLED: bool = True
+    AGENT_VOICE_PROVIDER: Literal["auto", "ollama", "openrouter"] = "auto"
+    AGENT_VOICE_MODEL: str = ""
+    AGENT_VOICE_LOCAL_MODEL: str = "qwen2.5:3b"
+    AGENT_RESEARCH_ENABLED: bool = True
+    AGENT_RESEARCH_PROVIDER: Literal["auto", "ollama", "openrouter"] = "auto"
+    AGENT_RESEARCH_MODEL: str = ""
+    AGENT_RESEARCH_LOCAL_MODEL: str = "qwen2.5:3b"
+    AGENT_IMAGE_ENABLED: bool = True
+    # Image generation is local SD 1.5. An OpenRouter image model is used only when this is
+    # set AND the prompt passes the filter (never personal or finance content). Off by default.
+    OPENROUTER_IMAGE_MODEL: str = ""
+    # An agent's OpenRouter call that takes longer than this falls back to local.
+    MODEL_ROUTER_EXTERNAL_TIMEOUT_SECONDS: float = Field(default=10.0, gt=0, le=120)
+    # Local agent calls waiting for Ollama beyond this many are refused (the caller falls back
+    # to rules); chat has its own queue. Market data and risk checks never use Ollama.
+    MODEL_ROUTER_LOCAL_QUEUE: int = Field(default=2, ge=0, le=20)
+    MODEL_ROUTER_LOCAL_TIMEOUT_SECONDS: float = Field(default=120.0, gt=0, le=900)
+
     # --- Production integration (docs/24-production-integration.md) ---
     # Alerts: open incidents (severity >= warning), stale heartbeats, failed/old backups and
     # approvals about to expire, sent to DISCORD_WEBHOOK_URL. Empty cron = job not created.

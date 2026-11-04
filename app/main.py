@@ -111,6 +111,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             settings.OLLAMA_MAX_QUEUE,
             settings.OLLAMA_QUEUE_RETRY_AFTER,
         )
+        # The agents' own local queue (news, voice answers, research): one generation at a
+        # time, MODEL_ROUTER_LOCAL_QUEUE waiting; chat keeps its own (docs/model-routing.md).
+        app.state.agent_limiter = GenerationLimiter(
+            1, settings.MODEL_ROUTER_LOCAL_QUEUE, settings.OLLAMA_QUEUE_RETRY_AFTER
+        )
         # Read-only broker adapters by broker name: Dhan (Phase B), the MT5 bot export (Phase C).
         app.state.trading_adapters = {}
         dhan = build_dhan_adapter(live, redis, app.state.sessionmaker)

@@ -23,6 +23,7 @@ from app.models.github import (
     GitHubWorkflowRun,
 )
 from app.models.imaging import GeneratedAsset, ImageJob
+from app.models.model_calls import ModelCall
 from app.models.repairs import Incident, RepairTask
 from app.models.reviews import Review
 
@@ -52,6 +53,7 @@ __all__ = [
     "ImageJob",
     "Incident",
     "Message",
+    "ModelCall",
     "ModelInventory",
     "RepairTask",
     "Review",
