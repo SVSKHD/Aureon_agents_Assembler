@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     DATA_ROOT_MARKER: str = ".spasta-data-mounted"
 
     SECRET_KEY: SecretStr
+    # Fernet key(s) for core.app_settings (docs/settings.md). Comma-separated: the FIRST key
+    # encrypts, every key decrypts (rotation). Bootstrap only: never editable from the UI.
+    SETTINGS_MASTER_KEY: SecretStr | None = None
     CORS_ORIGINS: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
     # Readiness-probe timeout per dependency, seconds.
@@ -666,5 +669,21 @@ class Settings(BaseSettings):
 
 
 @lru_cache
-def get_settings() -> Settings:
+def get_env_settings() -> Settings:
+    """The settings from the environment / .env only, ignoring core.app_settings."""
     return Settings()
+
+
+_effective: Settings | None = None
+
+
+def get_settings() -> Settings:
+    """The process's current settings: .env overlaid with core.app_settings once the overlay
+    has been loaded (app/services/app_settings.py), else .env alone."""
+    return _effective if _effective is not None else get_env_settings()
+
+
+def set_effective_settings(settings: Settings | None) -> None:
+    """Install the overlaid settings for get_settings() (None = back to .env only)."""
+    global _effective
+    _effective = settings

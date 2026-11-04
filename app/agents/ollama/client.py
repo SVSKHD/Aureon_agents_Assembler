@@ -12,6 +12,8 @@ from typing import Any
 
 import httpx
 
+from app.core.logging import scrub_messages
+
 
 class OllamaError(Exception):
     """Ollama answered, but with an error (bad model, runner crash, ...)."""
@@ -155,7 +157,7 @@ class OllamaClient:
         which makes Ollama stop generating."""
         payload: dict[str, Any] = {
             "model": model,
-            "messages": messages,
+            "messages": scrub_messages(messages),
             "stream": True,
             "options": options,
         }

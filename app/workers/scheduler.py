@@ -39,7 +39,7 @@ from app.agents.trading.dhan.adapter import DhanAdapter
 from app.agents.trading.mt5 import build_mt5_adapter
 from app.agents.trading.mt5.adapter import MT5Adapter
 from app.agents.trading.types import Timeframe
-from app.core.config import Settings, get_settings
+from app.core.config import Settings
 from app.core.logging import configure_logging, get_logger
 from app.db.session import build_engine, build_sessionmaker
 from app.integrations.github import build_github_client
@@ -50,6 +50,7 @@ from app.models.finance import FinanceTombstone
 from app.models.trading import BrokerAccount
 from app.services import (
     alerts,
+    app_settings,
     dhan_sync,
     github,
     github_actions,
@@ -568,7 +569,7 @@ class Scheduler:
 
 
 async def main() -> int:
-    settings = get_settings()
+    settings = await app_settings.worker_settings()
     configure_logging(settings.LOG_LEVEL)
     engine = build_engine(settings)
     maker = build_sessionmaker(engine)
@@ -591,6 +592,10 @@ async def main() -> int:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stopping.set)
+    # A change to its keys from Spasta re-execs this worker (docs/settings.md).
+    app_settings.start_worker_watch(
+        settings, maker, stopping, ("DHAN_", "GITHUB_", "DISCORD_", "MT5_"), redis
+    )
 
     def state() -> tuple[str, dict[str, Any]]:
         return (
@@ -627,4 +632,4 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main()))
+    app_settings.run_worker(main, "app.workers.scheduler")

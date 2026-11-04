@@ -21,6 +21,8 @@ from typing import Any
 import httpx
 from pydantic import SecretStr
 
+from app.core.logging import scrub_messages
+
 
 class OpenRouterError(Exception):
     """OpenRouter could not answer. `code` doubles as the chat's fallback reason."""
@@ -126,7 +128,7 @@ class OpenRouterClient:
         """
         payload: dict[str, Any] = {
             "model": model,
-            "messages": messages,
+            "messages": scrub_messages(messages),
             "stream": True,
             "usage": {"include": True},
         }

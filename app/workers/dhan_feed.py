@@ -30,9 +30,10 @@ from app.agents.registry import AgentRegistry, AgentSpec, Heartbeat
 from app.agents.trading.dhan.adapter import market_day_bounds
 from app.agents.trading.dhan.feed import DhanFeed, FeedPacket, parse_instruments
 from app.agents.trading.dhan.parse import IST
-from app.core.config import Settings, get_settings
+from app.core.config import Settings
 from app.core.logging import configure_logging, get_logger
 from app.db.session import build_engine, build_sessionmaker
+from app.services import app_settings
 
 log = get_logger("worker.dhan_feed")
 DHAN_FEED = AgentSpec("dhan-feed", "Dhan live market feed", "trading")
@@ -94,7 +95,7 @@ class FeedSink:
 
 
 async def main() -> int:
-    settings: Settings = get_settings()
+    settings: Settings = await app_settings.worker_settings()
     configure_logging(settings.LOG_LEVEL)
     if not settings.dhan_configured:
         log.error("dhan_not_configured", hint="set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN")
@@ -122,6 +123,10 @@ async def main() -> int:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, shutdown.set)
+    # A change to its keys from Spasta re-execs this worker (docs/settings.md).
+    app_settings.start_worker_watch(
+        settings, build_sessionmaker(engine), shutdown, ("DHAN_",), redis
+    )
 
     def state() -> tuple[str, dict[str, Any]]:
         st = feed.stats
@@ -190,4 +195,4 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main()))
+    app_settings.run_worker(main, "app.workers.dhan_feed")

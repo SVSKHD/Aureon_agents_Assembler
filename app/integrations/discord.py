@@ -25,7 +25,7 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings
-from app.core.logging import get_logger
+from app.core.logging import get_logger, scrub
 from app.integrations.github.redact import redact
 
 log = get_logger("integrations.discord")
@@ -93,6 +93,8 @@ async def post(
     retry_base_seconds: float,
 ) -> bool:
     """POST with a capped number of attempts. Never raises; returns whether it was delivered."""
+    # Known secret values (docs/settings.md) never reach a channel, whatever built the text.
+    payload = scrub(payload)
     async with httpx.AsyncClient(timeout=request_seconds, follow_redirects=False) as http:
         for attempt in range(1, attempts + 1):
             delay = retry_base_seconds * 2 ** (attempt - 1)

@@ -31,14 +31,13 @@ from app.agents.coding.git import Git
 from app.agents.ollama.client import OllamaClient
 from app.agents.ollama.heavy import HEAVY_MODEL_LOCK
 from app.agents.registry import AgentRegistry, AgentSpec, Heartbeat
-from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
 from app.core.procsec import make_non_dumpable
 from app.db.session import build_engine, build_sessionmaker
 from app.integrations.github import build_github_client
 from app.integrations.github.client import GitHubClient
 from app.models.agents import CodeTask
-from app.services import coding, coding_git, incidents, repairs
+from app.services import app_settings, coding, coding_git, incidents, repairs
 
 log = get_logger("worker.coding")
 CODING = AgentSpec("coding", "Coding agent", "coding")
@@ -136,7 +135,7 @@ async def git_loop(
 
 
 async def main() -> int:
-    settings = get_settings()
+    settings = await app_settings.worker_settings()
     configure_logging(settings.LOG_LEVEL)
     # Test commands run model-patched code as our children: keep our environ/memory unreadable.
     if not make_non_dumpable():
@@ -155,6 +154,8 @@ async def main() -> int:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
+    # A change to its keys from Spasta re-execs this worker (docs/settings.md).
+    app_settings.start_worker_watch(settings, maker, stop, ("GITHUB_",), None)
     state: dict[str, Any] = {"paused": False, "running": None}
 
     def report() -> tuple[str, dict[str, Any]]:
@@ -240,4 +241,4 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main()))
+    app_settings.run_worker(main, "app.workers.coding")

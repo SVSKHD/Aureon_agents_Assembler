@@ -87,7 +87,8 @@ async def db_clean(migrated: str) -> AsyncIterator[str]:
                 "agents.agents, agents.repair_tasks, agents.incidents, "
                 "agents.generated_assets, agents.image_jobs, "
                 "ai.messages, ai.conversations, ai.model_inventory, "
-                "audit.audit_events, core.sessions, core.users RESTART IDENTITY CASCADE"
+                "audit.audit_events, core.app_settings, core.sessions, core.users "
+                "RESTART IDENTITY CASCADE"
             )
         )
     await engine.dispose()

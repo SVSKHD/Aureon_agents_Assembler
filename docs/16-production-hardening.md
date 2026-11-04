@@ -151,6 +151,15 @@ whose stamp is older than `BACKUP_RETENTION_DAYS`, but only if each one is a rea
 (not a symlink), contains a `MANIFEST.json`, has a name that matches the stamp pattern exactly,
 and resolves strictly inside `BACKUP_DIR`. Nothing else is ever deleted.
 
+> **The DB backup alone cannot restore the stored secrets.** `core.app_settings` is in the
+> dump, but only as ciphertext encrypted with `SETTINGS_MASTER_KEY` (docs/settings.md). The key
+> lives in `/opt/private-ai/aureon/.env`, **not** in the backup. Keep a copy of the key (or of the
+> whole `.env`) offline in your password manager, apart from `$BACKUP_DIR`. If the key is lost,
+> every value set from `/settings` is lost too. Aureon falls back to `.env` and logs
+> `app_setting_undecryptable`, and each key has to be set again from the UI. After running
+> `scripts/ops/rotate-settings-key.sh`, store the new key straight away: backups taken after
+> the rotation need it.
+
 Run it by hand with `scripts/ops/backup.sh` (or `--dry-run`). Check the result with
 `ls -l $BACKUP_DIR` and `cat $BACKUP_DIR/aureon-*/MANIFEST.json | tail -40`.
 
@@ -180,6 +189,12 @@ scripts/ops/restore.sh aureon-<stamp> --into-live --yes-i-am-sure
 # --clean --if-exists --single-transaction --exit-on-error: all or nothing
 sudo systemctl start aureon && scripts/ops/healthcheck.sh --wait 300
 ```
+
+**Restoring onto a new server:** copy `.env` with the **same** `SETTINGS_MASTER_KEY` that was
+in use when the backup was taken (or the key list from a rotation in progress) *before* starting
+the API. Otherwise the restored `core.app_settings` rows cannot be decrypted. Check with
+`GET /api/v1/settings`: `encryption_ready` should be `true`, and the keys set from the UI should
+show `source: "db"`.
 
 To point the API at a restored copy instead, set `DATABASE_URL`'s database name to
 `spasta_restore_<ts>` and run `docker compose up -d`. That needs no data movement.
