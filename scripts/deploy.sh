@@ -50,11 +50,14 @@ main() {
     echo "WARN: stashed local edits to tracked files (git stash list)"
   fi
 
-  # Keep the running image for rollback (both images, when present).
-  docker image inspect aureon-agentic:dev >/dev/null 2>&1 \
-    && docker tag aureon-agentic:dev aureon-agentic:rollback
-  docker image inspect aureon-coding:dev >/dev/null 2>&1 \
-    && docker tag aureon-coding:dev aureon-coding:rollback
+  # Keep the running images for rollback (each one that exists). Profile workers (coding,
+  # imaging) are built and updated too when .env sets COMPOSE_PROFILES (docs/deploy-automation.md).
+  local img
+  for img in aureon-agentic aureon-coding aureon-imaging; do
+    if docker image inspect "$img:dev" >/dev/null 2>&1; then
+      docker tag "$img:dev" "$img:rollback"
+    fi
+  done
 
   git reset --quiet --hard "$want"
   if docker compose build --quiet && docker compose run --rm migrate && docker compose up -d \
@@ -66,10 +69,11 @@ main() {
 
   echo "FAILED ${want:0:12}: rolling back to ${cur:0:12}"
   git reset --quiet --hard "$cur"
-  docker image inspect aureon-agentic:rollback >/dev/null 2>&1 \
-    && docker tag aureon-agentic:rollback aureon-agentic:dev
-  docker image inspect aureon-coding:rollback >/dev/null 2>&1 \
-    && docker tag aureon-coding:rollback aureon-coding:dev
+  for img in aureon-agentic aureon-coding aureon-imaging; do
+    if docker image inspect "$img:rollback" >/dev/null 2>&1; then
+      docker tag "$img:rollback" "$img:dev"
+    fi
+  done
   if docker compose up -d && wait_ready 90; then
     echo "ROLLED BACK to ${cur:0:12} (healthy)"
   else

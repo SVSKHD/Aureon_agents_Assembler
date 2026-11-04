@@ -27,7 +27,11 @@ from typing import Protocol
 from app.core.config import Settings
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-PLACEHOLDERS = ("prompt", "negative_prompt", "seed", "steps", "width", "height", "output")
+PLACEHOLDERS = (
+    "prompt", "negative_prompt", "seed", "steps", "width", "height", "output",
+    # From the job's IMAGE_MODELS entry (docs/image-agent.md); empty without one.
+    "model_path", "cfg", "sampler",
+)  # fmt: skip
 
 ProgressCallback = Callable[[int], None]
 
@@ -44,6 +48,9 @@ class GenerationRequest:
     steps: int
     width: int
     height: int
+    model_path: str = ""
+    cfg: float = 7.0
+    sampler: str = "euler_a"
 
 
 class ImageGenerator(Protocol):
@@ -141,6 +148,24 @@ class SubprocessGenerator:
         self.template = template
         self.cwd = cwd
         self.env = env
+        self._proc: asyncio.subprocess.Process | None = None
+
+    def suspend(self) -> bool:
+        """Freeze the running generation (SIGSTOP to its process group): it keeps its memory
+        and resumes exactly where it was. Used while chat/voice requests are active."""
+        return self._signal(signal.SIGSTOP)
+
+    def resume(self) -> bool:
+        return self._signal(signal.SIGCONT)
+
+    def _signal(self, sig: signal.Signals) -> bool:
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return False
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, sig)
+            return True
+        return False
 
     def argv(self, req: GenerationRequest, output: Path) -> list[str]:
         values = {
@@ -151,13 +176,16 @@ class SubprocessGenerator:
             "width": req.width,
             "height": req.height,
             "output": str(output),
+            "model_path": req.model_path,
+            "cfg": f"{req.cfg:g}",
+            "sampler": req.sampler,
         }
         return [_not_an_option(arg, arg.format_map(values)) for arg in self.template]
 
     async def generate(
         self, req: GenerationRequest, output: Path, on_progress: ProgressCallback
     ) -> None:
-        proc = await asyncio.create_subprocess_exec(
+        self._proc = proc = await asyncio.create_subprocess_exec(
             *self.argv(req, output),
             cwd=self.cwd,
             env=self.env,
@@ -181,6 +209,8 @@ class SubprocessGenerator:
         except BaseException:
             await asyncio.shield(_terminate(proc))
             raise
+        finally:
+            self._proc = None
         if rc != 0:
             raise GenerationFailed(f"image-agent exited with {rc}: " + " | ".join(tail))
         if not await asyncio.to_thread(output.is_file):
@@ -192,6 +222,7 @@ async def _terminate(proc: asyncio.subprocess.Process, grace: float = 5.0) -> No
         return
     with contextlib.suppress(ProcessLookupError):
         os.killpg(proc.pid, signal.SIGTERM)
+        os.killpg(proc.pid, signal.SIGCONT)  # a suspended job must run to handle SIGTERM
     try:
         await asyncio.wait_for(proc.wait(), grace)
     except TimeoutError:

@@ -37,6 +37,8 @@ def settings(data_root: Path) -> Settings:
         HEALTH_CHECK_TIMEOUT=1.0,
         # Never pick up a real token from the host environment.
         GITHUB_TOKEN=None,
+        # Image jobs never wait for an IST trading window in tests (tests set their own).
+        IMAGE_PAUSE_WINDOWS=[],
     )
 
 

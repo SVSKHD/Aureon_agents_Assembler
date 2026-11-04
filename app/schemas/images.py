@@ -18,6 +18,8 @@ class GenerateRequest(BaseModel):
     seed: int | None = Field(default=None, ge=0, le=2**32 - 1)
     steps: int | None = Field(default=None, ge=1)
     size: str = Field(default="512x512", pattern=r"^\d{2,4}x\d{2,4}$")
+    # One of GET /api/images/models (IMAGE_MODELS); None = IMAGE_MODEL_NAME.
+    model: str | None = Field(default=None, max_length=60, pattern=r"^[A-Za-z0-9._-]+$")
 
     _clean = field_validator("prompt", "negative_prompt")(_no_control)
 
@@ -63,3 +65,15 @@ class AssetPage(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class ImageModelOut(BaseModel):
+    name: str
+    default: bool
+    steps: int
+    note: str
+
+
+class ImageModelList(BaseModel):
+    items: list[ImageModelOut]
+    enabled: bool

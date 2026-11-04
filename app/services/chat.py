@@ -21,7 +21,7 @@ import contextlib
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -589,9 +589,16 @@ class ChatStreamingResponse(StreamingResponse):
     """Always closes the event generator and releases the ticket, however the response ends
     (completion, client disconnect seen via receive() or via a failed send(), or shutdown)."""
 
-    def __init__(self, stream: ChatStream, on_close: Callable[[], None] | None = None) -> None:
+    def __init__(
+        self,
+        stream: ChatStream,
+        on_close: Callable[[], None] | None = None,
+        on_finish: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         self._gen = stream.events()
         self._on_close = on_close or stream.release
+        # Async clean-up after the stream ends, e.g. clearing the interactive marker.
+        self._on_finish = on_finish
         super().__init__(
             self._gen,
             media_type="text/event-stream",
@@ -606,3 +613,6 @@ class ChatStreamingResponse(StreamingResponse):
                 await self._gen.aclose()
             finally:
                 self._on_close()
+                if self._on_finish is not None:
+                    with contextlib.suppress(Exception):
+                        await self._on_finish()

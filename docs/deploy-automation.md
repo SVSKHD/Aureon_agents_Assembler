@@ -37,7 +37,10 @@ GitHub (merge)                 server (pulls; nothing pushes to it)
 2. `git fetch` + `git reset --hard origin/main`. Untracked server files (`.env`,
    `.env.migrate`, `compose.override.yaml`, `scripts/ops/ops.env`) are never touched; local
    edits to tracked files are stashed under a named stash first.
-3. `aureon-agentic:dev` (and `aureon-coding:dev`) are tagged `:rollback`.
+3. `aureon-agentic:dev` (and `aureon-coding:dev`, `aureon-imaging:dev`) are tagged `:rollback`.
+   The profile workers are only built and updated when the server's `.env` names them in
+   `COMPOSE_PROFILES` (this server: `COMPOSE_PROFILES=coding,imaging`). Without it, they keep
+   running their old image after a deploy.
 4. `docker compose build`, `docker compose run --rm migrate`, `docker compose up -d`.
 5. Up to 60 s for `GET /api/health/ready` = 200 (Postgres, Redis, Ollama, HDD all ok).
 6. On failure: `:rollback` → `:dev`, `git reset --hard <previous SHA>`, `up -d`, exit 1. The

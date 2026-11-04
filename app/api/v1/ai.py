@@ -31,7 +31,7 @@ from app.schemas.ai import (
     ModelStatusList,
     OpenRouterStatus,
 )
-from app.services import audit
+from app.services import audit, interactive
 from app.services.ai_usage import DailyUsage, UsageTracker, to_micro, utc_today
 from app.services.chat import (
     ChatJob,
@@ -342,7 +342,10 @@ async def chat(
         if ticket is not None:
             ticket.release()
         raise
-    return ChatStreamingResponse(stream)
+    # Image generation yields to a running chat (app/services/interactive.py).
+    redis = request.app.state.redis
+    token = await interactive.mark(redis, "chat", settings.CHAT_TIMEOUT_SECONDS)
+    return ChatStreamingResponse(stream, on_finish=lambda: interactive.clear(redis, token))
 
 
 def _conv_out(c: Conversation) -> ConversationOut:
