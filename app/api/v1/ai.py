@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
@@ -11,6 +12,7 @@ from sqlalchemy import select
 
 from app.agents.ollama.client import OllamaClient, OllamaUnavailable
 from app.agents.ollama.limiter import GenerationLimiter, QueueFull, Ticket
+from app.agents.providers.base import EXTERNAL_PROVIDERS, PROVIDER_LABELS
 from app.api.ui import ui_module
 from app.auth.deps import CsrfProtected, Current, DbSession, SettingsDep
 from app.core.config import Settings
@@ -30,9 +32,10 @@ from app.schemas.ai import (
     ModelStatus,
     ModelStatusList,
     OpenRouterStatus,
+    ProviderStatus,
 )
 from app.services import audit, interactive
-from app.services.ai_usage import DailyUsage, UsageTracker, to_micro, utc_today
+from app.services.ai_usage import MICRO, DailyUsage, UsageTracker, to_micro, utc_today
 from app.services.chat import (
     ChatJob,
     ChatStream,
@@ -42,7 +45,13 @@ from app.services.chat import (
     sync_inventory,
     trim_history,
 )
-from app.services.inference import Decision, ExternalGate, local_fallback_model
+from app.services.inference import (
+    Decision,
+    ExternalGate,
+    external_clients,
+    gate_for,
+    local_fallback_model,
+)
 
 UI_MODULE = ui_module("chat", label="AI chat", group="ai", icon="message-square", order=40)
 router = APIRouter(tags=["ai"])
@@ -53,11 +62,36 @@ def _ollama(request: Request) -> OllamaClient:
     return client
 
 
-def _gate(request: Request, settings: Settings) -> ExternalGate:
-    return ExternalGate(
-        settings,
-        getattr(request.app.state, "openrouter", None),
-        getattr(request.app.state, "ai_usage", None),
+def _gate(request: Request, settings: Settings, provider: str = "openrouter") -> ExternalGate:
+    state = request.app.state
+    return gate_for(settings, provider, external_clients(state), getattr(state, "ai_usage", None))
+
+
+def _gates(request: Request, settings: Settings) -> dict[str, ExternalGate]:
+    return {p: _gate(request, settings, p) for p in EXTERNAL_PROVIDERS}
+
+
+def _default_external(settings: Settings, gates: dict[str, ExternalGate]) -> ExternalGate | None:
+    """AI_DEFAULT_EXTERNAL_PROVIDER's gate when it is usable (no other provider is tried)."""
+    gate = gates.get(settings.AI_DEFAULT_EXTERNAL_PROVIDER)
+    return gate if gate is not None and gate.usable else None
+
+
+def _provider_status(settings: Settings, gate: ExternalGate) -> ProviderStatus:
+    cfg = settings.external(gate.provider)
+    reason = gate.unusable_reason()
+    return ProviderStatus(
+        provider=gate.provider,
+        label=PROVIDER_LABELS[gate.provider],
+        enabled=cfg.enabled,
+        configured=bool(cfg.api_key),
+        usable=reason is None,
+        unavailable_reason=reason,
+        default_model=cfg.default_model or None,
+        allowed_models=list(cfg.models),
+        daily_limit_usd=cfg.daily_limit_usd,
+        cost_source="provider" if cfg.reports_cost else "configured_price",
+        privacy="external",
     )
 
 
@@ -136,17 +170,45 @@ async def model_catalog(
         reachable = True
     except OllamaUnavailable:
         installed, reachable = [], False
-    gate = _gate(request, settings)
+    gates = _gates(request, settings)
     local = local_fallback_model(settings, installed if reachable else None)
     models = [CatalogModel(provider="ollama", id=m, label=m) for m in installed]
-    if gate.usable:
-        models += [
-            CatalogModel(provider="openrouter", id=m, label=m) for m in settings.openrouter_models
-        ]
+    for p, g in gates.items():
+        if not g.usable:
+            continue
+        for m in g.models:
+            priced = g.priced(m)
+            models.append(
+                CatalogModel(
+                    provider=p,
+                    id=m,
+                    label=m,
+                    available=priced,
+                    unavailable_reason=None if priced else "no_pricing",
+                    privacy="external",
+                )
+            )
+    default_gate = _default_external(settings, gates)
     default = (
-        CatalogTarget(provider="openrouter", model=settings.OPENROUTER_DEFAULT_MODEL.strip())
-        if gate.usable
+        CatalogTarget(
+            provider=default_gate.provider,
+            model=default_gate.default_model,
+        )
+        if default_gate is not None
         else CatalogTarget(provider="ollama", model=local)
+    )
+    local_status = ProviderStatus(
+        provider="ollama",
+        label=PROVIDER_LABELS["ollama"],
+        enabled=True,
+        configured=True,
+        usable=reachable,
+        unavailable_reason=None if reachable else "unreachable",
+        default_model=local,
+        allowed_models=installed,
+        daily_limit_usd=None,
+        cost_source="none",
+        privacy="local",
     )
     return ModelCatalog(
         default=default,
@@ -155,20 +217,33 @@ async def model_catalog(
         models=models,
         openrouter=OpenRouterStatus(
             enabled=settings.OPENROUTER_ENABLED,
-            unavailable_reason=gate.unusable_reason(),
+            unavailable_reason=gates["openrouter"].unusable_reason(),
             research_external_allowed=settings.AI_RESEARCH_EXTERNAL_ALLOWED,
         ),
+        providers=[local_status, *(_provider_status(settings, g) for g in gates.values())],
+        default_external_provider=settings.AI_DEFAULT_EXTERNAL_PROVIDER,
+        global_daily_limit_usd=settings.AI_EXTERNAL_DAILY_LIMIT_USD,
     )
 
 
 @router.get("/ai/usage", response_model=AiUsage)
-async def ai_usage(request: Request, _: Current, settings: SettingsDep) -> AiUsage:
-    """Today's (UTC) OpenRouter spend, tokens and calls against the daily cap."""
-    limit = settings.OPENROUTER_DAILY_LIMIT_USD
-    tracker: UsageTracker | None = getattr(request.app.state, "ai_usage", None)
+async def ai_usage(
+    request: Request,
+    _: Current,
+    settings: SettingsDep,
+    provider: Annotated[str, Query(pattern="^(openrouter|anthropic|gemini)$")] = "openrouter",
+) -> AiUsage:
+    """Today's (UTC) spend, tokens and calls of one provider (default OpenRouter) against its
+    daily cap, plus today's total across providers against the shared cap."""
+    limit = settings.external(provider).daily_limit_usd
+    base: UsageTracker | None = getattr(request.app.state, "ai_usage", None)
+    tracker = base.for_provider(provider) if base is not None else None
     available = True
+    global_spent = None
     try:
         usage = await tracker.today() if tracker else DailyUsage(utc_today())
+        if tracker is not None:
+            global_spent = Decimal(await tracker.total_today_micro()) / MICRO
     except Exception:
         usage, available = DailyUsage(utc_today()), False
     spent = usage.spent_usd
@@ -183,25 +258,37 @@ async def ai_usage(request: Request, _: Current, settings: SettingsDep) -> AiUsa
         failures=usage.failures,
         cap_reached=limit <= 0 or usage.cost_micro >= to_micro(limit),
         available=available,
+        provider=provider,
+        global_limit_usd=settings.AI_EXTERNAL_DAILY_LIMIT_USD,
+        global_spent_usd=global_spent,
     )
 
 
-def _target(body: ChatRequest, conv: Conversation | None, gate: ExternalGate) -> tuple[str, str]:
+def _target(
+    body: ChatRequest,
+    conv: Conversation | None,
+    gates: dict[str, ExternalGate],
+    settings: Settings,
+) -> tuple[str, str]:
     """(provider, model) the user asked for; model "" = the local default."""
-    settings = gate.settings
     if body.provider is not None:
         provider = body.provider
         model = body.model or (conv.model if conv is not None and conv.provider == provider else "")
-        if provider == "openrouter" and not model:
-            model = settings.OPENROUTER_DEFAULT_MODEL.strip()
+        if provider in gates and not model:
+            model = gates[provider].default_model
         return provider, model
     if body.model:
-        is_or = "/" in body.model and body.model in settings.openrouter_models
-        return ("openrouter" if is_or else "ollama"), body.model
+        for p in EXTERNAL_PROVIDERS:
+            if p == "openrouter" and "/" not in body.model:
+                continue
+            if body.model in settings.external(p).models:
+                return p, body.model
+        return "ollama", body.model
     if conv is not None:
         return conv.provider, conv.model
-    if gate.usable:
-        return "openrouter", settings.OPENROUTER_DEFAULT_MODEL.strip()
+    default_gate = _default_external(settings, gates)
+    if default_gate is not None:
+        return default_gate.provider, default_gate.default_model
     return "ollama", ""
 
 
@@ -239,17 +326,19 @@ async def chat(
     if conv is not None and body.context and body.context != "general" and context == "general":
         context = body.context  # becoming stricter applies to this turn already
 
-    gate = _gate(request, settings)
-    provider, model = _target(body, conv, gate)
+    gates = _gates(request, settings)
+    provider, model = _target(body, conv, gates, settings)
+    gate = gates.get(provider)
     ollama = _ollama(request)
     paused = bool(request.app.state.agent_paused.get("ollama"))
 
-    if provider == "openrouter":
+    if gate is not None:
         if body.model and not gate.allowed(model):
+            label = PROVIDER_LABELS[provider]
             return JSONResponse(
                 {
-                    "detail": f"model {model!r} is not an allowed OpenRouter model",
-                    "available": settings.openrouter_models,
+                    "detail": f"model {model!r} is not an allowed {label} model",
+                    "available": gate.models,
                 },
                 status_code=status.HTTP_404_NOT_FOUND,
             )
@@ -258,7 +347,7 @@ async def chat(
         except OllamaUnavailable:
             installed = None
         fallback = None if paused else local_fallback_model(settings, installed)
-        decision = await gate.decide(model, prompt, context=context)
+        decision = await gate.decide(model, prompt, context=context, max_tokens=body.max_tokens)
     else:
         try:
             installed = [m.name for m in await _models_synced(request, db)]
@@ -275,12 +364,12 @@ async def chat(
         decision = Decision(False)
 
     first_provider, first_model = provider, model
-    if provider == "openrouter" and not decision.external:
+    if gate is not None and not decision.external:
         if not fallback:
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
-                f"OpenRouter is not used for this turn ({decision.reason}) and no local "
-                "model is available",
+                f"{PROVIDER_LABELS[provider]} is not used for this turn ({decision.reason}) "
+                "and no local model is available",
             )
         first_provider, first_model = "ollama", fallback
 
@@ -321,12 +410,13 @@ async def chat(
                 requested_provider=provider,
                 requested_model=model,
                 fallback_model=fallback,
-                route_reason=decision.reason if provider == "openrouter" else None,
+                route_reason=decision.reason if gate is not None else None,
                 filter_categories=tuple(decision.categories),
                 temperature=body.temperature,
                 max_tokens=body.max_tokens,
                 user_id=current.user.id,
                 client=audit.ClientInfo.from_request(request),
+                reserved_micro=decision.reserved_micro,
             ),
             ollama=ollama,
             maker=request.app.state.sessionmaker,
@@ -335,12 +425,14 @@ async def chat(
             heartbeat=settings.CHAT_HEARTBEAT_SECONDS,
             registry=request.app.state.registry,
             limiter=request.app.state.chat_limiter,
-            openrouter=gate.client,
-            usage=gate.usage,
+            external=gate.client if gate is not None else None,
+            usage=getattr(request.app.state, "ai_usage", None),
         )
     except BaseException:
         if ticket is not None:
             ticket.release()
+        if gate is not None:
+            await gate.release(decision)
         raise
     # Image generation yields to a running chat (app/services/interactive.py).
     redis = request.app.state.redis

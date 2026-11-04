@@ -20,6 +20,14 @@ that changed. The other rules are unchanged.
     unless `AI_RESEARCH_EXTERNAL_ALLOWED=true`. The Claude review exception stands as before.
   - Implementation: [25-openrouter.md](25-openrouter.md), decisions D-25-*.
 
+## 26 — Direct AI providers
+
+Decisions D-26-1 to D-26-6 are recorded in [26-ai-providers.md](26-ai-providers.md#decisions):
+official SDKs; no built-in prices (unpriced = local); worst-case reservations for priced
+providers; no external-to-external failover; no Anthropic server-side refusal fallbacks;
+the research worker stays OpenRouter-only. Rule 4's opt-in, filter and local-fallback
+requirements apply to every provider unchanged.
+
 ## A — Finance (Prompt 3)
 
 - **D-A1: DDL source.** The production Postgres container is not reachable from the build

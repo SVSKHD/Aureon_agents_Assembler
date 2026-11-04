@@ -5,10 +5,12 @@
 Routing per call, in order:
 
 1. The agent's settings (core.app_settings, /settings → Agents): disabled -> AgentDisabled;
-   provider "ollama" -> local; "auto"/"openrouter" -> ask the existing ExternalGate
-   (app/services/inference.py): OpenRouter enabled + key + budget, model allowed, the data
-   classification filter (app/services/chat_filter.py) on the full payload, and the shared
-   OPENROUTER_DAILY_LIMIT_USD cap. No second filter exists.
+   provider "ollama" -> local; "openrouter"/"anthropic"/"gemini" -> that provider; "auto" ->
+   AI_DEFAULT_EXTERNAL_PROVIDER. Either way the existing ExternalGate decides
+   (app/services/inference.py): provider enabled + key + budget, model allowed (and priced for
+   the direct APIs), the data classification filter (app/services/chat_filter.py) on the full
+   payload, the provider's daily cap (shared with chat) and the global cap. No second filter
+   exists, and a failed external call never moves to another external provider.
 2. External: bounded by MODEL_ROUTER_EXTERNAL_TIMEOUT_SECONDS (10 s). An error, a timeout or
    the cap -> the same request goes to local Ollama, and the fallback is logged + recorded.
 3. Local: the agent's local model (default qwen2.5:3b) through a bounded queue
@@ -32,12 +34,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.ollama.client import OllamaClient, OllamaError
 from app.agents.ollama.limiter import GenerationLimiter, QueueFull
-from app.agents.openrouter.client import OpenRouterClient, OpenRouterError, parse_usage
+from app.agents.openrouter.client import OpenRouterClient, parse_usage
+from app.agents.providers.base import EXTERNAL_PROVIDERS, ExternalChatClient, ProviderError
 from app.core.config import Settings
 from app.core.logging import get_logger
 from app.models.model_calls import ModelCall
 from app.services.ai_usage import UsageTracker
-from app.services.inference import ExternalGate
+from app.services.inference import ExternalGate, external_clients
 
 log = get_logger("services.model_router")
 
@@ -64,9 +67,15 @@ class ModelUnavailable(RouterError):
 @dataclass(frozen=True, slots=True)
 class AgentConfig:
     enabled: bool
-    provider: str  # auto | ollama | openrouter
-    model: str  # OpenRouter model ("" = OPENROUTER_DEFAULT_MODEL)
+    provider: str  # auto | ollama | openrouter | anthropic | gemini
+    model: str  # the external model ("" = that provider's default model)
     local_model: str
+
+    def external_provider(self, settings: Settings) -> str:
+        """The provider an external attempt uses: the agent's own, else the default one."""
+        if self.provider in EXTERNAL_PROVIDERS:
+            return self.provider
+        return settings.AI_DEFAULT_EXTERNAL_PROVIDER
 
 
 def agent_config(settings: Settings, agent: AgentName) -> AgentConfig:
@@ -85,8 +94,8 @@ class Answer:
     provider: str
     model: str
     local_only: bool
-    # Why it is not on OpenRouter (None when it is): filter | context | disabled |
-    # daily_cap_reached | forced_local | timeout | rate_limited | ...
+    # Why it is not on the external provider (None when it is): filter | context |
+    # disabled | daily_cap_reached | forced_local | timeout | rate_limited | ...
     route_reason: str | None
     fallback: bool
 
@@ -116,10 +125,15 @@ class ModelRouter:
         usage: UsageTracker | None,
         maker: async_sessionmaker[AsyncSession] | None,
         limiter: GenerationLimiter,
+        external: Mapping[str, ExternalChatClient] | None = None,
     ) -> None:
         self.settings = settings
         self.ollama = ollama
         self.openrouter = openrouter
+        # Every external client by provider; `openrouter=` stays the original keyword.
+        self.clients: dict[str, ExternalChatClient] = dict(external or {})
+        if openrouter is not None:
+            self.clients.setdefault("openrouter", openrouter)
         self.usage = usage
         self.maker = maker
         self.limiter = limiter
@@ -134,6 +148,7 @@ class ModelRouter:
             usage=getattr(state, "ai_usage", None),
             maker=state.sessionmaker,
             limiter=state.agent_limiter,
+            external=external_clients(state),
         )
 
     async def complete(
@@ -150,19 +165,30 @@ class ModelRouter:
         if not cfg.enabled:
             raise AgentDisabled(f"the {agent} agent is disabled")
         msgs = [{"role": m["role"], "content": m["content"]} for m in messages]
-        external_model = cfg.model or self.settings.OPENROUTER_DEFAULT_MODEL.strip()
+        provider = cfg.external_provider(self.settings)
+        external_model = cfg.model or self.settings.external(provider).default_model
         reason: str | None
         local_only = False
         fallback = False
         if force_local or cfg.provider == "ollama":
             reason = "forced_local"
         else:
-            gate = ExternalGate(self.settings, self.openrouter, self.usage)
-            decision = await gate.decide(external_model, msgs, context=context)
+            gate = ExternalGate(
+                self.settings, self.clients.get(provider), self.usage, provider=provider
+            )
+            decision = await gate.decide(
+                external_model, msgs, context=context, max_tokens=max_tokens
+            )
             if decision.external:
                 try:
                     return await self._external(
-                        agent, external_model, msgs, max_tokens, temperature
+                        agent,
+                        external_model,
+                        msgs,
+                        max_tokens,
+                        temperature,
+                        provider=provider,
+                        reserved_micro=decision.reserved_micro,
                     )
                 except RouterError as exc:
                     reason, fallback = exc.code, True
@@ -180,28 +206,34 @@ class ModelRouter:
         msgs: list[dict[str, str]],
         max_tokens: int | None,
         temperature: float,
+        *,
+        provider: str = "openrouter",
+        reserved_micro: int = 0,
     ) -> Answer:
-        assert self.openrouter is not None
+        client = self.clients[provider]
         started = time.monotonic()
         parts: list[str] = []
         usage: dict[str, Any] = {"prompt_tokens": 0, "completion_tokens": 0, "cost_usd": None}
 
         async def run() -> None:
-            assert self.openrouter is not None
-            async for piece in self.openrouter.chat_stream(
+            async for piece in client.chat_stream(
                 model, msgs, temperature=temperature, max_tokens=max_tokens
             ):
                 if piece.get("done"):
-                    usage.update(parse_usage(piece.get("usage")))
+                    # Clients yield parsed usage (`cost_usd`). The raw OpenRouter shape
+                    # (`cost`) is still accepted. Before docs/26 this always re-parsed, which
+                    # dropped the real client's cost: agent calls were never charged to the cap.
+                    u = piece.get("usage") or {}
+                    usage.update(u if "cost_usd" in u else parse_usage(u))
                 elif piece.get("content"):
                     parts.append(str(piece["content"]))
 
-        call = _Call(agent, "openrouter", model, "ok")
+        call = _Call(agent, provider, model, "ok")
         try:
             await asyncio.wait_for(run(), self.settings.MODEL_ROUTER_EXTERNAL_TIMEOUT_SECONDS)
         except TimeoutError:
             call.outcome = "timeout"
-        except OpenRouterError as exc:
+        except ProviderError as exc:
             call.outcome, call.route_reason = "error", exc.code
         call.latency_ms = int((time.monotonic() - started) * 1000)
         call.prompt_tokens = int(usage["prompt_tokens"])
@@ -209,11 +241,12 @@ class ModelRouter:
         call.cost_usd = usage["cost_usd"]
         await self._record(call)
         if self.usage is not None:
-            await self.usage.record(
+            await self.usage.for_provider(provider).record(
                 cost_usd=call.cost_usd,
                 prompt_tokens=call.prompt_tokens,
                 completion_tokens=call.completion_tokens,
                 failed=call.outcome != "ok",
+                reserved_micro=reserved_micro,
             )
         if call.outcome != "ok":
             log.warning(
@@ -222,7 +255,7 @@ class ModelRouter:
             err = RouterError(call.outcome)
             err.code = call.route_reason or call.outcome
             raise err
-        return Answer("".join(parts).strip(), "openrouter", model, False, None, False)
+        return Answer("".join(parts).strip(), provider, model, False, None, False)
 
     async def _local(
         self,

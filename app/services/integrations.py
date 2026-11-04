@@ -271,6 +271,38 @@ class IntegrationsSummary:
             "status": "degraded" if missing or not names else "ok",
         }
 
+    async def ai_providers(self) -> Section:
+        """External AI providers from settings only (docs/26): no call is made, so the card
+        never spends tokens. The live check is /settings → <provider> → Test."""
+        s = self.settings
+        providers: dict[str, Any] = {}
+        degraded = False
+        for p in ("openrouter", "anthropic", "gemini"):
+            cfg = s.external(p)
+            reason = s.external_unusable_reason(p)
+            unpriced = bool(cfg.default_model) and not cfg.priced(cfg.default_model)
+            providers[p] = {
+                "enabled": cfg.enabled,
+                "configured": bool(cfg.api_key),
+                "usable": reason is None and not unpriced,
+                "reason": reason or ("no_pricing" if unpriced else None),
+                "default_model": cfg.default_model or None,
+                "daily_limit_usd": str(cfg.daily_limit_usd),
+            }
+            degraded = degraded or (cfg.enabled and (reason is not None or unpriced))
+        any_on = any(v["enabled"] for v in providers.values())
+        return {
+            "providers": providers,
+            "default_external_provider": s.AI_DEFAULT_EXTERNAL_PROVIDER,
+            "global_daily_limit_usd": (
+                str(s.AI_EXTERNAL_DAILY_LIMIT_USD)
+                if s.AI_EXTERNAL_DAILY_LIMIT_USD is not None
+                else None
+            ),
+            "local_default": True,
+            "status": "degraded" if degraded else ("ok" if any_on else "disabled"),
+        }
+
     async def discord(self) -> Section:
         on = bool(self.settings.discord_webhook_url)
         return {
@@ -315,6 +347,7 @@ class IntegrationsSummary:
             ("webhook_worker", self.webhook_worker),
             ("claude_cli", self.claude_cli),
             ("ollama", self.ollama_models),
+            ("ai_providers", self.ai_providers),
             ("discord", self.discord),
             ("database", self.database),
             ("backups", self.backups),

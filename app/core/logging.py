@@ -22,8 +22,9 @@ _URL_CREDS = re.compile(r"(?P<scheme>[a-z][a-z0-9+.-]*://)(?P<user>[^:/@\s]+):[^
 _BEARER = re.compile(r"(?P<p>\b(?:bearer|token)\s+)[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE)
 # GitHub credentials in free text (classic/OAuth/app tokens and fine-grained PATs).
 _GITHUB_TOKEN = re.compile(r"github_pat_[A-Za-z0-9_]{8,}|gh[pousr]_[A-Za-z0-9]{8,}")
-# OpenRouter (sk-or-v1-...), OpenAI and Anthropic-style API keys in free text.
-_API_KEY = re.compile(r"\bsk-(?:or-v1-|proj-|ant-)?[A-Za-z0-9_-]{16,}")
+# OpenRouter (sk-or-v1-...), OpenAI and Anthropic-style API keys, and Google API keys
+# (Gemini: AIza...), in free text.
+_API_KEY = re.compile(r"\bsk-(?:or-v1-|proj-|ant-)?[A-Za-z0-9_-]{16,}|\bAIza[0-9A-Za-z_-]{30,}")
 # Discord webhook URLs carry their credential in the path.
 _DISCORD_WEBHOOK = re.compile(
     r"(?P<p>discord(?:app)?\.com/api/webhooks/\d+/)[A-Za-z0-9._-]+", re.IGNORECASE

@@ -1,10 +1,12 @@
 """Low-level DhanHQ v2 REST client: READ-ONLY endpoints only.
 
 - **No order endpoints:** there is no place, modify or cancel method here, and no generic
-  "call any URL" helper. Order execution is Trading Phase G, in a separate module behind the
-  LIVE gate.
-- **Credentials:** the access token comes from env (Settings) and is sent only in the
-  `access-token` header. It is never logged or put in error messages.
+  "call any URL" helper. `_request` itself refuses anything but GET and the market-data
+  POSTs (`assert_read_only`), so a new method cannot write by accident. Order execution is
+  Trading Phase G, in a separate module behind the LIVE gate.
+- **Credentials:** the access token comes from Settings (the Dhan login's session token,
+  stored encrypted in core.app_settings, or the manual DHAN_ACCESS_TOKEN) and is sent only
+  in the `access-token` header. It is never logged or put in error messages.
 - **Rate limits** use the documented table. Buckets are shared across processes via Redis
   (BrokerRateLimiter):
   - non-trading APIs: 20/s
@@ -40,7 +42,32 @@ BUCKETS: dict[str, list[Window]] = {
     "quote": [Window(1, 1)],
     "option_chain": [Window(3, 1)],
 }
+# The read-only guarantee, enforced at the one place a request leaves (docs/11-dhan.md): GET
+# for reads, and POST only to the market-data endpoints Dhan serves as POST. Anything else
+# (an order place/modify/cancel, PUT, DELETE, ...) is refused before a request is made.
+READ_POST_PATHS = frozenset(
+    {
+        "/marketfeed/quote",
+        "/charts/historical",
+        "/charts/intraday",
+        "/optionchain",
+        "/optionchain/expirylist",
+    }
+)
 AUTH_CODES = {"DH-901", "807", "808", "809", "810"}
+
+
+class ReadOnlyViolation(BrokerError):
+    """A write was attempted through the read-only Dhan client."""
+
+
+def assert_read_only(method: str, path: str) -> None:
+    m = method.upper()
+    if m == "GET" or (m == "POST" and path in READ_POST_PATHS):
+        return
+    raise ReadOnlyViolation(f"Dhan client is read-only: {m} {path.split('?')[0]} is not allowed")
+
+
 RETRY_CODES = {"DH-904", "805", "DH-908", "DH-909"}
 MAX_ATTEMPTS = 3
 
@@ -99,6 +126,7 @@ class DhanClient:
     async def _request(
         self, method: str, path: str, bucket: str, body: dict[str, Any] | None = None
     ) -> Any:
+        assert_read_only(method, path)
         request_id = new_request_id()
         self.last_request_id = request_id
         for attempt in range(1, MAX_ATTEMPTS + 1):

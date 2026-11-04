@@ -20,6 +20,8 @@ _PATTERNS = (
     re.compile(r"\bBearer\s+[A-Za-z0-9_\-.=]{8,}"),
     # OpenRouter / OpenAI / Anthropic-style API keys (docs/25-openrouter.md)
     re.compile(r"\bsk-(?:or-v1-|proj-|ant-)?[A-Za-z0-9_-]{16,}"),
+    # Google API keys (Gemini, docs/26-ai-providers.md)
+    re.compile(r"\bAIza[0-9A-Za-z_-]{30,}"),
 )
 
 

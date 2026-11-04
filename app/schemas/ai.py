@@ -42,7 +42,7 @@ class ChatMessageIn(BaseModel):
     content: str = Field(min_length=1, max_length=32_000)
 
 
-Provider = Literal["ollama", "openrouter"]
+Provider = Literal["ollama", "openrouter", "anthropic", "gemini"]
 ConversationContext = Literal["general", "finance", "trading", "research"]
 
 
@@ -50,10 +50,11 @@ class ChatRequest(BaseModel):
     """`messages` are the NEW turns only; for an existing conversation the server prepends
     its stored history before calling the model.
 
-    `provider`/`model` pick who should answer (docs/25-openrouter.md). Both may be omitted:
-    an existing conversation keeps its own, a new one gets the server default (OpenRouter's
-    default model when it is usable, else the local default). A `model` without a
-    `provider` means OpenRouter only when it is one of the allowed OpenRouter ids.
+    `provider`/`model` pick who should answer (docs/25-openrouter.md, docs/26). Both may be
+    omitted: an existing conversation keeps its own, a new one gets the server default
+    (AI_DEFAULT_EXTERNAL_PROVIDER's default model when it is usable, else the local default).
+    A `model` without a `provider` means an external provider only when it is one of that
+    provider's allowed ids (OpenRouter ids contain a "/").
     `context` links a conversation to finance/trading/research (forces local inference);
     a link only ever gets stricter."""
 
@@ -115,6 +116,12 @@ class CatalogModel(BaseModel):
     provider: Provider
     id: str
     label: str
+    # False: listed for visibility but not selectable (e.g. an unpriced direct-API model).
+    available: bool = True
+    unavailable_reason: str | None = None
+    capabilities: list[str] = Field(default_factory=lambda: ["chat", "streaming"])
+    # "local" (never leaves the server) | "external" (only after the privacy gate).
+    privacy: Literal["local", "external"] = "local"
 
 
 class CatalogTarget(BaseModel):
@@ -129,22 +136,46 @@ class OpenRouterStatus(BaseModel):
     research_external_allowed: bool
 
 
+class ProviderStatus(BaseModel):
+    """One provider's state for the picker and the settings page. Never a key."""
+
+    provider: Provider
+    label: str
+    enabled: bool
+    # A key is set (never the key itself).
+    configured: bool
+    usable: bool
+    # None = usable. disabled | not_configured | no_budget (why every turn stays local).
+    unavailable_reason: str | None
+    default_model: str | None
+    allowed_models: list[str]
+    daily_limit_usd: Decimal | None
+    # OpenRouter reports the cost; direct APIs are charged at the configured price.
+    cost_source: Literal["provider", "configured_price", "none"]
+    privacy: Literal["local", "external"]
+
+
 class ModelCatalog(BaseModel):
-    """Everything the SPA's picker offers. OpenRouter ids come from the server's allowlist;
-    the browser never talks to OpenRouter."""
+    """Everything the SPA's picker offers. External ids come from the server's allowlists;
+    the browser never talks to a provider."""
 
     default: CatalogTarget
     local_fallback_model: str | None
     ollama_reachable: bool
     models: list[CatalogModel]
     openrouter: OpenRouterStatus
+    # Every provider, local first (docs/26). Added without changing the fields above.
+    providers: list[ProviderStatus] = Field(default_factory=list)
+    default_external_provider: str | None = None
+    global_daily_limit_usd: Decimal | None = None
 
 
 class AiUsage(BaseModel):
-    """Today's (UTC) OpenRouter spend against OPENROUTER_DAILY_LIMIT_USD."""
+    """Today's (UTC) spend of one provider (OpenRouter unless ?provider=) against its cap,
+    plus the shared cap across providers."""
 
     day: date
-    provider: Literal["openrouter"] = "openrouter"
+    provider: Literal["openrouter", "anthropic", "gemini"] = "openrouter"
     spent_usd: Decimal
     limit_usd: Decimal
     remaining_usd: Decimal
@@ -155,3 +186,7 @@ class AiUsage(BaseModel):
     cap_reached: bool
     # False when the counter could not be read (external calls then stay local).
     available: bool = True
+    # AI_EXTERNAL_DAILY_LIMIT_USD (None = per-provider caps only) and today's total across
+    # providers, open reservations included.
+    global_limit_usd: Decimal | None = None
+    global_spent_usd: Decimal | None = None

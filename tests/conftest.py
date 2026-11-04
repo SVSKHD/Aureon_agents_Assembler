@@ -37,6 +37,10 @@ def settings(data_root: Path) -> Settings:
         HEALTH_CHECK_TIMEOUT=1.0,
         # Never pick up a real token from the host environment.
         GITHUB_TOKEN=None,
+        DISCORD_WEBHOOK_URL=None,
+        OPENROUTER_API_KEY=None,
+        ANTHROPIC_API_KEY=None,
+        GEMINI_API_KEY=None,
         # Image jobs never wait for an IST trading window in tests (tests set their own).
         IMAGE_PAUSE_WINDOWS=[],
     )
