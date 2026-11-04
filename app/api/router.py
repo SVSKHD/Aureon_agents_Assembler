@@ -10,6 +10,7 @@ from app.api.v1 import (
     audit_events,
     auth,
     code,
+    dhan_auth,
     finance,
     github,
     github_actions,
@@ -51,4 +52,5 @@ api_router.include_router(voice.router)  # /api/v1/voice/intent (navigation only
 api_router.include_router(repairs.router)  # /api/v1/repairs (Phase 18 self-repair)
 api_router.include_router(reviews.router)  # /api/v1/reviews + …/pulls/{n}/claude-review
 api_router.include_router(app_settings.router)  # /api/v1/settings (runtime settings + secrets)
+api_router.include_router(dhan_auth.router)  # /api/v1/dhan/auth (Dhan API key login)
 api_router.include_router(system.router)  # /api/v1/system (Phase 22 integrations card)

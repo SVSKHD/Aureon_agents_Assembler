@@ -14,13 +14,18 @@ from app.core.config import Settings
 def build_dhan_adapter(
     settings: Settings, redis: Redis, maker: async_sessionmaker[AsyncSession]
 ) -> DhanAdapter | None:
-    """The adapter for the env-configured Dhan client, or None if credentials are unset."""
-    if not settings.dhan_configured:
+    """The adapter for the configured Dhan client, or None without a usable token: the
+    logged-in session's token while valid, else the manual DHAN_ACCESS_TOKEN."""
+    if not settings.DHAN_CLIENT_ID or settings.dhan_access_token() is None:
         return None
-    assert settings.DHAN_CLIENT_ID and settings.DHAN_ACCESS_TOKEN
+
+    def token() -> str | None:
+        current = settings.dhan_access_token()
+        return current.get_secret_value() if current is not None else None
+
     client = DhanClient(
         settings.DHAN_CLIENT_ID,
-        settings.DHAN_ACCESS_TOKEN.get_secret_value(),
+        token,
         base_url=settings.DHAN_BASE_URL,
         timeout=settings.DHAN_HTTP_TIMEOUT,
         limiter=BrokerRateLimiter(redis, f"rl:dhan:{settings.DHAN_CLIENT_ID}", BUCKETS),

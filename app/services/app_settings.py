@@ -64,14 +64,19 @@ class Spec:
     # Writing or reverting it needs the admin's password: every secret, and the URLs a
     # credential is sent to (pointing DHAN_BASE_URL elsewhere would hand over the token).
     reauth: bool = False
+    # Written only by its own flow (the Dhan login), never by PUT/DELETE /api/v1/settings.
+    # Listed (masked) so the admin sees it; part of the overlay like any other key.
+    managed: bool = False
 
     @property
     def secret(self) -> bool:
         return self.kind == "secret"
 
 
-def _s(key: str, cat: str, kind: Kind, desc: str, reauth: bool = False) -> Spec:
-    return Spec(key, cat, kind, desc, reauth or kind == "secret")
+def _s(
+    key: str, cat: str, kind: Kind, desc: str, reauth: bool = False, managed: bool = False
+) -> Spec:
+    return Spec(key, cat, kind, desc, reauth or kind == "secret", managed)
 
 
 CATEGORIES = ("openrouter", "dhan", "github", "discord", "mt5")
@@ -91,7 +96,37 @@ REGISTRY: dict[str, Spec] = {
             "Let research prompts go to external models",
         ),
         _s("DHAN_CLIENT_ID", "dhan", "secret", "Dhan client id"),
-        _s("DHAN_ACCESS_TOKEN", "dhan", "secret", "Dhan access token (expires; re-issue daily)"),
+        _s("DHAN_API_KEY", "dhan", "secret", "Dhan API key (web.dhan.co, Access DhanHQ APIs)"),
+        _s("DHAN_API_SECRET", "dhan", "secret", "Dhan API secret"),
+        _s(
+            "DHAN_REDIRECT_URL",
+            "dhan",
+            "url",
+            "Redirect URL registered with the API key: <this site>/api/v1/dhan/auth/callback",
+            reauth=True,
+        ),
+        _s("DHAN_AUTH_URL", "dhan", "url", "Dhan login API base URL", reauth=True),
+        _s(
+            "DHAN_SESSION_TOKEN",
+            "dhan",
+            "secret",
+            "Session token from 'Log in to Dhan' (set by the login, not by hand)",
+            managed=True,
+        ),
+        _s(
+            "DHAN_SESSION_EXPIRES_AT",
+            "dhan",
+            "str",
+            "When the Dhan session expires (UTC; set by the login)",
+            managed=True,
+        ),
+        _s("DHAN_SESSION_ALERT_MINUTES", "dhan", "int", "Alert this many minutes before expiry"),
+        _s(
+            "DHAN_ACCESS_TOKEN",
+            "dhan",
+            "secret",
+            "Manual fallback: an access token from web.dhan.co (used without a Dhan login)",
+        ),
         _s("DHAN_BASE_URL", "dhan", "url", "Dhan REST base URL", reauth=True),
         _s("DHAN_FEED_URL", "dhan", "url", "Dhan market feed URL (wss)", reauth=True),
         _s("DHAN_INSTRUMENT_CSV_URL", "dhan", "url", "Dhan instrument master CSV", reauth=True),
@@ -291,6 +326,13 @@ def mask(value: str | None, secret: bool) -> str | None:
     if secret and len(value) < 16:
         return "••••"
     return "••••" + value[-4:] if len(value) > 4 else "••••"
+
+
+def as_utc(value: datetime | None) -> datetime | None:
+    """A stored timestamp as an aware UTC datetime (naive values are UTC)."""
+    if value is None:
+        return None
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 def dhan_token_expiry(token: str | None) -> datetime | None:
@@ -567,9 +609,12 @@ async def _openrouter(s: Settings, http: httpx.AsyncClient) -> TestOutcome:
 
 
 async def _dhan(s: Settings, http: httpx.AsyncClient) -> TestOutcome:
-    cid, token = current_value(s, "DHAN_CLIENT_ID"), current_value(s, "DHAN_ACCESS_TOKEN")
-    if not cid or not token:
-        return TestOutcome(False, "DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN must both be set")
+    cid, secret = current_value(s, "DHAN_CLIENT_ID"), s.dhan_access_token()
+    if not cid or secret is None:
+        return TestOutcome(
+            False, "set DHAN_CLIENT_ID and log in to Dhan (or set DHAN_ACCESS_TOKEN)"
+        )
+    token = secret.get_secret_value()
     resp = await http.get(
         f"{s.DHAN_BASE_URL.rstrip('/')}/fundlimit",
         headers={"access-token": token, "client-id": cid, "Accept": "application/json"},

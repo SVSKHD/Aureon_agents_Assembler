@@ -250,6 +250,7 @@ WEBHOOK = "https://discord.com/api/webhooks/123456789/" + "WebhookSecretPart_" *
 ALLOWED_FIELDS = {
     "key", "category", "description", "kind", "is_secret", "requires_reauth", "is_set",
     "masked", "source", "updated_at", "version", "expires_at", "expires_soon",
+    "managed",  # a key only its own flow writes (Dhan login); never a value
 }  # fmt: skip
 
 

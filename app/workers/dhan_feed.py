@@ -98,20 +98,24 @@ async def main() -> int:
     settings: Settings = await app_settings.worker_settings()
     configure_logging(settings.LOG_LEVEL)
     if not settings.dhan_configured:
-        log.error("dhan_not_configured", hint="set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN")
+        log.error(
+            "dhan_not_configured",
+            hint="set DHAN_CLIENT_ID and log in to Dhan on /settings (or DHAN_ACCESS_TOKEN)",
+        )
         return 1
     instruments = parse_instruments(settings.DHAN_FEED_INSTRUMENTS)
     if not instruments:
         log.error("no_feed_instruments", hint="set DHAN_FEED_INSTRUMENTS")
         return 1
-    assert settings.DHAN_CLIENT_ID and settings.DHAN_ACCESS_TOKEN
+    token = settings.dhan_access_token()
+    assert settings.DHAN_CLIENT_ID and token is not None
     engine = build_engine(settings)
     registry = AgentRegistry(build_sessionmaker(engine))
     redis = Redis.from_url(settings.REDIS_URL)
     feed = DhanFeed(
         url=settings.DHAN_FEED_URL,
         client_id=settings.DHAN_CLIENT_ID,
-        access_token=settings.DHAN_ACCESS_TOKEN.get_secret_value(),
+        access_token=token.get_secret_value(),
         instruments=instruments,
         mode=settings.DHAN_FEED_MODE,
         queue_max=settings.DHAN_FEED_QUEUE_MAX,
@@ -163,7 +167,7 @@ async def main() -> int:
                             "error",
                             "feed stopped: Dhan rejected the token or data plan "
                             f"(reason {feed.stats.last_disconnect_reason}); "
-                            "update DHAN_ACCESS_TOKEN and restart dhan-feed",
+                            "log in to Dhan again on /settings (the feed restarts itself)",
                         )
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(shutdown.wait(), 5)

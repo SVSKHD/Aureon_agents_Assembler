@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from functools import lru_cache
@@ -11,6 +12,15 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+
+def _secret_text(value: SecretStr | str | None) -> str:
+    """A secret's text, stripped ("" when unset). Accepts a plain str too (model_copy skips
+    validation, so a copied Settings can hold one)."""
+    if value is None:
+        return ""
+    raw = value.get_secret_value() if isinstance(value, SecretStr) else str(value)
+    return raw.strip()
 
 
 class Environment(StrEnum):
@@ -171,10 +181,39 @@ class Settings(BaseSettings):
     DHAN_BACKFILL_DAYS: int = Field(default=30, ge=1, le=3650)
     # The static IP you whitelisted on Dhan (only scripts/dhan_preflight.py reads it).
     DHAN_STATIC_IP: str | None = None
+    # API key login (docs/11-dhan.md, "Log in with the API key"): the key + secret from
+    # web.dhan.co -> Access DhanHQ APIs -> API key; the redirect URL registered there.
+    DHAN_API_KEY: SecretStr | None = None
+    DHAN_API_SECRET: SecretStr | None = None
+    DHAN_REDIRECT_URL: str | None = None
+    DHAN_AUTH_URL: str = "https://auth.dhan.co"
+    # Written by the login flow only (core.app_settings, encrypted): the session's access
+    # token and its expiry (UTC). Never set these in .env.
+    DHAN_SESSION_TOKEN: SecretStr | None = None
+    DHAN_SESSION_EXPIRES_AT: datetime | None = None
+    # Discord alert when the Dhan session has expired or expires within this many minutes.
+    DHAN_SESSION_ALERT_MINUTES: int = Field(default=60, ge=0, le=24 * 60)
+
+    def dhan_session_active(self, now: datetime | None = None) -> bool:
+        """A login-flow token that has not expired yet."""
+        exp = self.DHAN_SESSION_EXPIRES_AT
+        if not _secret_text(self.DHAN_SESSION_TOKEN) or exp is None:
+            return False
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=UTC)
+        return exp > (now or datetime.now(UTC))
+
+    def dhan_access_token(self, now: datetime | None = None) -> SecretStr | None:
+        """The token every Dhan call uses: the logged-in session's while it is valid, else the
+        manual DHAN_ACCESS_TOKEN fallback (None = no usable token)."""
+        if self.dhan_session_active(now):
+            return SecretStr(_secret_text(self.DHAN_SESSION_TOKEN))
+        manual = _secret_text(self.DHAN_ACCESS_TOKEN)
+        return SecretStr(manual) if manual else None
 
     @property
     def dhan_configured(self) -> bool:
-        return bool(self.DHAN_CLIENT_ID and self.DHAN_ACCESS_TOKEN)
+        return bool(self.DHAN_CLIENT_ID and self.dhan_access_token())
 
     # --- MT5 bot (Trading Phase C, docs/12-mt5-adapter.md). Read-only status export only. ---
     # Either the bot's logs/status.json (bind-mounted read-only) or its GET /status endpoint.

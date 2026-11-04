@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -59,7 +60,7 @@ class DhanClient:
     def __init__(
         self,
         client_id: str,
-        access_token: str,
+        access_token: str | Callable[[], str | None],
         *,
         base_url: str,
         limiter: BrokerRateLimiter | None,
@@ -67,6 +68,8 @@ class DhanClient:
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.client_id = client_id
+        # A string, or a callable read on every request: the API passes
+        # Settings.dhan_access_token, so an expired login falls back to the manual token.
         self._token = access_token
         self.limiter = limiter
         self._http = httpx.AsyncClient(
@@ -74,7 +77,6 @@ class DhanClient:
             timeout=timeout,
             transport=transport,
             headers={
-                "access-token": access_token,
                 "client-id": client_id,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
@@ -84,6 +86,12 @@ class DhanClient:
 
     async def aclose(self) -> None:
         await self._http.aclose()
+
+    def _current_token(self) -> str:
+        token = self._token() if callable(self._token) else self._token
+        if not token:
+            raise CredentialsExpired("no usable Dhan access token; log in to Dhan")
+        return token
 
     def __repr__(self) -> str:  # never print the token
         return f"DhanClient(client_id={self.client_id!r})"
@@ -98,7 +106,9 @@ class DhanClient:
                 await self.limiter.acquire(bucket)
             cause: Exception | None = None
             try:
-                resp = await self._http.request(method, path, json=body)
+                resp = await self._http.request(
+                    method, path, json=body, headers={"access-token": self._current_token()}
+                )
             except httpx.TimeoutException as exc:
                 err = DhanApiError("timeout", "Dhan did not respond in time")
                 cause = exc
