@@ -105,7 +105,7 @@ ADMIN = {
     ("PATCH", "/api/v1/github/repositories/{owner}/{repo}/issues/comments/{comment_id}"),
     ("DELETE", "/api/v1/github/repositories/{owner}/{repo}/issues/comments/{comment_id}"),
     ("POST", "/api/v1/github/repositories/{owner}/{repo}/issues/{n}/labels"),
-    ("DELETE", "/api/v1/github/repositories/{owner}/{repo}/issues/{n}/labels/{name}"),
+    ("DELETE", "/api/v1/github/repositories/{owner}/{repo}/issues/{n}/labels/{name:path}"),
     ("PUT", "/api/v1/github/repositories/{owner}/{repo}/issues/{n}/lock"),
     ("DELETE", "/api/v1/github/repositories/{owner}/{repo}/issues/{n}/lock"),
     ("POST", "/api/v1/github/repositories/{owner}/{repo}/issues/{n}/links"),
