@@ -27,6 +27,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.api.ui import ui_module
 from app.api.v1.github import Client, _allowed, _error, _invalid
 from app.auth.deps import AdminRequired, CurrentSession, DbSession, SettingsDep
 from app.core.config import Settings
@@ -52,6 +53,7 @@ from app.services import github_ops as ops
 from app.services.approvals import ApprovalError, ApprovalGate
 from app.services.audit import ClientInfo
 
+UI_MODULE = ui_module("github", label="GitHub", group="dev", icon="github", order=52)
 router = APIRouter(prefix="/v1/github", tags=["github"])
 
 Number = Annotated[int, Path(ge=1, le=10**9)]

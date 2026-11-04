@@ -16,10 +16,12 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
+from app.api.ui import ui_module
 from app.auth.deps import AdminRequired, DbSession
 from app.models.auth import AuditEvent, User
 from app.schemas.common import Page
 
+UI_MODULE = ui_module("audit", label="Audit", group="admin", icon="scroll-text", order=80)
 router = APIRouter(prefix="/v1/audit", tags=["audit"])
 
 

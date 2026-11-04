@@ -18,6 +18,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.api.ui import ui_module
 from app.api.v1.github import Client, _allowed
 from app.api.v1.github_issues import Number, RepoDep, errors
 from app.auth.deps import AdminRequired, DbSession, SettingsDep
@@ -31,6 +32,7 @@ from app.services import claude_review as cr
 from app.services import github_ops as ops
 from app.services.audit import ClientInfo
 
+UI_MODULE = ui_module("reviews", label="Reviews", group="dev", icon="message-square-code", order=56)
 router = APIRouter(prefix="/v1", tags=["reviews"])
 
 Limit = Annotated[int, Query(ge=1, le=200)]

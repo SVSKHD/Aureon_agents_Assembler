@@ -23,10 +23,12 @@ from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.api.ui import ui_module
 from app.auth.deps import SettingsDep
 from app.schemas.github_actions import WebhookAck
 from app.services import github_webhooks as hooks
 
+UI_MODULE = ui_module("github", label="GitHub", group="dev", icon="github", order=52)
 router = APIRouter(prefix="/v1/github", tags=["github-webhooks"])
 
 

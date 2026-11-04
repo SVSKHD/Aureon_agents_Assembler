@@ -34,6 +34,7 @@ from app.agents.trading.mt5.push import (
     parse_push,
 )
 from app.agents.trading.ratelimit import BrokerRateLimiter, RateLimitExceeded, Window
+from app.api.ui import ui_module
 from app.auth.deps import Current, DbSession, SettingsDep
 from app.core.config import Settings
 from app.core.logging import get_logger
@@ -52,6 +53,7 @@ from app.services import mt5_dashboard
 from app.services.mt5_ingest import TIMELINE_KINDS, DbIngestStore, IngestStore
 
 log = get_logger(__name__)
+UI_MODULE = ui_module("mt5", label="MT5", group="markets", icon="activity", order=24)
 router = APIRouter(prefix="/trading/mt5", tags=["trading", "mt5"])
 
 INGEST_PATH = "/api/trading/mt5/ingest"

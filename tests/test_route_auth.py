@@ -237,6 +237,8 @@ def test_prod_app_has_no_docs_or_openapi(data_root: Path) -> None:
 
 
 @pytest.mark.parametrize("path", ["/api/openapi.json", "/api/docs"])
-async def test_docs_answer_outside_prod(client: object, path: str) -> None:
+async def test_docs_need_a_session_even_outside_prod(client: object, path: str) -> None:
+    """docs/ui-manifest.md: the OpenAPI document maps every route, so it is never public;
+    Swagger (dev only) is behind the session too."""
     r = await client.get(path)  # type: ignore[attr-defined]
-    assert r.status_code == 200
+    assert r.status_code == 401

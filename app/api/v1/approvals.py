@@ -29,6 +29,7 @@ from sqlalchemy import select
 # Importing the GitHub ops / actions modules registers the github.* executors.
 import app.services.github_actions
 import app.services.github_ops  # noqa: F401
+from app.api.ui import ui_module
 from app.auth.deps import AdminRequired, DbSession, SettingsDep
 from app.auth.security import verify_password
 from app.models.approvals import ApprovalPolicy
@@ -55,6 +56,7 @@ from app.services import approval_reauth, approval_stream, audit
 from app.services.approvals import ApprovalError, ApprovalGate, Policy
 from app.services.audit import ClientInfo
 
+UI_MODULE = ui_module("approvals", label="Approvals", group="admin", icon="circle-check", order=60)
 router = APIRouter(prefix="/v1/approvals", tags=["approvals"])
 
 Status = Literal["pending", "approved", "denied", "expired", "invalidated", "executed", "failed"]

@@ -17,6 +17,7 @@ from sqlalchemy import select
 from app.agents.coding.git import GitError
 from app.agents.coding.paths import PathRejected, normalize
 from app.agents.coding.repos import RepoConfig, RepoNotAllowed, get_repo
+from app.api.ui import ui_module
 from app.auth.deps import AdminRequired, DbSession, SettingsDep
 from app.core.config import Settings
 from app.models.agents import CodeGitOp, CodeTask
@@ -40,6 +41,7 @@ from app.schemas.common import Page
 from app.services import audit, coding, coding_git
 from app.services.audit import ClientInfo
 
+UI_MODULE = ui_module("code", label="Code", group="dev", icon="code", order=50)
 router = APIRouter(tags=["code"])
 Limit = Annotated[int, Query(ge=1, le=200)]
 Offset = Annotated[int, Query(ge=0)]

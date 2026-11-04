@@ -30,6 +30,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.agents.trading.ratelimit import BrokerRateLimiter, RateLimitExceeded, Window
+from app.api.ui import ui_module
 from app.auth.deps import AdminRequired, Current, DbSession
 from app.core.config import Settings
 from app.services import app_settings as svc
@@ -38,6 +39,7 @@ from app.services import dhan_auth as dhan
 from app.services.audit import ClientInfo
 
 log = structlog.get_logger(__name__)
+UI_MODULE = ui_module("dhan", label="Dhan", group="markets", icon="landmark", order=26)
 router = APIRouter(prefix="/v1/dhan/auth", tags=["dhan"])
 
 # The SPA page that finishes the login (CcSettings handles ?dhan_token_id= / ?dhan_error=).

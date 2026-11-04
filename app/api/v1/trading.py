@@ -24,6 +24,7 @@ from app.agents.research import strategies as strategy_impls
 from app.agents.trading.base import BrokerAdapter
 from app.agents.trading.mt5.adapter import MT5Adapter
 from app.agents.trading.types import Broker, SignalSide, Timeframe
+from app.api.ui import ui_module
 from app.auth.deps import AdminRequired, CsrfProtected, Current, DbSession, SettingsDep
 from app.models.agents import Agent, AgentLog
 from app.models.brokers import MANUAL_MT5_SERVER, Mt5Symbol
@@ -94,6 +95,9 @@ from app.services.trading import (
     visible_accounts,
 )
 
+UI_MODULE = ui_module(
+    "trading", label="Trading", group="markets", icon="candlestick-chart", order=20
+)
 router = APIRouter(prefix="/trading", tags=["trading"])
 
 Limit = Annotated[int, Query(ge=1, le=500)]
@@ -1061,6 +1065,7 @@ async def stream(
         heartbeat_seconds=settings.TRADING_STREAM_HEARTBEAT_SECONDS,
         max_seconds=settings.TRADING_STREAM_MAX_SECONDS,
         stale_after=settings.AGENT_STALE_SECONDS,
+        schema_hash=getattr(request.app.state, "schema_hash", ""),
     )
     return StreamingResponse(
         gen,

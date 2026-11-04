@@ -26,6 +26,7 @@ from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Path, Query, status
 
+from app.api.ui import ui_module
 from app.api.v1.github_issues import Number, PageNo, PerPage, RepoDep, errors
 from app.schemas.github import CommitOut
 from app.schemas.github_ops import (
@@ -53,6 +54,7 @@ from app.schemas.github_ops import (
 from app.services import github as gh
 from app.services import github_ops as ops
 
+UI_MODULE = ui_module("github", label="GitHub", group="dev", icon="github", order=52)
 router = APIRouter(prefix="/v1/github", tags=["github"])
 
 REPO = "/repositories/{owner}/{repo}"

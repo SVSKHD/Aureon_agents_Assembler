@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
 
+from app.api.ui import ui_module
 from app.auth.deps import AuthServiceDep, CsrfProtected, Current, DbSession, SettingsDep
 from app.auth.rate_limit import LoginRateLimiter
 from app.auth.security import csrf_token_for
@@ -23,6 +24,7 @@ from app.schemas.auth import (
 from app.services import audit
 from app.services.audit import ClientInfo
 
+UI_MODULE = ui_module("auth", label="Account", group="account", icon="user", order=5)
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 INVALID_CREDENTIALS = "invalid email or password"

@@ -27,3 +27,11 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: pytest -q -m "not db"
+      # docs/ui-manifest.md: every route has x-ui (tests/test_ui_manifest.py, part of pytest
+      # above) and the typed OpenAPI document is kept as an artifact for the frontend client.
+      - run: python scripts/export_openapi.py --out openapi.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openapi
+          path: openapi.json
+          retention-days: 30

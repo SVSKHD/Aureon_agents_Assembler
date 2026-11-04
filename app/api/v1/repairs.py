@@ -23,6 +23,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from sqlalchemy import func, select
 
+from app.api.ui import ui_module
 from app.auth.deps import AdminRequired, DbSession, SettingsDep
 from app.models.repairs import Incident, RepairTask
 from app.schemas.common import Page
@@ -37,6 +38,7 @@ from app.schemas.repairs import (
 from app.services import audit, incidents, repairs
 from app.services.audit import ClientInfo
 
+UI_MODULE = ui_module("repairs", label="Repairs", group="dev", icon="wrench", order=58)
 router = APIRouter(prefix="/v1/repairs", tags=["repairs"])
 
 IncidentStatus = Literal["open", "recovering", "repair_queued", "resolved", "ignored"]

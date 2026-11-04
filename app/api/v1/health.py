@@ -6,8 +6,10 @@ from typing import Any
 
 from fastapi import APIRouter, Request, Response, status
 
+from app.api.ui import ui_module
 from app.services.health import HealthService
 
+UI_MODULE = ui_module("health", label="Health", group="admin", icon="heart-pulse", order=950)
 router = APIRouter(prefix="/health", tags=["health"])
 
 

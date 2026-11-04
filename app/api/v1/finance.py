@@ -38,6 +38,7 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from app.api.ui import ui_module
 from app.auth.deps import AdminRequired, CsrfProtected, Current, DbSession, SettingsDep
 from app.models.finance import FinanceAttachment
 from app.schemas import finance as s
@@ -48,6 +49,7 @@ from app.services import finance_attachments as att
 from app.services.audit import ClientInfo
 from app.services.health import check_data_root
 
+UI_MODULE = ui_module("finance", label="Finance", group="personal", icon="wallet", order=30)
 router = APIRouter(prefix="/finance", tags=["finance"])
 
 Limit = Annotated[int, Query(ge=1, le=500)]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import time
 import uuid
+from typing import Any
 
 import structlog
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -86,6 +87,30 @@ class SecurityHeadersMiddleware:
                     if name in present or (skip_csp and name == b"content-security-policy"):
                         continue
                     headers.append((name, value))
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+class SchemaHeaderMiddleware:
+    """Adds `X-API-Schema: <hash>` (app.state.schema_hash, docs/ui-manifest.md) to every
+    /api response, so the frontend notices a new API right after a deploy. Pure ASGI."""
+
+    def __init__(self, app: ASGIApp, state: Any) -> None:
+        self.app = app
+        self.state = state
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not str(scope.get("path", "")).startswith("/api"):
+            await self.app(scope, receive, send)
+            return
+        value = str(getattr(self.state, "schema_hash", "") or "").encode()
+
+        async def send_wrapper(message: Message) -> None:
+            if message["type"] == "http.response.start" and value:
+                headers = list(message.get("headers", []))
+                headers.append((b"x-api-schema", value))
                 message["headers"] = headers
             await send(message)
 
