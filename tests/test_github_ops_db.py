@@ -215,6 +215,14 @@ async def test_issue_list_detail_and_writes(env: OpsEnv) -> None:
             assert r.json() == ["bug", "ui"]
             r = await e.send("admin", "DELETE", f"{R}/issues/1/labels/needs triage")
             assert r.json() == ["bug"] and rm.called
+            # A label with "/" arrives as %2F (the frontend's encodeURIComponent) and is
+            # re-encoded for GitHub as one path segment.
+            rm_slash = router.delete(f"{GH}/issues/1/labels/area%2Fui").mock(
+                return_value=httpx.Response(200, json=[{"name": "bug"}])
+            )
+            r = await e.send("admin", "DELETE", f"{R}/issues/1/labels/area%2Fui")
+            assert r.status_code == 200, r.text
+            assert r.json() == ["bug"] and rm_slash.called
             r = await e.send("admin", "PUT", f"{R}/issues/1/lock", json={"lock_reason": "spam"})
             assert r.status_code == 204
             r = await e.send("admin", "DELETE", f"{R}/issues/1/lock")
@@ -239,6 +247,7 @@ async def test_issue_list_detail_and_writes(env: OpsEnv) -> None:
             ("issue.comment.delete", "succeeded"),
             ("issue.label.add", "succeeded"),
             ("issue.label.remove", "succeeded"),
+            ("issue.label.remove", "succeeded"),  # the "area/ui" label
             ("issue.lock", "succeeded"),
             ("issue.unlock", "succeeded"),
             ("issue.comment.create", "failed"),
@@ -249,7 +258,7 @@ async def test_issue_list_detail_and_writes(env: OpsEnv) -> None:
         r = await e.get("admin", "/api/v1/github/operations", params={"status": "failed"})
         assert r.json()["total"] == 1 and r.json()["items"][0]["op"] == "issue.comment.create"
         r = await e.get("admin", "/api/v1/github/operations", params={"limit": 5})
-        assert r.json()["total"] == 12 and len(r.json()["items"]) == 5
+        assert r.json()["total"] == 13 and len(r.json()["items"]) == 5
 
 
 async def test_tracked_payload_is_redacted(env: OpsEnv) -> None:

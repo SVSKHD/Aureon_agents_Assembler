@@ -244,6 +244,26 @@ async def test_repositories_sync_list_and_removal(gh_env: EnvFactory) -> None:
         assert conn["last_sync"]["repos_removed"] == 1
 
 
+async def test_refresh_reuses_a_sync_already_running(gh_env: EnvFactory) -> None:
+    """A retried GET ?refresh=true (client timed out during a slow sync) must not start a
+    second sync; a stale 'running' row from a crashed process must not block forever."""
+    async with gh_env() as env:
+        await env.sql("INSERT INTO github.sync_runs (trigger, status) VALUES ('api', 'running')")
+        with respx.mock(base_url=API, assert_all_called=False) as router:
+            mock_user(router)
+            listed = _repos_route(router, [[repo_json(1, "me/app")]])
+            r = await env.get("admin", f"{BASE}/repositories?refresh=true")
+            assert r.status_code == 200, r.text
+            assert listed.call_count == 0
+            assert await env.sql("SELECT count(*) FROM github.sync_runs") == [(1,)]
+
+            await env.sql("UPDATE github.sync_runs SET started_at = now() - interval '10 minutes'")
+            r = await env.get("admin", f"{BASE}/repositories?refresh=true")
+            assert r.status_code == 200, r.text
+            assert listed.call_count == 1
+            assert [i["full_name"] for i in r.json()["items"]] == ["me/app"]
+
+
 async def test_allowlisted_owners_and_repos(gh_env: EnvFactory) -> None:
     async with gh_env(
         GITHUB_ALLOWED_OWNERS=["acme"], GITHUB_ALLOWED_REPOS=["acme/api", "acme/extra"]
