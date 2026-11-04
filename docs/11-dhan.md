@@ -18,7 +18,67 @@ and packet layouts come from two sources, and anything neither confirms is marke
 Re-check the unconfirmed items against https://dhanhq.co/docs/v2/ before relying on them.
 Nothing in the code invents an endpoint.
 
+## Log in with the API key
+
+The normal way to get a Dhan session. It follows
+[dhanhq.co/docs/v2/authentication](https://dhanhq.co/docs/v2/authentication/) ("API key &
+secret"). It is read-only: it only obtains the data session, and there is no order code.
+
+**One-time setup on Dhan:**
+
+1. Go to web.dhan.co → My Profile → Access DhanHQ APIs, and switch to **API key**.
+2. Enter an app name and the redirect URL `https://<this site>/api/v1/dhan/auth/callback`.
+   For the Tailscale address that is `https://svskhd8.taila439d5.ts.net/api/v1/dhan/auth/callback`.
+3. Dhan shows the API key and secret. They are valid for 12 months.
+
+**On /settings (Dhan group):** set `DHAN_CLIENT_ID`, `DHAN_API_KEY`, `DHAN_API_SECRET` and
+`DHAN_REDIRECT_URL`. The two secrets need your password and are stored encrypted.
+
+**Each session ("Log in to Dhan"):**
+
+| Step | Who | What |
+| --- | --- | --- |
+| 1 | SPA → `POST /api/v1/dhan/auth/start` (admin + CSRF) | Aureon calls `POST {DHAN_AUTH_URL}/app/generate-consent?client_id=…` with the `app_id`/`app_secret` headers, records a one-time pending login for this session (Redis, 10 min), and returns the login URL |
+| 2 | browser | Opens `{DHAN_AUTH_URL}/login/consentApp-login?consentAppId=…`, logs in on Dhan, and Dhan redirects it to the redirect URL with `?tokenId=…` |
+| 3 | `GET /api/v1/dhan/auth/callback` (public) | Only redirects (303) to `/dev/settings?dhan_token_id=…` |
+| 4 | SPA → `POST /api/v1/dhan/auth/consume` (admin + CSRF) | Needs the pending login from step 1 (used once). Calls `GET {DHAN_AUTH_URL}/app/consumeApp-consent?tokenId=…`. The token must be for `DHAN_CLIENT_ID`. Stores `accessToken` and `expiryTime` (IST, converted to UTC) as `DHAN_SESSION_TOKEN` / `DHAN_SESSION_EXPIRES_AT` |
+
+Why step 3 is a redirect: the return from auth.dhan.co is a cross-site navigation, and the
+session and CSRF cookies are `SameSite=Strict`, so it arrives without a session. The SPA page
+it lands on is same-origin, so its `POST` carries both.
+
+Why there is no state parameter: Dhan's flow has none. Instead, `consume` needs a login started
+from the same session in the last 10 minutes, and the token's `dhanClientId` must equal
+`DHAN_CLIENT_ID`. A crafted callback link carrying someone else's tokenId is refused
+(`403 dhan_client_mismatch`).
+
+**After login:**
+
+- The session token is used for every Dhan call: the API adapter, the scheduler jobs and
+  `dhan-feed`. The workers restart themselves on the settings change.
+- When it expires, calls fall back to `DHAN_ACCESS_TOKEN` if one is set (read per request, no
+  restart needed). Otherwise there is no usable token.
+- `GET /api/v1/dhan/auth/status` (any signed-in user) reports `source`
+  (`session`/`manual`/`none`), the expiry, `expires_soon` and `data_stale`.
+- `GET /api/v1/system/integrations` reports Dhan `down` with "no valid Dhan session" while
+  there is no usable token.
+- Discord: an `error` alert once the session has expired ("trading data is stale"), and a
+  `warning` within `DHAN_SESSION_ALERT_MINUTES` (60) of expiry. Each expiry time alerts once.
+- `DELETE /api/v1/dhan/auth/session` (admin + CSRF) forgets the session. Dhan has no revoke
+  call for these tokens, so it simply expires.
+
+The two session keys are **managed**: they appear (masked) on /settings, but
+`PUT`/`DELETE /api/v1/settings/{key}` refuse them with `403 managed_key`. Dhan allows 25
+consents a day, and Aureon allows 8 login starts per admin per hour.
+
+Every step is audited without values: `dhan_login_started`, `dhan_login_completed` (with the
+expiry), `dhan_login_failed` (with an error code) and `dhan_logout`. A Dhan response body is
+never returned or logged.
+
 ## Credentials and token expiry
+
+> Since the API key login, `DHAN_ACCESS_TOKEN` is only the **manual fallback**. The notes
+> below describe that manual token.
 
 - **Env only:** `DHAN_CLIENT_ID` and `DHAN_ACCESS_TOKEN` are never stored in the DB or logs, and
   `repr()` of the client and feed omits them. The token is sent as the `access-token` header,

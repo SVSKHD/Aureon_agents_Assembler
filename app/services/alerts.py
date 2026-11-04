@@ -9,7 +9,9 @@ Each run collects what needs a human:
 - failed or too-old backups, from the status file scripts/ops/backup.sh writes (skipped,
   without an alert, when the file is not readable);
 - pending approval requests that expire within ALERTS_APPROVAL_EXPIRY_MINUTES (the approval
-  engine already announces the expiry itself).
+  engine already announces the expiry itself);
+- the Dhan session (API key login, or the manual token): expired, or expiring within
+  DHAN_SESSION_ALERT_MINUTES. Keyed by the expiry time, so a new login starts fresh.
 
 and sends each through the Phase 20 Discord adapter. Deduplicated: one alert per fingerprint
 per ALERTS_DEDUP_MINUTES (a Redis key `SET NX EX`; an in-process map without Redis). A failed
@@ -37,6 +39,7 @@ from app.integrations import discord
 from app.models.agents import Agent
 from app.models.approvals import ApprovalRequest
 from app.models.repairs import INCIDENT_ACTIVE, Incident
+from app.services import dhan_auth
 from app.services.incidents import stale_threshold
 from app.services.integrations import read_backup_status
 
@@ -51,7 +54,7 @@ Sender = Callable[[Settings, Mapping[str, Any]], Awaitable[bool]]
 
 @dataclass(frozen=True, slots=True)
 class Alert:
-    kind: str  # incident | heartbeat | backup | approval
+    kind: str  # incident | heartbeat | backup | approval | dhan_session
     fingerprint: str
     severity: str
     title: str
@@ -143,6 +146,9 @@ async def collect(
                 "/dev/status",
             )
         )
+    dhan_alert = _dhan_session_alert(settings, now)
+    if dhan_alert is not None:
+        alerts.append(dhan_alert)
     for req in approvals:
         left = max(0, int((req.expires_at - now).total_seconds() // 60))
         alerts.append(
@@ -156,6 +162,39 @@ async def collect(
             )
         )
     return alerts, info
+
+
+def _dhan_session_alert(settings: Settings, now: datetime) -> Alert | None:
+    """Only when Dhan is in use (a client id and some credential: API key or manual token)."""
+    if not settings.DHAN_CLIENT_ID or not (
+        settings.DHAN_API_KEY or settings.DHAN_ACCESS_TOKEN or settings.DHAN_SESSION_TOKEN
+    ):
+        return None
+    st = dhan_auth.status(settings, now)
+    if st["source"] == "none":
+        exp = st["session_expires_at"]
+        when = f"expired {exp:%Y-%m-%d %H:%M} UTC" if exp else "no session"
+        return Alert(
+            "dhan_session",
+            _fp("dhan-session-expired", str(exp)),
+            "error",
+            "Dhan session expired: trading data is stale",
+            f"{when}. Log in to Dhan on /settings to start a new session.",
+            "/dev/settings",
+        )
+    until = st["valid_until"]
+    if st["expires_soon"] and until is not None:
+        left = max(0, int((until - now).total_seconds() // 60))
+        return Alert(
+            "dhan_session",
+            _fp("dhan-session-expiring", until.isoformat()),
+            "warning",
+            f"Dhan session expires in {left} min",
+            f"valid until {until:%Y-%m-%d %H:%M} UTC ({st['source']}). Log in to Dhan on "
+            "/settings to renew it.",
+            "/dev/settings",
+        )
+    return None
 
 
 class Dedup:

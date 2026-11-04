@@ -37,6 +37,7 @@ from app.core.config import Settings
 from app.integrations.claude_cli import ClaudeCLI
 from app.models.agents import Agent, ScheduledJob
 from app.models.github import GitHubWebhookEvent
+from app.services import dhan_auth
 
 Section = dict[str, Any]
 SECTION_LIMIT_S = 4.0
@@ -109,6 +110,10 @@ def read_backup_status(path: Path, max_age_hours: float, now: datetime) -> Secti
     return out
 
 
+def _jsonable(d: dict[str, Any]) -> dict[str, Any]:
+    return {k: v.isoformat() if isinstance(v, datetime) else v for k, v in d.items()}
+
+
 class IntegrationsSummary:
     def __init__(
         self,
@@ -149,8 +154,19 @@ class IntegrationsSummary:
 
     async def dhan(self) -> Section:
         s = self.settings
-        if not s.dhan_configured:
+        session = dhan_auth.status(s, self.now)
+        if not s.DHAN_CLIENT_ID:
             return {"status": "not_configured", "configured": False}
+        if session["data_stale"]:
+            # Client id set but no usable token (login expired / never done): every
+            # Dhan-derived number is stale until someone logs in again.
+            return {
+                "configured": True,
+                "read_only": True,
+                "session": _jsonable(session),
+                "problems": ["no valid Dhan session: log in to Dhan on /settings"],
+                "status": "down",
+            }
         feed = (await self._agents("dhan-feed")).get("dhan-feed")
         async with self.maker() as db:
             job = await db.get(ScheduledJob, "dhan-reconcile")
@@ -160,9 +176,12 @@ class IntegrationsSummary:
             problems.append("dhan-reconcile failed")
         if view["registered"] and view["state"] in DOWN_STATES:
             problems.append(f"dhan-feed {view['state']}")
+        if session["expires_soon"]:
+            problems.append("Dhan session expires soon")
         return {
             "configured": True,
             "read_only": True,
+            "session": _jsonable(session),
             "feed": view,
             "reconcile": {
                 "last_status": job.last_status if job else None,

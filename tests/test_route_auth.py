@@ -27,6 +27,10 @@ PUBLIC = {
     ("POST", "/api/v1/github/webhooks"),
     # MT5 bot push: machine-to-machine, bearer MT5_INGEST_TOKEN instead (docs/12 §3).
     ("POST", "/api/trading/mt5/ingest"),
+    # Dhan login callback: only redirects the browser to the SPA with the tokenId; the
+    # exchange is POST /consume (admin + CSRF + a login started from that session).
+    ("GET", "/api/v1/dhan/auth/callback"),
+    ("GET", "/api/v1/dhan/auth/callback/"),
 }
 # Public routes that change state, each with its own authentication.
 PUBLIC_UNSAFE = {"/api/auth/login", "/api/v1/github/webhooks", "/api/trading/mt5/ingest"}
@@ -34,6 +38,9 @@ PUBLIC_UNSAFE = {"/api/auth/login", "/api/v1/github/webhooks", "/api/trading/mt5
 PUBLIC_RATE_LIMITED = {p for m, p in PUBLIC if p.startswith("/api/public/")}
 
 ADMIN = {
+    ("POST", "/api/v1/dhan/auth/start"),
+    ("POST", "/api/v1/dhan/auth/consume"),
+    ("DELETE", "/api/v1/dhan/auth/session"),
     ("GET", "/api/v1/settings"),
     ("PUT", "/api/v1/settings/{key}"),
     ("DELETE", "/api/v1/settings/{key}"),

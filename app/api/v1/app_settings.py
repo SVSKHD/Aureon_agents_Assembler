@@ -46,6 +46,7 @@ class SettingOut(BaseModel):
     kind: str
     is_secret: bool
     requires_reauth: bool
+    managed: bool = False
     is_set: bool
     masked: str | None
     source: Source
@@ -85,9 +86,11 @@ def _error(status: int, code: str, detail: str) -> HTTPException:
     return HTTPException(status, {"code": code, "detail": detail})
 
 
-def _spec(key: str) -> svc.Spec:
+def _spec(key: str, write: bool = False) -> svc.Spec:
     spec = svc.REGISTRY.get(key)
     if spec is not None:
+        if write and spec.managed:
+            raise _error(403, "managed_key", f"{key} is set by its own flow (Log in to Dhan)")
         return spec
     if key in svc.BOOTSTRAP_KEYS:
         raise _error(403, "bootstrap_key", f"{key} is a bootstrap key: set it in .env only")
@@ -193,14 +196,19 @@ def _describe(spec: svc.Spec, row: AppSetting | None, live: Settings, env: Setti
         kind=spec.kind,
         is_secret=spec.secret,
         requires_reauth=spec.reauth,
+        managed=spec.managed,
         is_set=value is not None,
         masked=svc.mask(value, spec.secret),
         source=_source(spec.key, row, env),
         updated_at=row.updated_at if row is not None else None,
         version=row.version if row is not None else None,
     )
-    if spec.key == "DHAN_ACCESS_TOKEN":
-        exp = svc.dhan_token_expiry(value)
+    if spec.key in ("DHAN_ACCESS_TOKEN", "DHAN_SESSION_TOKEN"):
+        exp = (
+            svc.dhan_token_expiry(value)
+            if spec.key == "DHAN_ACCESS_TOKEN"
+            else svc.as_utc(live.DHAN_SESSION_EXPIRES_AT)
+        )
         item.expires_at = exp
         if exp is not None:
             warn = timedelta(hours=live.DHAN_TOKEN_WARN_HOURS)
@@ -237,7 +245,7 @@ async def put_setting(
     key: str, body: SettingIn, request: Request, admin: AdminRequired, db: DbSession
 ) -> SettingOut:
     """Set or replace the DB value (it overrides .env). Secrets need `password`."""
-    spec = _spec(key)
+    spec = _spec(key, write=True)
     env: Settings = request.app.state.env_settings
     cipher = _cipher(env)
     await _reauth(request, db, admin, spec, body.password)
@@ -279,7 +287,7 @@ async def revert_setting(
     body: RevertIn | None = None,
 ) -> SettingOut:
     """Drop the DB value so .env (or the default) applies again. Secrets need `password`."""
-    spec = _spec(key)
+    spec = _spec(key, write=True)
     await _reauth(request, db, admin, spec, body.password if body else None)
     row = await db.get(AppSetting, key, with_for_update=True)
     if row is None:

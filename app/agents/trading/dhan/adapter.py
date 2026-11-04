@@ -124,8 +124,7 @@ class DhanAdapter(BrokerAdapter):
                 self.broker,
                 False,
                 now,
-                "access token expired or invalid; generate a new one on "
-                "web.dhan.co and update DHAN_ACCESS_TOKEN",
+                "access token expired or invalid; log in to Dhan again on /settings",
             )
         except BrokerError as exc:
             return AdapterHealth(self.broker, False, now, str(exc))

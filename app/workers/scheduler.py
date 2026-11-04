@@ -136,7 +136,9 @@ async def refresh_model_inventory(ctx: TaskContext) -> dict[str, Any]:
 
 def _dhan(ctx: TaskContext) -> DhanAdapter:
     if ctx.dhan is None:
-        raise RuntimeError("Dhan is not configured (DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN)")
+        raise RuntimeError(
+            "Dhan is not configured (DHAN_CLIENT_ID + a Dhan login or DHAN_ACCESS_TOKEN)"
+        )
     return ctx.dhan
 
 

@@ -15,7 +15,7 @@ Only the keys in `REGISTRY` (`app/services/app_settings.py`) can be set. Keys ma
 | Group      | Keys |
 |------------|------|
 | OpenRouter | `OPENROUTER_API_KEY` (secret, re-auth), `OPENROUTER_ENABLED`, `OPENROUTER_DEFAULT_MODEL`, `OPENROUTER_DAILY_LIMIT_USD`, `OPENROUTER_ALLOWED_MODELS`, `AI_RESEARCH_EXTERNAL_ALLOWED` |
-| Dhan       | `DHAN_CLIENT_ID`, `DHAN_ACCESS_TOKEN` (secrets, re-auth). The three URL keys `DHAN_BASE_URL`, `DHAN_FEED_URL` and `DHAN_INSTRUMENT_CSV_URL` also need re-auth, because the token is sent to them. Also settable: every other `DHAN_*` the code reads (timeouts, feed, crons, backfill, `DHAN_STATIC_IP`) |
+| Dhan       | `DHAN_CLIENT_ID`, `DHAN_API_KEY`, `DHAN_API_SECRET`, `DHAN_ACCESS_TOKEN` (manual fallback) (secrets, re-auth). The URL keys `DHAN_BASE_URL`, `DHAN_FEED_URL`, `DHAN_INSTRUMENT_CSV_URL`, `DHAN_AUTH_URL` and `DHAN_REDIRECT_URL` also need re-auth, because credentials are sent to them. `DHAN_SESSION_TOKEN` and `DHAN_SESSION_EXPIRES_AT` are **managed**: listed and masked, written only by "Log in to Dhan" (`403 managed_key` here; docs/11-dhan.md). Also settable: every other `DHAN_*` the code reads (timeouts, feed, crons, backfill, `DHAN_STATIC_IP`) |
 | GitHub     | `GITHUB_TOKEN` (secret, re-auth), `GITHUB_CODING_REPO_ALLOWLIST` (JSON list) |
 | Discord    | `DISCORD_WEBHOOK_URL` (secret, re-auth) |
 | MT5        | `MT5_INGEST_TOKEN` (secret, re-auth) |
@@ -121,7 +121,7 @@ The routes are under `/api/v1/` like the rest of Aureon's admin API.
 
 | Method | Path | What |
 |---|---|---|
-| GET | `/api/v1/settings` | Every key: `category`, `is_secret`, `requires_reauth`, `is_set`, `masked`, `source` (`db`/`env`/`default`/`unset`), `updated_at`, `version`. `DHAN_ACCESS_TOKEN` also gets `expires_at` (from the JWT `exp`) and `expires_soon` (inside `DHAN_TOKEN_WARN_HOURS`). Also returns the last test per group and `encryption_ready`. **Never a value.** |
+| GET | `/api/v1/settings` | Every key: `category`, `is_secret`, `requires_reauth`, `is_set`, `masked`, `source` (`db`/`env`/`default`/`unset`), `updated_at`, `version`. `managed`. `DHAN_ACCESS_TOKEN` also gets `expires_at` (from the JWT `exp`) and `expires_soon` (inside `DHAN_TOKEN_WARN_HOURS`); `DHAN_SESSION_TOKEN` gets them from the login's expiry. Also returns the last test per group and `encryption_ready`. **Never a value.** |
 | PUT | `/api/v1/settings/{key}` | `{"value": "...", "password": "..."}` sets or replaces the DB value. `password` is required for re-auth keys. |
 | DELETE | `/api/v1/settings/{key}` | `{"password": "..."}` (re-auth keys only) reverts to `.env`. |
 | POST | `/api/v1/settings/{key}/test` | Tests the key's group with the values in effect now. See the table below. |
