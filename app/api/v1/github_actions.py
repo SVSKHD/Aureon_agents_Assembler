@@ -25,6 +25,7 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, HTTPException, Path, Query, status
 from fastapi.responses import PlainTextResponse
 
+from app.api.ui import ui_module
 from app.api.v1.github_issues import PageNo, PerPage, RepoDep, errors
 from app.auth.deps import AdminRequired, DbSession, SettingsDep
 from app.integrations.github.logs import LogArchiveError, SanitizedLog
@@ -40,6 +41,7 @@ from app.schemas.github_ops import ListPage
 from app.services import actions_monitor
 from app.services import github_actions as actions
 
+UI_MODULE = ui_module("github", label="GitHub", group="dev", icon="github", order=52)
 router = APIRouter(prefix="/v1/github", tags=["github"])
 
 A = "/repositories/{owner}/{repo}/actions"

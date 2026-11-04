@@ -21,6 +21,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.api.ui import ui_module
 from app.auth.deps import AdminRequired, DbSession, SettingsDep
 from app.core.config import Settings
 from app.integrations.github.client import (
@@ -47,6 +48,7 @@ from app.services import audit
 from app.services import github as gh
 from app.services.audit import ClientInfo
 
+UI_MODULE = ui_module("github", label="GitHub", group="dev", icon="github", order=52)
 router = APIRouter(prefix="/v1/github", tags=["github"])
 
 Limit = Annotated[int, Query(ge=1, le=200)]

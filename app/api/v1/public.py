@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, sta
 from sqlalchemy import and_, select
 
 from app.agents.trading.ratelimit import BrokerRateLimiter, RateLimitExceeded, Window
+from app.api.ui import ui_module
 from app.auth.deps import DbSession, SettingsDep
 from app.core.logging import get_logger
 from app.models.finance import astra_documents
@@ -24,6 +25,7 @@ from app.schemas.finance import PublicDocumentOut
 from app.services.audit import ClientInfo
 
 log = get_logger(__name__)
+UI_MODULE = ui_module("public", label="Public", group="public", icon="globe", order=990)
 router = APIRouter(prefix="/public", tags=["public"])
 
 SHARES_NAMESPACE = "aureon-shares"

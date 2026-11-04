@@ -12,6 +12,10 @@ Events (each `data:` is JSON):
 - `quote`     the latest Dhan feed values for the requested instruments, when they change.
 - `mt5`       the MT5 bot pushed (new push_id) or its open failures changed; the /trading/mt5
               page refetches its panels. Current state, may repeat after a reconnect.
+- `schema_changed`  the API's schema changed (a deploy): `{hash, previous}`. Sent once to a
+              reconnecting stream within 10 min of the change, or mid-stream when another API
+              process announced a newer schema. The frontend refetches /api/v1/ui/manifest.
+              `hello` also carries `schema_hash` (docs/ui-manifest.md).
 - `bye`       the stream is ending (max duration or session expired); the client reconnects.
 
 Every data event carries an `id:` cursor. A reconnecting EventSource sends it back as
@@ -30,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -41,6 +46,7 @@ from sqlalchemy import func, literal, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.registry import effective_state
+from app.api import ui
 from app.auth.deps import CurrentSession
 from app.models.agents import Agent
 from app.models.auth import UserSession
@@ -349,6 +355,22 @@ async def quotes(
     return out
 
 
+async def _schema_event(redis: Redis, current: str, *, reconnect: bool) -> dict[str, str] | None:
+    """A reconnect shortly after a deploy that changed the schema gets one schema_changed."""
+    if not reconnect or not current:
+        return None
+    st = await ui.schema_state(redis)
+    try:
+        changed_at = float(st.get("changed_at", "0"))
+    except ValueError:
+        return None
+    if st.get("hash") != current or not st.get("previous"):
+        return None
+    if time.time() - changed_at > ui.SCHEMA_CHANGED_WINDOW_S:
+        return None
+    return {"hash": current, "previous": st["previous"]}
+
+
 async def events(
     maker: async_sessionmaker[AsyncSession],
     redis: Redis,
@@ -360,6 +382,7 @@ async def events(
     heartbeat_seconds: float,
     max_seconds: float,
     stale_after: float,
+    schema_hash: str = "",
 ) -> AsyncIterator[str]:
     loop = asyncio.get_running_loop()
     started = loop.time()
@@ -367,9 +390,27 @@ async def events(
         cursor = Cursor.decode(last_event_id) or await _start_cursor(db)
     state = StreamState(cursor)
     yield "retry: 3000\n\n"
-    yield sse("hello", {"server_time": datetime.now(UTC), "poll_seconds": poll_seconds})
+    yield sse(
+        "hello",
+        {
+            "server_time": datetime.now(UTC),
+            "poll_seconds": poll_seconds,
+            "schema_hash": schema_hash,
+        },
+    )
     last_sent = loop.time()
+    announced = await _schema_event(redis, schema_hash, reconnect=last_event_id is not None)
+    if announced is not None:
+        yield sse("schema_changed", announced)
+    polls = 0
     while True:
+        polls += 1
+        if schema_hash and polls % 15 == 0:  # every ~30 s: did another process deploy a newer API?
+            state_now = await ui.schema_state(redis)
+            newer = state_now.get("hash")
+            if newer and newer != schema_hash:
+                yield sse("schema_changed", {"hash": newer, "previous": schema_hash})
+                schema_hash = newer
         async with maker() as db:
             if not await _session_ok(db, current.session.id):
                 yield sse("bye", {"reason": "session_ended"})

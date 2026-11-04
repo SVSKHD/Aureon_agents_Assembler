@@ -6,10 +6,12 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.docs import get_swagger_ui_html
 from redis.asyncio import Redis
 
 from app.agents.ollama.client import OllamaClient
@@ -17,11 +19,17 @@ from app.agents.ollama.limiter import GenerationLimiter
 from app.agents.registry import OLLAMA, AgentRegistry, Heartbeat
 from app.agents.trading.dhan import build_dhan_adapter
 from app.agents.trading.mt5 import build_mt5_adapter
+from app.api import ui
 from app.api.router import api_router
+from app.auth.deps import Current
 from app.core.cf_access import CloudflareAccessMiddleware
 from app.core.config import Settings, get_env_settings
 from app.core.logging import configure_logging, get_logger
-from app.core.middleware import RequestIdMiddleware, SecurityHeadersMiddleware
+from app.core.middleware import (
+    RequestIdMiddleware,
+    SchemaHeaderMiddleware,
+    SecurityHeadersMiddleware,
+)
 from app.core.prod_checks import assert_production_ready
 from app.db.session import build_engine, build_sessionmaker
 from app.integrations.claude_cli import ClaudeCLI
@@ -72,6 +80,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.engine = engine
         app.state.sessionmaker = build_sessionmaker(engine)
         app.state.redis = redis
+        await ui.announce_schema(redis, app.state.schema_hash)
         # Runtime settings (docs/settings.md): .env overlaid with core.app_settings. `settings`
         # stays the .env view; `live` is what routes and clients see, swapped on change.
         app.state.env_settings = settings
@@ -189,9 +198,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title="Aureon_Agentic",
         version="0.1.0",
         lifespan=lifespan,
-        docs_url="/api/docs" if settings.docs_enabled else None,
+        # /api/openapi.json is served by app/api/v1/ui_manifest.py for signed-in users only;
+        # Swagger (dev only) below reads it with the session cookie.
+        docs_url=None,
         redoc_url=None,
-        openapi_url="/api/openapi.json" if settings.docs_enabled else None,
+        openapi_url=None,
     )
     if settings.CORS_ORIGINS:
         app.add_middleware(
@@ -205,8 +216,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Phase 22 (docs/24): verify the Cloudflare Access JWT, except on the bypass paths.
         app.add_middleware(CloudflareAccessMiddleware, settings=settings)
     app.add_middleware(SecurityHeadersMiddleware)
+    app.add_middleware(SchemaHeaderMiddleware, state=app.state)
     app.add_middleware(RequestIdMiddleware)
     app.include_router(api_router)
+    if settings.docs_enabled:
+
+        @app.get("/api/docs", include_in_schema=False)
+        async def swagger(_: Current) -> Any:
+            return get_swagger_ui_html(openapi_url="/api/openapi.json", title="Aureon API")
+
+    # x-ui on every operation, and the schema hash (X-API-Schema, the stream's hello).
+    ui.install_openapi(app)
+    app.state.schema_hash = ui.schema_hash(app)
     return app
 
 

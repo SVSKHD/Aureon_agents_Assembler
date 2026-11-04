@@ -11,6 +11,7 @@ from sqlalchemy import select
 
 from app.agents.ollama.client import OllamaClient, OllamaUnavailable
 from app.agents.ollama.limiter import GenerationLimiter, QueueFull, Ticket
+from app.api.ui import ui_module
 from app.auth.deps import CsrfProtected, Current, DbSession, SettingsDep
 from app.core.config import Settings
 from app.models.ai import Conversation, ModelInventory
@@ -43,6 +44,7 @@ from app.services.chat import (
 )
 from app.services.inference import Decision, ExternalGate, local_fallback_model
 
+UI_MODULE = ui_module("chat", label="AI chat", group="ai", icon="message-square", order=40)
 router = APIRouter(tags=["ai"])
 
 

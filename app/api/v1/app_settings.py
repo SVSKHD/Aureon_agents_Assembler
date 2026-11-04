@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
 from app.agents.trading.ratelimit import BrokerRateLimiter, RateLimitExceeded, Window
+from app.api.ui import ui_module
 from app.auth.deps import AdminRequired, DbSession
 from app.auth.security import verify_password
 from app.core.config import Settings
@@ -28,6 +29,7 @@ from app.services import app_settings_runtime, audit
 from app.services.audit import ClientInfo
 
 log = structlog.get_logger(__name__)
+UI_MODULE = ui_module("settings", label="Settings", group="admin", icon="settings", order=90)
 router = APIRouter(prefix="/v1/settings", tags=["settings"])
 
 WRITES_PER_10_MIN = 20

@@ -9,6 +9,7 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
 
+from app.api.ui import ui_module
 from app.auth.deps import CsrfProtected, Current, DbSession, SettingsDep
 from app.core.logging import get_logger
 from app.models.imaging import GeneratedAsset, ImageJob
@@ -16,6 +17,7 @@ from app.schemas.images import AssetOut, AssetPage, GenerateRequest, JobOut
 from app.services.health import check_data_root
 from app.services.imaging import ImageService, QueueFull, safe_asset_file
 
+UI_MODULE = ui_module("images", label="Images", group="ai", icon="image", order=42)
 router = APIRouter(prefix="/images", tags=["images"])
 log = get_logger(__name__)
 

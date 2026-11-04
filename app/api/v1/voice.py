@@ -12,10 +12,12 @@ from typing import Any, Literal
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.api.ui import ui_module
 from app.auth.deps import AdminRequired, SettingsDep
 from app.core.logging import get_logger
 from app.integrations import voice
 
+UI_MODULE = ui_module("voice", label="Voice", group="ai", icon="mic", order=44)
 router = APIRouter(prefix="/v1/voice", tags=["voice"])
 log = get_logger("api.voice")
 

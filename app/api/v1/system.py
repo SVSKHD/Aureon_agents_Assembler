@@ -6,9 +6,11 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
+from app.api.ui import ui_module
 from app.auth.deps import AdminRequired
 from app.services.integrations import IntegrationsSummary
 
+UI_MODULE = ui_module("system", label="System", group="admin", icon="server", order=900)
 router = APIRouter(prefix="/v1/system", tags=["system"])
 
 

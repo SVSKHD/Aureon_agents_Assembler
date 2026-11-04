@@ -36,6 +36,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app.agents.trading.base import BrokerAdapter
+from app.api.ui import ui_module
 from app.api.v1.approvals import approval_deps
 from app.auth.deps import AdminRequired, CsrfProtected, Current, DbSession, SettingsDep
 from app.models.approvals import ApprovalRequest
@@ -69,6 +70,9 @@ from app.services.approvals import (
 from app.services.audit import ClientInfo
 from app.services.trading import count, get_visible_account, is_admin, visible_account_ids
 
+UI_MODULE = ui_module(
+    "paper", label="Paper trading", group="markets", icon="flask-conical", order=22
+)
 router = APIRouter(prefix="/trading", tags=["paper trading"])
 
 Limit = Annotated[int, Query(ge=1, le=500)]

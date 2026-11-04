@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, status
 from sqlalchemy import func, select, update
 
 from app.agents.registry import effective_state
+from app.api.ui import ui_module
 from app.auth.deps import AdminRequired, Current, DbSession, SettingsDep
 from app.core.config import Settings
 from app.models.agents import Agent, AgentLog, AgentRun, ScheduledJob
@@ -29,6 +30,7 @@ from app.services import audit
 from app.services.audit import ClientInfo
 from app.services.system import SystemStatus
 
+UI_MODULE = ui_module("agents", label="Agents", group="admin", icon="bot", order=70)
 router = APIRouter(tags=["agents"])
 
 
