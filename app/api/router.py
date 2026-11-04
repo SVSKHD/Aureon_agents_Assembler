@@ -5,6 +5,7 @@ from fastapi import APIRouter
 from app.api.v1 import (
     agents,
     ai,
+    ai_usage,
     app_settings,
     approvals,
     audit_events,
@@ -35,6 +36,7 @@ api_router.include_router(health.router)
 api_router.include_router(auth.router)
 api_router.include_router(finance.router)
 api_router.include_router(ai.router)
+api_router.include_router(ai_usage.router)  # /api/v1/ai/usage (per-agent model calls)
 api_router.include_router(images.router)
 api_router.include_router(agents.router)
 api_router.include_router(trading.router)

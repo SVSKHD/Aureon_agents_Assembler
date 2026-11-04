@@ -36,7 +36,7 @@ from typing import Literal
 from app.services.review_filter import entropy, secret_hits
 
 Category = Literal["secrets", "finance", "trading", "broker", "positions", "logs"]
-CONTEXTS = ("general", "finance", "trading", "research")
+CONTEXTS = ("general", "finance", "trading", "research", "news")
 Context = Literal["general", "finance", "trading", "research"]
 HARD: frozenset[str] = frozenset({"secrets", "finance", "broker", "positions", "logs"})
 SOFT: frozenset[str] = frozenset({"trading"})
@@ -250,6 +250,10 @@ def classify_chat(
     """Classify the whole outbound payload (every message, every role)."""
     reasons: list[str] = []
     research_ok = context == "research" and research_external_allowed
+    # Public market news (the news agent): market words are the point of it, so the soft
+    # "trading" category may go out; secrets, personal finance, broker accounts, positions
+    # and logs still force local (HARD).
+    news = context == "news"
     if context not in CONTEXTS:
         reasons.append("context:unknown")
     elif context in LOCAL_CONTEXTS and not research_ok:
@@ -257,7 +261,7 @@ def classify_chat(
     cats: set[str] = set()
     for m in messages:
         cats |= text_categories(str(m.get("content") or ""))
-    blocking = cats & HARD if research_ok else cats
+    blocking = cats & HARD if (research_ok or news) else cats
     reasons.extend(f"content:{c}" for c in sorted(blocking))
     return ChatClassification(not reasons, sorted(blocking), reasons)
 
