@@ -47,13 +47,22 @@ CMD ["python", "-m", "app.workers.coding"]
 # Installs the existing /opt/image-agent's Python dependencies (CPU wheels) so its
 # entrypoint can run inside this container. Code and models stay in /opt/image-agent,
 # bind-mounted read-only at runtime; nothing is downloaded at runtime.
+# libgomp1: the OpenMP runtime the image-agent's stable-diffusion.cpp `sd-cli` links against
+# (docs/image-agent.md). IMAGE_AGENT_PIP=false skips the Python requirements (torch etc.)
+# when the command is sd-cli, which needs none of them.
 FROM runtime AS imaging
 ARG IMAGE_AGENT_REQUIREMENTS=requirements.txt
+ARG IMAGE_AGENT_PIP=true
 ARG PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu
 USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libgomp1 \
+ && rm -rf /var/lib/apt/lists/*
 COPY --from=imageagent ${IMAGE_AGENT_REQUIREMENTS} /tmp/image-agent-requirements.txt
-RUN pip install --no-cache-dir --extra-index-url ${PIP_EXTRA_INDEX_URL} \
-      -r /tmp/image-agent-requirements.txt \
+RUN if [ "$IMAGE_AGENT_PIP" = "true" ]; then \
+      pip install --no-cache-dir --extra-index-url ${PIP_EXTRA_INDEX_URL} \
+        -r /tmp/image-agent-requirements.txt; \
+    fi \
  && rm /tmp/image-agent-requirements.txt
 USER aureon
 CMD ["python", "-m", "app.workers.imaging"]

@@ -13,7 +13,14 @@ from app.api.ui import ui_module
 from app.auth.deps import CsrfProtected, Current, DbSession, SettingsDep
 from app.core.logging import get_logger
 from app.models.imaging import GeneratedAsset, ImageJob
-from app.schemas.images import AssetOut, AssetPage, GenerateRequest, JobOut
+from app.schemas.images import (
+    AssetOut,
+    AssetPage,
+    GenerateRequest,
+    ImageModelList,
+    ImageModelOut,
+    JobOut,
+)
 from app.services.health import check_data_root
 from app.services.imaging import ImageService, QueueFull, safe_asset_file
 
@@ -63,6 +70,28 @@ def _asset_out(a: GeneratedAsset, j: ImageJob) -> AssetOut:
     )
 
 
+@router.get("/models", response_model=ImageModelList)
+async def models(_: Current, settings: SettingsDep) -> ImageModelList:
+    """The local models a job may use (IMAGE_MODELS); the default is IMAGE_MODEL_NAME."""
+    items = [
+        ImageModelOut(
+            name=name,
+            default=name == settings.IMAGE_MODEL_NAME,
+            steps=int(spec.get("steps", settings.IMAGE_DEFAULT_STEPS)),
+            note=str(spec.get("note", "")),
+        )
+        for name, spec in settings.IMAGE_MODELS.items()
+    ] or [
+        ImageModelOut(
+            name=settings.IMAGE_MODEL_NAME,
+            default=True,
+            steps=settings.IMAGE_DEFAULT_STEPS,
+            note="",
+        )
+    ]
+    return ImageModelList(items=items, enabled=settings.AGENT_IMAGE_ENABLED)
+
+
 @router.post("/generate", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED)
 async def generate(
     body: GenerateRequest,
@@ -73,7 +102,13 @@ async def generate(
 ) -> JobOut:
     if body.size not in settings.IMAGE_ALLOWED_SIZES:
         raise HTTPException(422, f"size must be one of {settings.IMAGE_ALLOWED_SIZES}")
-    steps = body.steps or settings.IMAGE_DEFAULT_STEPS
+    if not settings.AGENT_IMAGE_ENABLED:
+        raise HTTPException(503, "image generation is disabled (AGENT_IMAGE_ENABLED)")
+    model = body.model or settings.IMAGE_MODEL_NAME
+    if settings.IMAGE_MODELS and model not in settings.IMAGE_MODELS:
+        raise HTTPException(422, f"model must be one of {sorted(settings.IMAGE_MODELS)}")
+    spec = settings.IMAGE_MODELS.get(model, {})
+    steps = body.steps or int(spec.get("steps", settings.IMAGE_DEFAULT_STEPS))
     if steps > settings.IMAGE_MAX_STEPS:
         raise HTTPException(422, f"steps may not exceed {settings.IMAGE_MAX_STEPS}")
     try:
@@ -86,7 +121,9 @@ async def generate(
 
     svc = ImageService(db, current.user.id, settings)
     try:
-        job = await svc.enqueue(body.prompt, body.negative_prompt, body.seed, steps, width, height)
+        job = await svc.enqueue(
+            body.prompt, body.negative_prompt, body.seed, steps, width, height, model=model
+        )
     except QueueFull as exc:
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,

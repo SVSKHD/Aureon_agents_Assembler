@@ -119,3 +119,50 @@ async def test_stub_generator(tmp_path: Path) -> None:
     await StubGenerator().generate(REQ, tmp_path / "s.png", seen.append)
     assert png_dimensions(tmp_path / "s.png") == (64, 48)
     assert seen[-1] == 100
+
+
+def test_model_placeholders_fill_from_the_request(tmp_path: Path) -> None:
+    g = SubprocessGenerator(
+        ["sd-cli", "-m", "{model_path}", "--cfg-scale", "{cfg}", "--sampling-method",
+         "{sampler}", "-o", "{output}"],
+        tmp_path,
+        {},
+    )  # fmt: skip
+    req = GenerationRequest(
+        prompt="p", negative_prompt="", seed=1, steps=6, width=512, height=512,
+        model_path="/mnt/spasta-data/models/checkpoints/x.gguf", cfg=1.5, sampler="lcm",
+    )  # fmt: skip
+    argv = g.argv(req, tmp_path / "o.png")
+    assert argv[2] == "/mnt/spasta-data/models/checkpoints/x.gguf"
+    assert argv[4] == "1.5" and argv[6] == "lcm"
+
+
+def _state(pid: int) -> str:
+    return Path(f"/proc/{pid}/stat").read_text().split(")")[-1].split()[0]
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs /proc")
+async def test_suspend_freezes_and_resume_continues_then_cancel_still_works(
+    tmp_path: Path,
+) -> None:
+    dump = tmp_path / "d.json"
+    g = gen(tmp_path, "hang", str(dump))
+    task = asyncio.create_task(g.generate(REQ, tmp_path / "o.png", lambda _: None))
+    for _ in range(200):
+        if dump.exists() and dump.stat().st_size:
+            break
+        await asyncio.sleep(0.02)
+    pid = json.loads(dump.read_text())["pid"]
+    assert g.suspend() is True
+    await asyncio.sleep(0.1)
+    assert _state(pid) == "T"  # stopped
+    assert g.resume() is True
+    await asyncio.sleep(0.1)
+    assert _state(pid) in ("S", "R")
+    assert g.suspend() is True  # cancelling a suspended job must still end it
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    assert g.suspend() is False  # nothing running

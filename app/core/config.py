@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -127,6 +128,17 @@ class Settings(BaseSettings):
     IMAGE_POLL_SECONDS: float = Field(default=2.0, gt=0)
     IMAGE_QUEUE_KEY: str = "aureon:imaging:wake"
     IMAGE_STUB_DELAY: float = Field(default=0.0, ge=0)
+    # Selectable local models (docs/image-agent.md): JSON {"name": {"file": "/abs/model.gguf",
+    # "steps": 20, "cfg": 7.0, "sampler": "euler_a"}}. The job's model fills the command's
+    # {model_path} {cfg} {sampler} placeholders; IMAGE_MODEL_NAME is the default. Empty = the
+    # single IMAGE_MODEL_NAME as before (the command decides everything).
+    IMAGE_MODELS: Annotated[dict[str, dict[str, Any]], NoDecode] = Field(default_factory=dict)
+    # Generation yields: a running job is suspended (SIGSTOP) while a chat/voice request is
+    # active, and no new job starts inside these windows (Asia/Kolkata, Mon-Fri).
+    IMAGE_PAUSE_FOR_INTERACTIVE: bool = True
+    IMAGE_PAUSE_WINDOWS: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["09:00-09:35", "15:00-15:35"]
+    )
 
     # --- agents / scheduler / monitoring (docs/05-agents.md) ---
     AGENT_HEARTBEAT_SECONDS: float = Field(default=15.0, gt=0)
@@ -676,10 +688,41 @@ class Settings(BaseSettings):
             return json.loads(v) if v.strip() else []
         return v
 
+    @field_validator("IMAGE_MODELS", mode="before")
+    @classmethod
+    def _parse_image_models(cls, v: object) -> object:
+        if isinstance(v, str):
+            return json.loads(v) if v.strip() else {}
+        return v
+
+    @field_validator("IMAGE_MODELS")
+    @classmethod
+    def _check_image_models(cls, v: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        for name, spec in v.items():
+            if not re.fullmatch(r"[A-Za-z0-9._-]{1,60}", name):
+                raise ValueError(f"IMAGE_MODELS: bad model name {name!r}")
+            path = str(spec.get("file", ""))
+            if not path.startswith("/") or ".." in path:
+                raise ValueError(f"IMAGE_MODELS[{name}].file must be an absolute path")
+            if int(spec.get("steps", 20)) < 1 or float(spec.get("cfg", 7.0)) <= 0:
+                raise ValueError(f"IMAGE_MODELS[{name}]: steps >= 1 and cfg > 0")
+            if not re.fullmatch(r"[a-z0-9_+]{1,30}", str(spec.get("sampler", "euler_a"))):
+                raise ValueError(f"IMAGE_MODELS[{name}]: bad sampler")
+        return v
+
+    @field_validator("IMAGE_PAUSE_WINDOWS")
+    @classmethod
+    def _check_windows(cls, v: list[str]) -> list[str]:
+        for w in v:
+            if not re.fullmatch(r"\d{2}:\d{2}-\d{2}:\d{2}", w):
+                raise ValueError(f"IMAGE_PAUSE_WINDOWS: {w!r} is not HH:MM-HH:MM")
+        return v
+
     @field_validator(
         "CORS_ORIGINS",
         "IMAGE_AGENT_ENV_PASSTHROUGH",
         "IMAGE_ALLOWED_SIZES",
+        "IMAGE_PAUSE_WINDOWS",
         "DHAN_FEED_INSTRUMENTS",
         "DHAN_BACKFILL_INSTRUMENTS",
         "DHAN_BACKFILL_TIMEFRAMES",

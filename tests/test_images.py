@@ -352,3 +352,35 @@ async def test_user_isolation(make_env: EnvFactory) -> None:
         assert (await env.b.get("/api/images")).json()["total"] == 0
         # Still intact for the owner.
         assert (await env.a.get(f"/api/images/{asset_id}/file")).status_code == 200
+
+
+async def test_models_selection_and_per_model_steps(make_env: EnvFactory) -> None:
+    models = {
+        "dreamshaper8": {"file": "/m/ds8.gguf", "steps": 20, "cfg": 7.0, "sampler": "euler_a"},
+        "dreamshaper8-lcm": {"file": "/m/lcm.gguf", "steps": 6, "cfg": 1.5, "sampler": "lcm",
+                             "note": "fast"},
+    }  # fmt: skip
+    async with make_env(IMAGE_MODELS=models, IMAGE_MODEL_NAME="dreamshaper8") as env:
+        r = await env.a.get("/api/images/models")
+        assert r.status_code == 200
+        items = {m["name"]: m for m in r.json()["items"]}
+        assert items["dreamshaper8"]["default"] and items["dreamshaper8-lcm"]["steps"] == 6
+        hdr = {"x-csrf-token": env.csrf["a"]}
+        r = await env.a.post(
+            "/api/images/generate", json={"prompt": "a lighthouse", "model": "dreamshaper8-lcm"},
+            headers=hdr,
+        )  # fmt: skip
+        assert r.status_code == 202, r.text
+        assert r.json()["model"] == "dreamshaper8-lcm" and r.json()["steps"] == 6
+        r = await env.a.post(
+            "/api/images/generate", json={"prompt": "x", "model": "sdxl"}, headers=hdr
+        )
+        assert r.status_code == 422
+
+
+async def test_disabled_image_agent_refuses(make_env: EnvFactory) -> None:
+    async with make_env(AGENT_IMAGE_ENABLED=False) as env:
+        r = await env.a.post(
+            "/api/images/generate", json={"prompt": "x"}, headers={"x-csrf-token": env.csrf["a"]}
+        )
+        assert r.status_code == 503

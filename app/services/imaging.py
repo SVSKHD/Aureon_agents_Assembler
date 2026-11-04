@@ -52,6 +52,8 @@ class ImageService:
         steps: int,
         width: int,
         height: int,
+        *,
+        model: str | None = None,
     ) -> ImageJob:
         # Serialize enqueues so two requests can't both slip under the cap.
         await self.db.execute(text(ENQUEUE_LOCK))
@@ -68,7 +70,7 @@ class ImageService:
             steps=steps,
             width=width,
             height=height,
-            model=self.settings.IMAGE_MODEL_NAME,
+            model=model or self.settings.IMAGE_MODEL_NAME,
         )
         self.db.add(job)
         await self.db.flush()

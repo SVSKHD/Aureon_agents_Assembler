@@ -139,6 +139,7 @@ services:
         imageagent: ${IMAGE_AGENT_PATH:-/opt/image-agent}
       args:
         IMAGE_AGENT_REQUIREMENTS: ${IMAGE_AGENT_REQUIREMENTS:-requirements.txt}
+        IMAGE_AGENT_PIP: ${IMAGE_AGENT_PIP:-true}
     image: aureon-imaging:${IMAGE_TAG:-dev}
     container_name: aureon-imaging
     env_file: .env

@@ -21,8 +21,10 @@ import secrets
 import signal
 import time
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from redis.asyncio import Redis
 from redis.exceptions import TimeoutError as RedisTimeoutError
@@ -41,6 +43,7 @@ from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging, get_logger
 from app.db.session import build_engine, build_sessionmaker
 from app.models.imaging import GeneratedAsset, ImageJob
+from app.services import interactive
 from app.services.health import check_data_root
 from app.services.imaging import output_path
 
@@ -60,6 +63,18 @@ class Shutdown(Exception):
     pass
 
 
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def in_pause_window(windows: list[str], now: datetime | None = None) -> bool:
+    """Inside one of the HH:MM-HH:MM windows (Asia/Kolkata), Monday to Friday."""
+    local = (now or datetime.now(UTC)).astimezone(IST)
+    if local.weekday() >= 5:
+        return False
+    hm = local.strftime("%H:%M")
+    return any(a <= hm < b for a, b in (w.split("-", 1) for w in windows))
+
+
 class ImagingWorker:
     def __init__(
         self,
@@ -75,6 +90,38 @@ class ImagingWorker:
         self.stopping = asyncio.Event()
         self.paused = False
         self.current_job: uuid.UUID | None = None
+        self.redis: Redis | None = None
+        # Why generation is holding back right now (None = free to run): "interactive"
+        # (a chat/voice request; a running job is suspended) or "market_window" (no new job).
+        self.hold: str | None = None
+        self.suspended = False
+
+    # --- yielding to interactive work and trading windows (docs/image-agent.md) ------
+
+    async def hold_reason(self, now: datetime | None = None) -> str | None:
+        if (
+            self.settings.IMAGE_PAUSE_FOR_INTERACTIVE
+            and self.redis is not None
+            and await interactive.active(self.redis)
+        ):
+            return "interactive"
+        if in_pause_window(self.settings.IMAGE_PAUSE_WINDOWS, now):
+            return "market_window"
+        return None
+
+    async def _yield_if_needed(self) -> None:
+        """Suspend the running generation while interactive work runs; resume after."""
+        reason = await self.hold_reason()
+        self.hold = reason
+        want = reason == "interactive"
+        if want and not self.suspended and hasattr(self.generator, "suspend"):
+            self.suspended = bool(self.generator.suspend())
+            if self.suspended:
+                log.info("job_suspended", reason=reason)
+        elif not want and self.suspended and hasattr(self.generator, "resume"):
+            self.generator.resume()
+            self.suspended = False
+            log.info("job_resumed")
 
     # --- job state ------------------------------------------------------------------
 
@@ -142,6 +189,9 @@ class ImagingWorker:
 
     async def run_once(self) -> bool:
         """Process the next queued job. Returns False if there was none."""
+        self.hold = await self.hold_reason()
+        if self.hold is not None:  # no new job while chat/voice runs or in a trading window
+            return False
         job = await self._claim()
         if job is None:
             return False
@@ -152,6 +202,7 @@ class ImagingWorker:
         final = output_path(self.settings, job.user_id, job.id)
         tmp = final.with_name(f".{job.id}.{secrets.token_hex(4)}.png")
         await asyncio.to_thread(final.parent.mkdir, parents=True, exist_ok=True)
+        spec = self.settings.IMAGE_MODELS.get(job.model, {})
         req = GenerationRequest(
             prompt=job.prompt,
             negative_prompt=job.negative_prompt or "",
@@ -159,6 +210,9 @@ class ImagingWorker:
             steps=job.steps,
             width=job.width,
             height=job.height,
+            model_path=str(spec.get("file", "")),
+            cfg=float(spec.get("cfg", 7.0)),
+            sampler=str(spec.get("sampler", "euler_a")),
         )
         progress = {"now": 0, "saved": 0}
         started = time.monotonic()
@@ -190,6 +244,7 @@ class ImagingWorker:
                         break
                     if self.stopping.is_set():
                         raise Shutdown
+                    await self._yield_if_needed()
                     if await self._cancel_requested(job.id):
                         outcome = "cancelled"
                         break
@@ -207,6 +262,9 @@ class ImagingWorker:
             outcome, error = "failed", f"{type(exc).__name__}: {exc}"[:2000]
             log.exception("job_crashed", job_id=str(job.id))
         finally:
+            if self.suspended and hasattr(self.generator, "resume"):
+                self.generator.resume()  # a cancelled/stopping job must be able to exit
+                self.suspended = False
             if not task.done():
                 task.cancel()
                 with contextlib.suppress(BaseException):
@@ -292,6 +350,7 @@ class ImagingWorker:
     # --- main loop ------------------------------------------------------------------
 
     async def serve(self, redis: Redis) -> None:
+        self.redis = redis
         while not self.stopping.is_set():
             while not self.stopping.is_set() and not self.paused and await self.run_once():
                 pass
@@ -340,6 +399,8 @@ async def main() -> int:
             {
                 "current_job": str(worker.current_job) if busy else None,
                 "generator": settings.IMAGE_GENERATOR,
+                "holding": worker.hold,
+                "suspended": worker.suspended,
             },
         )
 
