@@ -1,34 +1,43 @@
-"""Which provider answers a chat turn: OpenRouter (opt-in) or local Ollama (default).
+"""Which provider answers a chat turn: an external provider (opt-in) or local Ollama (default).
 
-docs/25-openrouter.md. `ExternalGate.decide` is the single place that says yes to an
-external call. It is asked before every OpenRouter request and says no (with a reason code
-the SPA shows) when any of these hold, in this order:
+docs/25-openrouter.md, docs/26-ai-providers.md. `ExternalGate.decide` is the single place
+that says yes to an external call, for every provider (OpenRouter, Anthropic, Gemini). It
+is asked before every external request and says no (with a reason code the SPA shows) when
+any of these hold, in this order:
 
-    disabled | not_configured | no_budget      settings (Settings.openrouter_unusable_reason)
-    model_not_allowed                          the model is not the default or in the allowlist
+    disabled | not_configured | no_budget      settings (Settings.external_unusable_reason)
+    model_not_allowed                          not the provider's default or in its allowlist
+    no_pricing                                 Anthropic/Gemini model without a configured price
     context | filter                           app/services/chat_filter.py on the full payload
-    daily_cap_reached | usage_unavailable      app/services/ai_usage.py pre-check
+    daily_cap_reached | usage_unavailable      app/services/ai_usage.py pre-check (fail closed)
+    rate_limited_local                         AI_EXTERNAL_REQUESTS_PER_MINUTE for the provider
+    daily_cap_reached | global_cap_reached     the call's worst case reserved against the caps
 
 A "no" sends the turn to local Ollama (CHAT_DEFAULT_MODEL, else the first installed model).
-Errors during the call (rate_limited, upstream_error, timeout, unavailable, rejected) fall
-back the same way, from app/services/chat.py.
+Errors during the call (rate_limited, upstream_error, timeout, unavailable, rejected,
+refused) fall back the same way, from app/services/chat.py. A failed or refused external
+call never moves to ANOTHER external provider: the only fallback is local.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Literal
+from decimal import Decimal
+from typing import Any, Literal
 
 from app.agents.openrouter.client import OpenRouterClient
+from app.agents.providers.base import EXTERNAL_PROVIDERS, ExternalChatClient, ModelPrice, cost_usd
 from app.core.config import Settings
 from app.services.ai_usage import UsageTracker
 from app.services.chat_filter import classify_chat
 
-Provider = Literal["ollama", "openrouter"]
-PROVIDERS: tuple[Provider, ...] = ("ollama", "openrouter")
+Provider = Literal["ollama", "openrouter", "anthropic", "gemini"]
+PROVIDERS: tuple[Provider, ...] = ("ollama", "openrouter", "anthropic", "gemini")
 # Reasons that mean "the data had to stay local" (the SPA's "local only" badge).
 LOCAL_ONLY_REASONS = frozenset({"filter", "context"})
+# A rough upper bound for the prompt's tokens when reserving budget (no tokenizer locally).
+CHARS_PER_TOKEN = 3
 
 
 @dataclass(slots=True)
@@ -36,6 +45,9 @@ class Decision:
     external: bool
     reason: str | None = None
     categories: list[str] = field(default_factory=list)
+    provider: str = "openrouter"
+    # Budget held for this call (micro-USD); released by UsageTracker.record.
+    reserved_micro: int = 0
 
     @property
     def local_only(self) -> bool:
@@ -54,19 +66,87 @@ def build_openrouter(settings: Settings) -> OpenRouterClient | None:
     )
 
 
+def _prices(settings: Settings, provider: str) -> dict[str, ModelPrice]:
+    return {m: ModelPrice(i, o) for m, (i, o) in settings.external(provider).prices.items()}
+
+
+def build_external(
+    settings: Settings, provider: str, *, http_client: Any = None
+) -> ExternalChatClient | None:
+    """The provider's client when it is enabled and keyed; None otherwise.
+
+    `http_client` is for tests (an httpx2.AsyncClient for Anthropic, httpx for Gemini)."""
+    if provider == "openrouter":
+        return build_openrouter(settings)
+    cfg = settings.external(provider)
+    if not cfg.enabled or not cfg.api_key:
+        return None
+    common: dict[str, Any] = {
+        "base_url": cfg.base_url,
+        "timeout": cfg.timeout,
+        "max_retries": settings.AI_EXTERNAL_MAX_RETRIES,
+        "default_max_tokens": settings.AI_EXTERNAL_MAX_OUTPUT_TOKENS,
+        "prices": _prices(settings, provider),
+    }
+    if http_client is not None:
+        common["http_client"] = http_client
+    if provider == "anthropic":
+        from app.agents.anthropic.client import AnthropicClient
+
+        return AnthropicClient(cfg.api_key, **common)
+    if provider == "gemini":
+        from app.agents.gemini.client import GeminiClient
+
+        return GeminiClient(cfg.api_key, **common)
+    raise KeyError(provider)
+
+
+def external_clients(state: Any) -> dict[str, ExternalChatClient]:
+    """The API's current external clients by provider (they change on a settings reload)."""
+    out: dict[str, ExternalChatClient] = {}
+    for p in EXTERNAL_PROVIDERS:
+        client = getattr(state, p, None)
+        if client is not None:
+            out[p] = client
+    return out
+
+
+def estimate_cost(
+    settings: Settings,
+    provider: str,
+    model: str,
+    messages: Iterable[Mapping[str, str]],
+    max_tokens: int | None,
+) -> Decimal | None:
+    """The call's worst case at the configured price (None for OpenRouter: it reports cost)."""
+    cfg = settings.external(provider)
+    if cfg.reports_cost:
+        return None
+    price = cfg.prices.get(model.removeprefix("models/"))
+    if price is None:
+        return None
+    chars = sum(len(m.get("content", "")) for m in messages)
+    prompt = chars // CHARS_PER_TOKEN + 16
+    output = max_tokens or settings.AI_EXTERNAL_MAX_OUTPUT_TOKENS
+    return cost_usd(ModelPrice(*price), prompt, output)
+
+
 class ExternalGate:
     def __init__(
         self,
         settings: Settings,
-        client: OpenRouterClient | None,
+        client: ExternalChatClient | None,
         usage: UsageTracker | None,
+        *,
+        provider: str = "openrouter",
     ) -> None:
         self.settings = settings
         self.client = client
-        self.usage = usage
+        self.provider = provider
+        self.usage = usage.for_provider(provider) if usage is not None else None
 
     def unusable_reason(self) -> str | None:
-        reason = self.settings.openrouter_unusable_reason()
+        reason = self.settings.external_unusable_reason(self.provider)
         if reason is None and (self.client is None or self.usage is None):
             return "not_configured"
         return reason
@@ -75,8 +155,19 @@ class ExternalGate:
     def usable(self) -> bool:
         return self.unusable_reason() is None
 
+    @property
+    def models(self) -> list[str]:
+        return list(self.settings.external(self.provider).models)
+
+    @property
+    def default_model(self) -> str:
+        return self.settings.external(self.provider).default_model
+
     def allowed(self, model: str) -> bool:
-        return model in self.settings.openrouter_models
+        return model in self.settings.external(self.provider).models
+
+    def priced(self, model: str) -> bool:
+        return self.settings.external(self.provider).priced(model)
 
     async def decide(
         self,
@@ -84,22 +175,50 @@ class ExternalGate:
         messages: Iterable[Mapping[str, str]],
         *,
         context: str = "general",
+        max_tokens: int | None = None,
     ) -> Decision:
+        msgs = list(messages)
+
+        def no(reason: str | None, cats: Iterable[str] = ()) -> Decision:
+            return Decision(False, reason, list(cats), self.provider)
+
         if reason := self.unusable_reason():
-            return Decision(False, reason)
+            return no(reason)
         if not self.allowed(model):
-            return Decision(False, "model_not_allowed")
+            return no("model_not_allowed")
+        if not self.priced(model):
+            return no("no_pricing")
         verdict = classify_chat(
-            messages,
+            msgs,
             context=context,
             research_external_allowed=self.settings.AI_RESEARCH_EXTERNAL_ALLOWED,
         )
         if not verdict.external_ok:
-            return Decision(False, verdict.reason, verdict.categories)
+            return no(verdict.reason, verdict.categories)
+        cfg = self.settings.external(self.provider)
         assert self.usage is not None
-        if reason := await self.usage.precheck(self.settings.OPENROUTER_DAILY_LIMIT_USD):
-            return Decision(False, reason)
-        return Decision(True)
+        if reason := await self.usage.precheck(cfg.daily_limit_usd):
+            return no(reason)
+        if reason := await self.usage.minute_check(self.settings.AI_EXTERNAL_REQUESTS_PER_MINUTE):
+            return no(reason)
+        estimate = estimate_cost(self.settings, self.provider, model, msgs, max_tokens)
+        reason, held = await self.usage.reserve(
+            cfg.daily_limit_usd, estimate, self.settings.AI_EXTERNAL_DAILY_LIMIT_USD
+        )
+        if reason:
+            return no(reason)
+        return Decision(True, provider=self.provider, reserved_micro=held)
+
+    async def release(self, decision: Decision) -> None:
+        """Give back a reservation for a call that will not be made after all."""
+        if self.usage is not None and decision.reserved_micro:
+            await self.usage.release(decision.reserved_micro)
+
+
+def gate_for(
+    settings: Settings, provider: str, clients: Mapping[str, Any], usage: UsageTracker | None
+) -> ExternalGate:
+    return ExternalGate(settings, clients.get(provider), usage, provider=provider)
 
 
 def local_fallback_model(settings: Settings, installed: list[str] | None) -> str | None:
@@ -118,6 +237,10 @@ __all__ = [
     "Decision",
     "ExternalGate",
     "Provider",
+    "build_external",
     "build_openrouter",
+    "estimate_cost",
+    "external_clients",
+    "gate_for",
     "local_fallback_model",
 ]

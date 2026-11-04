@@ -19,15 +19,15 @@ path (docs/25-openrouter.md) and uses the same gate.
 
 1. **Agent settings** (`/settings` → Agents, stored in `core.app_settings`):
    - `AGENT_<NAME>_ENABLED`: a disabled agent raises `AgentDisabled`.
-   - `AGENT_<NAME>_PROVIDER`: `auto`, `ollama` or `openrouter`. `ollama` keeps the call local (reason `forced_local`). `openrouter` behaves like `auto`, still gated.
-   - `AGENT_<NAME>_MODEL`: the OpenRouter model. Blank means `OPENROUTER_DEFAULT_MODEL`.
+   - `AGENT_<NAME>_PROVIDER`: `auto`, `ollama`, `openrouter`, `anthropic` or `gemini` ([26](26-ai-providers.md)). `ollama` keeps the call local (reason `forced_local`). A named provider is preferred, still gated. `auto` uses `AI_DEFAULT_EXTERNAL_PROVIDER` (default `openrouter`).
+   - `AGENT_<NAME>_MODEL`: the external model for that provider. Blank means that provider's default model.
    - `AGENT_<NAME>_LOCAL_MODEL`: the local Ollama model.
 2. **The gate** (`ExternalGate` in `app/services/inference.py`, the only one there is) checks, in order:
    - OpenRouter is enabled, has a key and has a budget.
    - The model is the default or on the allowlist.
    - The data classification filter (`app/services/chat_filter.py`) passes on the full payload.
-   - Today's spend is under `OPENROUTER_DAILY_LIMIT_USD`. This cap is shared by chat and every agent.
-3. **External call**: if it takes longer than `MODEL_ROUTER_EXTERNAL_TIMEOUT_SECONDS` (10 s), errors, or is rate limited, the same request goes to local Ollama. A `model_router_fallback` log line and a recorded row say why.
+   - Today's spend is under the provider's daily cap (shared by chat and every agent), the local per-minute limit, and the global cap `AI_EXTERNAL_DAILY_LIMIT_USD` if set. Anthropic/Gemini models must also be priced.
+3. **External call**: if it takes longer than `MODEL_ROUTER_EXTERNAL_TIMEOUT_SECONDS` (10 s), errors, or is rate limited, the same request goes to local Ollama (never to another external provider). A `model_router_fallback` log line and a recorded row say why.
 4. **Local call**: the agent's local model, through a separate bounded queue: one generation running, `MODEL_ROUTER_LOCAL_QUEUE` (2) waiting. A full queue raises `LocalBusy`, and the caller degrades (the news agent uses its keyword rules). Market data, the Dhan feed and risk checks never call a model, so a busy Ollama can't block them.
 
 The `news` context lets the soft `trading` category (market words) leave the server, because

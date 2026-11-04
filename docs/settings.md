@@ -17,6 +17,9 @@ Only the keys in `REGISTRY` (`app/services/app_settings.py`) can be set. Keys ma
 | OpenRouter | `OPENROUTER_API_KEY` (secret, re-auth), `OPENROUTER_ENABLED`, `OPENROUTER_DEFAULT_MODEL`, `OPENROUTER_DAILY_LIMIT_USD`, `OPENROUTER_ALLOWED_MODELS`, `AI_RESEARCH_EXTERNAL_ALLOWED` |
 | Dhan       | `DHAN_CLIENT_ID`, `DHAN_API_KEY`, `DHAN_API_SECRET`, `DHAN_ACCESS_TOKEN` (manual fallback) (secrets, re-auth). The URL keys `DHAN_BASE_URL`, `DHAN_FEED_URL`, `DHAN_INSTRUMENT_CSV_URL`, `DHAN_AUTH_URL` and `DHAN_REDIRECT_URL` also need re-auth, because credentials are sent to them. `DHAN_SESSION_TOKEN` and `DHAN_SESSION_EXPIRES_AT` are **managed**: listed and masked, written only by "Log in to Dhan" (`403 managed_key` here; docs/11-dhan.md). Also settable: every other `DHAN_*` the code reads (timeouts, feed, crons, backfill, `DHAN_STATIC_IP`) |
 | GitHub     | `GITHUB_TOKEN` (secret, re-auth), `GITHUB_CODING_REPO_ALLOWLIST` (JSON list) |
+| Anthropic  | `ANTHROPIC_ENABLED`, `ANTHROPIC_API_KEY` (secret, re-auth), `ANTHROPIC_DEFAULT_MODEL`, `ANTHROPIC_ALLOWED_MODELS`, `ANTHROPIC_DAILY_LIMIT_USD`, `ANTHROPIC_MODEL_PRICES` (JSON object), `ANTHROPIC_TIMEOUT_SECONDS` ([26](26-ai-providers.md)) |
+| Gemini     | the same keys with the `GEMINI_` prefix |
+| AI         | `AI_DEFAULT_EXTERNAL_PROVIDER`, `AI_EXTERNAL_DAILY_LIMIT_USD`, `AI_EXTERNAL_MAX_OUTPUT_TOKENS`, `AI_EXTERNAL_MAX_RETRIES`, `AI_EXTERNAL_REQUESTS_PER_MINUTE` |
 | Discord    | `DISCORD_WEBHOOK_URL` (secret, re-auth) |
 | MT5        | `MT5_INGEST_TOKEN` (secret, re-auth) |
 

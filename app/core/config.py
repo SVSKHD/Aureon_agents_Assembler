@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -22,6 +23,30 @@ def _secret_text(value: SecretStr | str | None) -> str:
         return ""
     raw = value.get_secret_value() if isinstance(value, SecretStr) else str(value)
     return raw.strip()
+
+
+_PROVIDER_PREFIX = {"openrouter": "OPENROUTER", "anthropic": "ANTHROPIC", "gemini": "GEMINI"}
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalConfig:
+    """One external provider's settings (Settings.external). `api_key` is the raw secret:
+    it goes into a client and nowhere else."""
+
+    provider: str
+    enabled: bool
+    api_key: str = field(repr=False)
+    base_url: str
+    default_model: str
+    models: tuple[str, ...]
+    daily_limit_usd: Decimal
+    timeout: float
+    # model -> (input, output) USD per million tokens; empty for OpenRouter (reports cost).
+    prices: dict[str, tuple[Decimal, Decimal]]
+    reports_cost: bool
+
+    def priced(self, model: str) -> bool:
+        return self.reports_cost or model.removeprefix("models/") in self.prices
 
 
 class Environment(StrEnum):
@@ -553,20 +578,59 @@ class Settings(BaseSettings):
     # then the content filter still applies).
     AI_RESEARCH_EXTERNAL_ALLOWED: bool = False
 
+    # --- Direct Anthropic and Gemini APIs (docs/26-ai-providers.md). Same rules as OpenRouter:
+    # off by default, server-side keys, a model allowlist, a daily USD cap (0 = no budget), and
+    # the same classification gate. Neither reports a cost, so a model is usable only when the
+    # operator has priced it in *_MODEL_PRICES (USD per million tokens; nothing is built in):
+    #   {"<model id>": {"input": "<usd>", "output": "<usd>"}}
+    ANTHROPIC_ENABLED: bool = False
+    ANTHROPIC_API_KEY: SecretStr | None = None
+    ANTHROPIC_BASE_URL: str = "https://api.anthropic.com"
+    ANTHROPIC_DEFAULT_MODEL: str = ""
+    ANTHROPIC_ALLOWED_MODELS: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    ANTHROPIC_DAILY_LIMIT_USD: Decimal = Field(default=Decimal("0"), ge=0, le=Decimal("10000"))
+    ANTHROPIC_TIMEOUT_SECONDS: float = Field(default=60.0, gt=0, le=600)
+    ANTHROPIC_MODEL_PRICES: Annotated[dict[str, dict[str, Decimal]], NoDecode] = Field(
+        default_factory=dict
+    )
+    GEMINI_ENABLED: bool = False
+    GEMINI_API_KEY: SecretStr | None = None
+    GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com"
+    GEMINI_DEFAULT_MODEL: str = ""
+    GEMINI_ALLOWED_MODELS: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    GEMINI_DAILY_LIMIT_USD: Decimal = Field(default=Decimal("0"), ge=0, le=Decimal("10000"))
+    GEMINI_TIMEOUT_SECONDS: float = Field(default=60.0, gt=0, le=600)
+    GEMINI_MODEL_PRICES: Annotated[dict[str, dict[str, Decimal]], NoDecode] = Field(
+        default_factory=dict
+    )
+    # Shared by every external provider:
+    # - the provider new conversations and "auto" agents use when it is usable;
+    AI_DEFAULT_EXTERNAL_PROVIDER: Literal["openrouter", "anthropic", "gemini"] = "openrouter"
+    # - a cap on today's total external spend across providers (unset = per-provider caps only);
+    AI_EXTERNAL_DAILY_LIMIT_USD: Decimal | None = Field(default=None, ge=0, le=Decimal("10000"))
+    # - output tokens asked for when the caller sets none (Anthropic requires a value); also
+    #   the worst case reserved against the budget before a priced call starts;
+    AI_EXTERNAL_MAX_OUTPUT_TOKENS: int = Field(default=4096, ge=64, le=64000)
+    # - SDK retries before the first byte (connection errors, 408/409/429/5xx);
+    AI_EXTERNAL_MAX_RETRIES: int = Field(default=1, ge=0, le=5)
+    # - calls per provider per minute from this server (0 = no local limit).
+    AI_EXTERNAL_REQUESTS_PER_MINUTE: int = Field(default=30, ge=0, le=10000)
+
     # --- Model routing for the agents (docs/model-routing.md, app/services/model_router.py) ---
-    # Per agent: enabled, provider ("auto" = OpenRouter when the gate allows, else local;
-    # "ollama" = always local; "openrouter" = prefer it, still gated and with local fallback),
-    # the OpenRouter model ("" = OPENROUTER_DEFAULT_MODEL) and the local Ollama model.
+    # Per agent: enabled, provider ("auto" = AI_DEFAULT_EXTERNAL_PROVIDER when the gate allows,
+    # else local; "ollama" = always local; "openrouter" | "anthropic" | "gemini" = prefer that
+    # provider, still gated and with local fallback), the external model ("" = that
+    # provider's default model) and the local Ollama model.
     AGENT_NEWS_ENABLED: bool = True
-    AGENT_NEWS_PROVIDER: Literal["auto", "ollama", "openrouter"] = "auto"
+    AGENT_NEWS_PROVIDER: Literal["auto", "ollama", "openrouter", "anthropic", "gemini"] = "auto"
     AGENT_NEWS_MODEL: str = ""
     AGENT_NEWS_LOCAL_MODEL: str = "qwen2.5:3b"
     AGENT_VOICE_ENABLED: bool = True
-    AGENT_VOICE_PROVIDER: Literal["auto", "ollama", "openrouter"] = "auto"
+    AGENT_VOICE_PROVIDER: Literal["auto", "ollama", "openrouter", "anthropic", "gemini"] = "auto"
     AGENT_VOICE_MODEL: str = ""
     AGENT_VOICE_LOCAL_MODEL: str = "qwen2.5:3b"
     AGENT_RESEARCH_ENABLED: bool = True
-    AGENT_RESEARCH_PROVIDER: Literal["auto", "ollama", "openrouter"] = "auto"
+    AGENT_RESEARCH_PROVIDER: Literal["auto", "ollama", "openrouter", "anthropic", "gemini"] = "auto"
     AGENT_RESEARCH_MODEL: str = ""
     AGENT_RESEARCH_LOCAL_MODEL: str = "qwen2.5:3b"
     AGENT_IMAGE_ENABLED: bool = True
@@ -627,19 +691,79 @@ class Settings(BaseSettings):
     @property
     def openrouter_models(self) -> list[str]:
         """The OpenRouter model ids a conversation may use: the default, then the allowlist."""
-        extra = (m.strip() for m in self.OPENROUTER_ALLOWED_MODELS)
-        ids = [self.OPENROUTER_DEFAULT_MODEL.strip(), *extra]
-        return list(dict.fromkeys(m for m in ids if m))
+        return list(self.external("openrouter").models)
 
     def openrouter_unusable_reason(self) -> str | None:
         """None when OpenRouter may be tried at all; else why not (a fallback reason code)."""
-        if not self.OPENROUTER_ENABLED:
+        return self.external_unusable_reason("openrouter")
+
+    # --- external providers, one view per provider (docs/26-ai-providers.md) ---
+
+    def external(self, provider: str) -> ExternalConfig:
+        """The provider's settings as one value. KeyError for an unknown provider."""
+        prefix = _PROVIDER_PREFIX[provider]
+
+        def get(name: str) -> Any:
+            return getattr(self, f"{prefix}_{name}")
+
+        default = str(get("DEFAULT_MODEL") or "").strip()
+        extra = (m.strip() for m in get("ALLOWED_MODELS"))
+        models = tuple(dict.fromkeys(m for m in (default, *extra) if m))
+        prices: dict[str, tuple[Decimal, Decimal]] = {}
+        if provider != "openrouter":  # OpenRouter reports the cost itself
+            for model, p in (get("MODEL_PRICES") or {}).items():
+                prices[model.removeprefix("models/")] = (p["input"], p["output"])
+        return ExternalConfig(
+            provider=provider,
+            enabled=bool(get("ENABLED")),
+            api_key=_secret_text(get("API_KEY")),
+            base_url=str(get("BASE_URL")),
+            default_model=default,
+            models=models,
+            daily_limit_usd=get("DAILY_LIMIT_USD"),
+            timeout=float(get("TIMEOUT_SECONDS")),
+            prices=prices,
+            reports_cost=provider == "openrouter",
+        )
+
+    def external_unusable_reason(self, provider: str) -> str | None:
+        """None when the provider may be tried at all; else why not (a fallback reason)."""
+        cfg = self.external(provider)
+        if not cfg.enabled:
             return "disabled"
-        if not self.openrouter_key or not self.OPENROUTER_DEFAULT_MODEL.strip():
+        if not cfg.api_key or not cfg.default_model:
             return "not_configured"
-        if self.OPENROUTER_DAILY_LIMIT_USD <= 0:
+        if cfg.daily_limit_usd <= 0:
+            return "no_budget"
+        if self.AI_EXTERNAL_DAILY_LIMIT_USD is not None and self.AI_EXTERNAL_DAILY_LIMIT_USD <= 0:
             return "no_budget"
         return None
+
+    @field_validator("ANTHROPIC_MODEL_PRICES", "GEMINI_MODEL_PRICES", mode="before")
+    @classmethod
+    def _prices(cls, v: object) -> object:
+        """`{"model": {"input": usd_per_mtok, "output": usd_per_mtok}}`, from JSON or a dict."""
+        if v is None or v == "":
+            return {}
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except ValueError as exc:
+                raise ValueError("must be a JSON object") from exc
+        if not isinstance(v, dict):
+            raise ValueError("must be a JSON object of model -> {input, output}")
+        out: dict[str, dict[str, Decimal]] = {}
+        for model, price in v.items():
+            if not isinstance(model, str) or not model.strip() or not isinstance(price, dict):
+                raise ValueError("each entry must be model -> {input, output}")
+            try:
+                pair = {k: Decimal(str(price[k])) for k in ("input", "output")}
+            except (KeyError, ArithmeticError, ValueError) as exc:
+                raise ValueError("each price needs numeric input and output") from exc
+            if any(not d.is_finite() or d < 0 for d in pair.values()):
+                raise ValueError("prices must be numbers >= 0")
+            out[model.strip()] = pair
+        return out
 
     @property
     def github_webhook_configured(self) -> bool:
@@ -733,6 +857,8 @@ class Settings(BaseSettings):
         "CLAUDE_CLI_ENV_PASSTHROUGH",
         "CLAUDE_REVIEW_INTERNAL_DOMAINS",
         "OPENROUTER_ALLOWED_MODELS",
+        "ANTHROPIC_ALLOWED_MODELS",
+        "GEMINI_ALLOWED_MODELS",
         "CF_ACCESS_AUD",
         "CF_ACCESS_BYPASS_PATHS",
         mode="before",

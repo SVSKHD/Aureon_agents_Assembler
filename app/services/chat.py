@@ -3,8 +3,9 @@
 Streaming design
 ----------------
 A *producer* task talks to the model (inside the request timeout) and puts events on a queue.
-With an OpenRouter route (docs/25-openrouter.md) it tries OpenRouter first and, on any
-error, falls back to local Ollama in the same stream (a `fallback` event says so).
+With an external route (OpenRouter, Anthropic or Gemini; docs/25, docs/26) it tries that
+provider first and, on any error, falls back to local Ollama in the same stream (a
+`fallback` event says so). It never moves to another external provider.
 The SSE generator (*consumer*) reads that queue, sending a keep-alive comment whenever it
 has been quiet for CHAT_HEARTBEAT_SECONDS. A long CPU model load therefore never looks idle
 to Nginx or Cloudflare, and a disconnected client is noticed within one heartbeat.
@@ -34,7 +35,13 @@ from starlette.types import Receive, Scope, Send
 
 from app.agents.ollama.client import ModelInfo, OllamaClient, OllamaError
 from app.agents.ollama.limiter import GenerationLimiter, QueueFull, Ticket
-from app.agents.openrouter.client import OpenRouterClient, OpenRouterError
+from app.agents.openrouter.client import OpenRouterClient
+from app.agents.providers.base import (
+    EXTERNAL_PROVIDERS,
+    PROVIDER_LABELS,
+    ExternalChatClient,
+    ProviderError,
+)
 from app.agents.registry import AgentRegistry
 from app.core.logging import get_logger
 from app.models.ai import Conversation, Message, ModelInventory
@@ -229,7 +236,7 @@ class _Turn:
     error: str | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
-    # Who is answering now (changes on a fallback) and why the turn is not on OpenRouter.
+    # Who is answering now (changes on a fallback) and why the turn is not external.
     provider: str = "ollama"
     model: str = ""
     fallback_reason: str | None = None
@@ -238,10 +245,11 @@ class _Turn:
 
 @dataclass(slots=True)
 class _External:
-    """One OpenRouter attempt, for the audit row and the daily counter. Never content."""
+    """One external attempt, for the audit row and the daily counter. Never content."""
 
     model: str
     started: float
+    provider: str = "openrouter"
     outcome: str = "running"
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -257,19 +265,21 @@ class ChatJob:
     model: str
     prompt: list[dict[str, str]]
     options: dict[str, Any]
-    # Routing (docs/25-openrouter.md). `provider`/`model` are the first attempt.
+    # Routing (docs/25-openrouter.md, docs/26). `provider`/`model` are the first attempt.
     provider: str = "ollama"
     requested_provider: str = "ollama"
     requested_model: str = ""
-    # Local Ollama model used when OpenRouter is skipped or fails (None = no fallback).
+    # Local Ollama model used when the external provider is skipped or fails (None = none).
     fallback_model: str | None = None
-    # Why the turn starts on Ollama although OpenRouter was requested (None = it did not).
+    # Why the turn starts on Ollama although an external provider was requested.
     route_reason: str | None = None
     filter_categories: tuple[str, ...] = ()
     temperature: float | None = None
     max_tokens: int | None = None
     user_id: uuid.UUID | None = None
     client: audit.ClientInfo = field(default_factory=audit.ClientInfo)
+    # Budget the gate reserved for the external call (released when it is recorded).
+    reserved_micro: int = 0
 
 
 class ChatStream:
@@ -286,16 +296,25 @@ class ChatStream:
         limiter: GenerationLimiter | None = None,
         openrouter: OpenRouterClient | None = None,
         usage: UsageTracker | None = None,
+        external: ExternalChatClient | None = None,
     ) -> None:
         self.registry = registry
         self.job = job
         self.ollama = ollama
         self.maker = maker
-        # An OpenRouter route admits to the Ollama limiter only if it has to fall back.
+        # An external route admits to the Ollama limiter only if it has to fall back.
         self.ticket = ticket
         self.limiter = limiter
-        self.openrouter = openrouter
-        self.usage = usage
+        # `openrouter=` is the original keyword; `external=` takes any provider's client.
+        self.external_client: ExternalChatClient | None = (
+            external if external is not None else openrouter
+        )
+        self.openrouter = self.external_client
+        self.usage = (
+            usage.for_provider(job.provider)
+            if usage is not None and job.provider in EXTERNAL_PROVIDERS
+            else usage
+        )
         self.timeout = timeout
         self.heartbeat = heartbeat
         self.turn = _Turn(provider=job.provider, model=job.model, fallback_reason=job.route_reason)
@@ -314,13 +333,14 @@ class ChatStream:
         q, turn = self._queue, self.turn
         try:
             async with asyncio.timeout(self.timeout):
-                if turn.provider == "openrouter":
-                    if await self._produce_openrouter():
+                if turn.provider in EXTERNAL_PROVIDERS:
+                    if await self._produce_external():
                         turn.status = "complete"
                         return
                     if not self.job.fallback_model:
+                        label = PROVIDER_LABELS.get(self.job.provider, self.job.provider)
                         turn.status, turn.error_code = "error", "fallback_unavailable"
-                        turn.error = "OpenRouter failed and no local model is available"
+                        turn.error = f"{label} failed and no local model is available"
                         return
                     turn.provider, turn.model = "ollama", self.job.fallback_model
                     await q.put(
@@ -371,17 +391,19 @@ class ChatStream:
                 turn.completion_tokens = chunk.get("eval_count")
                 break
 
-    async def _produce_openrouter(self) -> bool:
-        """True when OpenRouter answered in full. False after any OpenRouter error, with
-        turn.fallback_reason set and the partial text dropped (the SPA resets it)."""
+    async def _produce_external(self) -> bool:
+        """True when the external provider answered in full. False after any provider error,
+        with turn.fallback_reason set and the partial text dropped (the SPA resets it)."""
         q, turn = self._queue, self.turn
-        ext = self.external = _External(turn.model, time.monotonic())
-        if self.openrouter is None:
+        ext = self.external = _External(turn.model, time.monotonic(), turn.provider)
+        client = self.external_client
+        if client is None:
             turn.fallback_reason = ext.outcome = "not_configured"
+            await self._record_external()
             return False
         await q.put(("start", None))
         try:
-            async for chunk in self.openrouter.chat_stream(
+            async for chunk in client.chat_stream(
                 turn.model,
                 self.job.prompt,
                 temperature=self.job.temperature,
@@ -397,12 +419,14 @@ class ChatStream:
                 if piece:
                     turn.parts.append(piece)
                     await q.put(("token", piece))
-        except OpenRouterError as exc:
+        except ProviderError as exc:
             ext.outcome = f"error:{exc.code}"
             turn.fallback_reason = exc.code
             turn.parts.clear()
             await self._record_external()
-            log.warning("openrouter_fallback", reason=exc.code, status=exc.status)
+            log.warning(
+                "external_fallback", provider=ext.provider, reason=exc.code, status=exc.status
+            )
             return False
         ext.outcome = "ok"
         turn.prompt_tokens, turn.completion_tokens = ext.prompt_tokens, ext.completion_tokens
@@ -410,19 +434,27 @@ class ChatStream:
         await self._record_external()
         return True
 
+    # The original name (tests and callers from before docs/26).
+    _produce_openrouter = _produce_external
+
     async def _record_external(self) -> None:
         ext = self.external
         if ext is None or ext.recorded:
             return
         ext.recorded = True
         ext.latency_ms = int((time.monotonic() - ext.started) * 1000)
-        if self.usage is not None and ext.outcome != "not_configured":
-            await self.usage.record(
-                cost_usd=ext.cost_usd,
-                prompt_tokens=ext.prompt_tokens,
-                completion_tokens=ext.completion_tokens,
-                failed=ext.outcome != "ok",
-            )
+        if self.usage is None:
+            return
+        if ext.outcome == "not_configured":
+            await self.usage.release(self.job.reserved_micro)
+            return
+        await self.usage.record(
+            cost_usd=ext.cost_usd,
+            prompt_tokens=ext.prompt_tokens,
+            completion_tokens=ext.completion_tokens,
+            failed=ext.outcome != "ok",
+            reserved_micro=self.job.reserved_micro,
+        )
 
     # --- persistence --------------------------------------------------------------------
 
@@ -470,7 +502,7 @@ class ChatStream:
                     self.job.client,
                     actor_user_id=self.job.user_id,
                     details={
-                        "provider": "openrouter",
+                        "provider": ext.provider,
                         "model": ext.model,
                         "conversation_id": str(self.job.conversation_id),
                         "message_id": msg.id,

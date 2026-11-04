@@ -21,33 +21,36 @@ from typing import Any
 import httpx
 from pydantic import SecretStr
 
+from app.agents.providers.base import (
+    ProviderError,
+    ProviderRateLimited,
+    ProviderRejected,
+    ProviderTimeout,
+    ProviderUnavailable,
+)
 from app.core.logging import scrub_messages
 
 
-class OpenRouterError(Exception):
-    """OpenRouter could not answer. `code` doubles as the chat's fallback reason."""
+class OpenRouterError(ProviderError):
+    """OpenRouter could not answer. `code` doubles as the chat's fallback reason.
 
-    code = "upstream_error"
-
-    def __init__(self, message: str, status: int | None = None) -> None:
-        super().__init__(message)
-        self.message = message
-        self.status = status
+    A ProviderError (app/agents/providers/base.py), so provider-neutral callers catch it;
+    the OpenRouter names stay for existing callers and tests."""
 
 
-class OpenRouterRateLimited(OpenRouterError):
+class OpenRouterRateLimited(OpenRouterError, ProviderRateLimited):
     code = "rate_limited"
 
 
-class OpenRouterTimeout(OpenRouterError):
+class OpenRouterTimeout(OpenRouterError, ProviderTimeout):
     code = "timeout"
 
 
-class OpenRouterUnavailable(OpenRouterError):
+class OpenRouterUnavailable(OpenRouterError, ProviderUnavailable):
     code = "unavailable"
 
 
-class OpenRouterRejected(OpenRouterError):
+class OpenRouterRejected(OpenRouterError, ProviderRejected):
     """4xx other than 429: bad key, no credits, unknown model, refused content."""
 
     code = "rejected"
@@ -84,6 +87,8 @@ def parse_usage(raw: Any) -> dict[str, Any]:
 
 
 class OpenRouterClient:
+    provider = "openrouter"
+
     def __init__(
         self,
         base_url: str,
@@ -105,6 +110,21 @@ class OpenRouterClient:
 
     async def aclose(self) -> None:
         await self._http.aclose()
+
+    async def list_models(self) -> list[str]:
+        """Model ids OpenRouter offers (GET /models). Raises OpenRouterError."""
+        try:
+            resp = await self._http.get(
+                "/models", headers={"Authorization": self._headers()["Authorization"]}
+            )
+        except httpx.TimeoutException as exc:
+            raise OpenRouterTimeout("OpenRouter did not respond in time") from exc
+        except httpx.TransportError as exc:
+            raise OpenRouterUnavailable("OpenRouter is unreachable") from exc
+        if resp.status_code >= 400:
+            raise _for_status(resp.status_code)
+        data = resp.json().get("data") if isinstance(resp.json(), dict) else None
+        return sorted(str(m["id"]) for m in data or [] if isinstance(m, dict) and m.get("id"))
 
     def _headers(self) -> dict[str, str]:
         return {

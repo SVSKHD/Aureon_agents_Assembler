@@ -27,7 +27,7 @@ from app.db.base import Base
 
 MESSAGE_ROLES = ("system", "user", "assistant")
 MESSAGE_STATUSES = ("complete", "cancelled", "error", "timeout")
-PROVIDERS = ("ollama", "openrouter")
+PROVIDERS = ("ollama", "openrouter", "anthropic", "gemini")
 CONVERSATION_CONTEXTS = ("general", "finance", "trading", "research")
 
 
@@ -35,7 +35,9 @@ class Conversation(Base):
     __tablename__ = "conversations"
     __table_args__ = (
         Index("ix_ai_conversations_user_id_updated_at", "user_id", "updated_at"),
-        CheckConstraint("provider IN ('ollama','openrouter')", name="provider"),
+        CheckConstraint(
+            "provider IN ('ollama','openrouter','anthropic','gemini')", name="provider"
+        ),
         CheckConstraint("context IN ('general','finance','trading','research')", name="context"),
         {"schema": "ai"},
     )

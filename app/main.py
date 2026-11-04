@@ -39,7 +39,7 @@ from app.services.ai_usage import UsageTracker
 from app.services.chat import chat_options
 from app.services.claude_review import ReviewRunner
 from app.services.health import HealthService
-from app.services.inference import build_openrouter
+from app.services.inference import build_external, build_openrouter
 from app.services.mt5_ingest import DbIngestStore
 
 log = get_logger(__name__)
@@ -101,6 +101,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # spend counter lives in Redis.
         openrouter = build_openrouter(live)
         app.state.openrouter = openrouter
+        # Direct Anthropic / Gemini APIs (docs/26-ai-providers.md): same rule, a client only
+        # when enabled and keyed. Kept apart from the Claude CLI review client below.
+        app.state.anthropic = build_external(live, "anthropic")
+        app.state.gemini = build_external(live, "gemini")
         app.state.ai_usage = UsageTracker(redis)
         warmup: asyncio.Task[None] | None = None
         if settings.CHAT_WARMUP and settings.CHAT_DEFAULT_MODEL:

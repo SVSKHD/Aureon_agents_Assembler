@@ -1,6 +1,7 @@
 """Data classification for external chat inference (docs/25-openrouter.md).
 
-Runs on the FULL outbound payload of every request that could go to OpenRouter: the system
+Runs on the FULL outbound payload of every request that could go to an external provider
+(OpenRouter, Anthropic or Gemini; docs/26), the same rules for each: the system
 prompt, the re-sent history and the new turns (the SPA's live-data context block arrives
 inside the system message, so it is covered too). It reuses the Claude review filter's
 secret and entropy detection (`app/services/review_filter.py`) and adds rules for chat text.
@@ -52,6 +53,7 @@ def _rx(*parts: str, ignore_case: bool = True) -> re.Pattern[str]:
 _SECRET_TEXT = _rx(
     r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.",  # JWT
     r"\bsk-(?:or-v1-|proj-|ant-)?[A-Za-z0-9_-]{16,}",  # OpenRouter / OpenAI / Anthropic keys
+    r"\bAIza[0-9A-Za-z_-]{30,}",  # Google API keys (Gemini)
     r"\bbearer\s+[A-Za-z0-9._~+/=-]{16,}",
     r"\b(?:ssh-(?:rsa|ed25519|dss)|ecdsa-sha2-nistp\d+)\s+AAAA[A-Za-z0-9+/]{20,}",
     r"\b(?:pass(?:word|wd|phrase|code)s?|pin\s*code|api[\s_-]?keys?|secret[\s_-]?keys?"

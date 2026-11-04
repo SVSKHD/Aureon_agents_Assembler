@@ -11,9 +11,10 @@ top, through the same pydantic validators .env goes through, so a DB value is pa
 like the env var it replaces. `get_settings()` returns the overlay once it is installed.
 
 RELOAD. A write publishes on Redis (CHANNEL). The API swaps `app.state.settings` and rebuilds
-the clients that hold a credential (OpenRouter, GitHub, Dhan) in place. Workers build their
-clients once at startup, so a worker whose keys changed shuts down gracefully and re-executes
-itself in the same container (`run_worker`): no container restart, no `docker compose` call.
+the clients that hold a credential (OpenRouter, Anthropic, Gemini, GitHub, Dhan) in place.
+Workers build their clients once at startup, so a worker whose keys changed shuts down
+gracefully and re-executes itself in the same container (`run_worker`): no container
+restart, no `docker compose` call.
 Workers without Redis (the coding worker) notice by polling a DB fingerprint.
 
 SECRECY. Values never leave this module except into Settings: the API returns masks, tests
@@ -52,7 +53,9 @@ from app.models.app_settings import AppSetting
 log = structlog.get_logger(__name__)
 
 CHANNEL = "aureon:settings:changed"
-Kind = Literal["str", "secret", "bool", "decimal", "int", "float", "url", "csv", "json_list"]
+Kind = Literal[
+    "str", "secret", "bool", "decimal", "int", "float", "url", "csv", "json_list", "json_object"
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,7 +82,17 @@ def _s(
     return Spec(key, cat, kind, desc, reauth or kind == "secret", managed)
 
 
-CATEGORIES = ("openrouter", "agents", "dhan", "github", "discord", "mt5")
+CATEGORIES = (
+    "openrouter",
+    "anthropic",
+    "gemini",
+    "ai",
+    "agents",
+    "dhan",
+    "github",
+    "discord",
+    "mt5",
+)
 
 REGISTRY: dict[str, Spec] = {
     s.key: s
@@ -97,13 +110,14 @@ REGISTRY: dict[str, Spec] = {
                     f"AGENT_{agent}_PROVIDER",
                     "agents",
                     "str",
-                    f"{label}: auto (OpenRouter when allowed) | ollama | openrouter",
+                    f"{label}: auto (the default external provider when allowed) | ollama"
+                    " | openrouter | anthropic | gemini",
                 ),
                 _s(
                     f"AGENT_{agent}_MODEL",
                     "agents",
                     "str",
-                    f"{label}: OpenRouter model (blank = default)",
+                    f"{label}: external model (blank = that provider's default)",
                 ),
                 _s(f"AGENT_{agent}_LOCAL_MODEL", "agents", "str", f"{label}: local Ollama model"),
             )
@@ -119,7 +133,7 @@ REGISTRY: dict[str, Spec] = {
             "MODEL_ROUTER_EXTERNAL_TIMEOUT_SECONDS",
             "agents",
             "float",
-            "Agents: OpenRouter timeout before local fallback (s)",
+            "Agents: external timeout before local fallback (s)",
         ),
         _s("MODEL_ROUTER_LOCAL_QUEUE", "agents", "int", "Agents: local Ollama queue size"),
         _s("OPENROUTER_ENABLED", "openrouter", "bool", "Allow external models via OpenRouter"),
@@ -132,6 +146,59 @@ REGISTRY: dict[str, Spec] = {
             "openrouter",
             "bool",
             "Let research prompts go to external models",
+        ),
+        # --- direct provider APIs (docs/26-ai-providers.md) ---
+        *(
+            spec
+            for prefix, cat, label in (
+                ("ANTHROPIC", "anthropic", "Anthropic"),
+                ("GEMINI", "gemini", "Gemini"),
+            )
+            for spec in (
+                _s(f"{prefix}_ENABLED", cat, "bool", f"Allow external models via the {label} API"),
+                _s(f"{prefix}_API_KEY", cat, "secret", f"{label} API key"),
+                _s(f"{prefix}_DEFAULT_MODEL", cat, "str", f"Default {label} model id"),
+                _s(
+                    f"{prefix}_ALLOWED_MODELS",
+                    cat,
+                    "csv",
+                    "Allowed model ids, comma-separated",
+                ),
+                _s(f"{prefix}_DAILY_LIMIT_USD", cat, "decimal", "Daily spend cap (USD)"),
+                _s(
+                    f"{prefix}_MODEL_PRICES",
+                    cat,
+                    "json_object",
+                    'USD per million tokens: {"<model>": {"input": "..", "output": ".."}}'
+                    " (a model without a price is never used)",
+                ),
+                _s(f"{prefix}_TIMEOUT_SECONDS", cat, "float", f"{label} timeout (s)"),
+            )
+        ),
+        _s(
+            "AI_DEFAULT_EXTERNAL_PROVIDER",
+            "ai",
+            "str",
+            "Provider for new conversations and 'auto' agents: openrouter | anthropic | gemini",
+        ),
+        _s(
+            "AI_EXTERNAL_DAILY_LIMIT_USD",
+            "ai",
+            "decimal",
+            "Daily cap on total external spend across providers (USD)",
+        ),
+        _s(
+            "AI_EXTERNAL_MAX_OUTPUT_TOKENS",
+            "ai",
+            "int",
+            "Output tokens per external call when the caller sets none",
+        ),
+        _s("AI_EXTERNAL_MAX_RETRIES", "ai", "int", "SDK retries per external call"),
+        _s(
+            "AI_EXTERNAL_REQUESTS_PER_MINUTE",
+            "ai",
+            "int",
+            "External calls per provider per minute (0 = no local limit)",
         ),
         _s("DHAN_CLIENT_ID", "dhan", "secret", "Dhan client id"),
         _s("DHAN_API_KEY", "dhan", "secret", "Dhan API key (web.dhan.co, Access DhanHQ APIs)"),
@@ -283,6 +350,14 @@ def normalize(spec: Spec, raw: str) -> str:
         return value
     if spec.kind == "csv":
         return ",".join(p.strip() for p in value.split(",") if p.strip())
+    if spec.kind == "json_object":
+        try:
+            obj = json.loads(value)
+        except ValueError as exc:
+            raise SettingsError("invalid_value", f"{spec.key} must be a JSON object") from exc
+        if not isinstance(obj, dict):
+            raise SettingsError("invalid_value", f"{spec.key} must be a JSON object")
+        return json.dumps(obj, sort_keys=True, default=str)
     if spec.kind == "json_list":
         if not value:
             return "[]"
@@ -348,6 +423,8 @@ def current_value(settings: Settings, key: str) -> str | None:
         return "true" if value else "false"
     if isinstance(value, Enum):
         value = value.value
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True, default=str) if value else None
     if isinstance(value, list):
         spec = REGISTRY.get(key)
         if spec is not None and spec.kind == "json_list":
@@ -646,6 +723,60 @@ async def _openrouter(s: Settings, http: httpx.AsyncClient) -> TestOutcome:
     return TestOutcome(True, "OpenRouter key OK" + (" and default model found" if model else ""))
 
 
+async def _external_models(s: Settings, provider: str, label: str) -> TestOutcome:
+    """List the provider's models with the key (no tokens are spent) and check the default
+    model exists and is priced. Errors are status lines from ProviderError, never bodies."""
+    from app.agents.providers.base import ProviderError
+    from app.services.inference import build_external
+
+    cfg = s.external(provider)
+    if not cfg.api_key:
+        return TestOutcome(False, f"{provider.upper()}_API_KEY is not set")
+    # Built even when disabled, so a key can be tested before it is switched on.
+    probe = s.model_copy(update={f"{provider.upper()}_ENABLED": True})
+    client = build_external(probe, provider)
+    if client is None:
+        return TestOutcome(False, f"{label} client could not be built")
+    try:
+        ids = set(await client.list_models())
+    except ProviderError as exc:
+        return TestOutcome(False, f"{label} key: {exc.message}")
+    finally:
+        await client.aclose()
+    model = cfg.default_model
+    if not model:
+        return TestOutcome(True, f"{label} key OK ({len(ids)} models); no default model set")
+    if model.removeprefix("models/") not in ids:
+        return TestOutcome(False, f"key OK; {provider.upper()}_DEFAULT_MODEL is not available")
+    if not cfg.priced(model):
+        return TestOutcome(
+            False, f"key OK; the default model has no price in {provider.upper()}_MODEL_PRICES"
+        )
+    return TestOutcome(True, f"{label} key OK and default model found")
+
+
+async def _anthropic(s: Settings, http: httpx.AsyncClient) -> TestOutcome:
+    return await _external_models(s, "anthropic", "Anthropic")
+
+
+async def _gemini(s: Settings, http: httpx.AsyncClient) -> TestOutcome:
+    return await _external_models(s, "gemini", "Gemini")
+
+
+async def _ai(s: Settings, http: httpx.AsyncClient) -> TestOutcome:
+    """The shared routing settings are coherent (no network call)."""
+    p = s.AI_DEFAULT_EXTERNAL_PROVIDER
+    reason = s.external_unusable_reason(p)
+    if reason:
+        return TestOutcome(False, f"default external provider {p} is not usable ({reason})")
+    cap = s.AI_EXTERNAL_DAILY_LIMIT_USD
+    return TestOutcome(
+        True,
+        f"default external provider {p} is usable; global cap "
+        + (f"{cap} USD" if cap is not None else "not set"),
+    )
+
+
 async def _dhan(s: Settings, http: httpx.AsyncClient) -> TestOutcome:
     cid, secret = current_value(s, "DHAN_CLIENT_ID"), s.dhan_access_token()
     if not cid or secret is None:
@@ -710,6 +841,9 @@ async def _agents(s: Settings, http: httpx.AsyncClient) -> TestOutcome:
 _TESTS: dict[str, Callable[[Settings, httpx.AsyncClient], Awaitable[TestOutcome]]] = {
     "agents": _agents,
     "openrouter": _openrouter,
+    "anthropic": _anthropic,
+    "gemini": _gemini,
+    "ai": _ai,
     "dhan": _dhan,
     "github": _github,
     "discord": _discord,

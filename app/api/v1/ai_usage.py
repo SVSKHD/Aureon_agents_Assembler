@@ -1,7 +1,8 @@
 """GET /api/v1/ai/usage: model calls per agent and provider (docs/model-routing.md).
 
 Admin only. Totals from ai.model_calls (metadata only: no prompt or answer is stored) plus
-today's OpenRouter spend against the shared OPENROUTER_DAILY_LIMIT_USD.
+today's OpenRouter spend against the shared OPENROUTER_DAILY_LIMIT_USD (the original fields),
+and today's spend of every external provider against its cap and the global cap (docs/26).
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from sqlalchemy import case, func, select
 from app.api.ui import ui_module
 from app.auth.deps import AdminRequired, DbSession
 from app.models.model_calls import ModelCall
-from app.services.ai_usage import UsageTracker
+from app.services.ai_usage import MICRO, PROVIDERS, UsageTracker
 
 UI_MODULE = ui_module("ai-usage", label="AI usage", group="ai", icon="gauge", order=46)
 router = APIRouter(prefix="/v1/ai", tags=["ai"])
@@ -36,11 +37,25 @@ class AgentUsage(BaseModel):
     avg_latency_ms: int
 
 
+class ProviderSpend(BaseModel):
+    provider: str
+    daily_limit_usd: Decimal
+    # None when the Redis counter could not be read (external calls then stay local).
+    spent_today_usd: Decimal | None
+    reserved_usd: Decimal | None
+    calls_today: int | None
+    failures_today: int | None
+
+
 class UsageOut(BaseModel):
     since: datetime
+    # OpenRouter's cap and spend (unchanged fields).
     daily_limit_usd: Decimal
     spent_today_usd: Decimal | None
     items: list[AgentUsage]
+    providers: list[ProviderSpend] = []
+    global_limit_usd: Decimal | None = None
+    global_spent_today_usd: Decimal | None = None
 
 
 @router.get("/usage", response_model=UsageOut)
@@ -72,18 +87,42 @@ async def usage(
             .order_by(ModelCall.agent, ModelCall.provider)
         )
     ).all()
-    spent: Decimal | None
-    try:
-        tracker = getattr(request.app.state, "ai_usage", None) or UsageTracker(
-            request.app.state.redis
+    settings = request.app.state.settings
+    tracker = getattr(request.app.state, "ai_usage", None) or UsageTracker(request.app.state.redis)
+    providers: list[ProviderSpend] = []
+    for p in PROVIDERS:
+        t = tracker.for_provider(p)
+        try:
+            today = await t.today()
+            reserved: Decimal | None = Decimal(await t.reserved_micro()) / MICRO
+            spent_p: Decimal | None = today.spent_usd
+            calls: int | None = today.calls
+            fails: int | None = today.failures
+        except Exception:
+            spent_p = reserved = calls = fails = None
+        providers.append(
+            ProviderSpend(
+                provider=p,
+                daily_limit_usd=settings.external(p).daily_limit_usd,
+                spent_today_usd=spent_p,
+                reserved_usd=reserved,
+                calls_today=calls,
+                failures_today=fails,
+            )
         )
-        spent = (await tracker.today()).spent_usd
+    spent = providers[0].spent_today_usd  # OpenRouter (PROVIDERS[0])
+    global_spent: Decimal | None
+    try:
+        global_spent = Decimal(await tracker.total_today_micro()) / MICRO
     except Exception:
-        spent = None
+        global_spent = None
     return UsageOut(
         since=since,
-        daily_limit_usd=request.app.state.settings.OPENROUTER_DAILY_LIMIT_USD,
+        daily_limit_usd=settings.OPENROUTER_DAILY_LIMIT_USD,
         spent_today_usd=spent,
+        providers=providers,
+        global_limit_usd=settings.AI_EXTERNAL_DAILY_LIMIT_USD,
+        global_spent_today_usd=global_spent,
         items=[
             AgentUsage(
                 agent=a,

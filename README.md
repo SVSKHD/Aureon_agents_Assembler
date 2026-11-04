@@ -30,6 +30,8 @@ Phase 19 adds an advisory Claude PR reviewer via the local Claude CLI (off unles
 Phase 20 grows the approval gate into the full approval engine: per-kind policies (N distinct admins, expiry, self-approval, re-auth), multiple artifacts with drift invalidation, a short-lived server-side session re-auth stamp, a hash-chained event log with verification, an admin inbox with an SSE stream, Discord notifications that only deep-link into the app, voice navigation (never an action), and paper-intent approvals through the engine (`trading.paper_intent`) ([docs/23-approval-engine.md](docs/23-approval-engine.md)).
 Phase 22 integrates production: scoped DB roles (`deploy/sql/roles.sql`; the app role has no DDL and an append-only audit trail; `MIGRATIONS_DATABASE_URL` for the migrate one-shot), the MT5 read-only feed confirmed end to end, the integrations health card, Discord alerts (`alerts_dispatch`, deduplicated), a migration rollback drill, Cloudflare Tunnel + Access for spasta.online and api.spasta.online (with optional app-level JWT verification), resource caps, and a 16-step acceptance run with recorded results ([docs/24-production-integration.md](docs/24-production-integration.md)).
 
+Direct Anthropic and Gemini APIs (docs/26) join OpenRouter behind the same gate: official SDKs, per-provider allowlists, operator-configured prices (an unpriced model is never used), per-provider and global daily caps with atomic reservations, a local rate limit, and local Ollama as the only fallback (never another external provider) ([docs/26-ai-providers.md](docs/26-ai-providers.md)). The Dhan audit and its read-only enforcement are in [docs/27-dhan-audit.md](docs/27-dhan-audit.md).
+
 OpenRouter (rule 4 amended 2026-11-03) adds opt-in external chat inference: off by default, a per-conversation provider/model, a classification filter over the whole outbound payload (secrets, finance, trading, broker, positions and logs stay local), a daily USD cap in Redis, automatic fallback to the local Ollama model on any error, and metadata-only audit rows ([docs/25-openrouter.md](docs/25-openrouter.md)).
 
 ## Layout
@@ -72,9 +74,9 @@ tests/  scripts/  deploy/  docs/
 | POST | `/api/auth/sessions/revoke-all` | Signs out every session of the user (needs `X-CSRF-Token`). |
 | GET | `/api/models` | Installed Ollama models (cached 60 s). |
 | GET | `/api/models/status` | Reachability, loaded models, last use. |
-| GET | `/api/models/catalog` | The picker: local models plus allowed OpenRouter models, and the default ([docs/25](docs/25-openrouter.md)). |
-| GET | `/api/ai/usage` | Today's OpenRouter spend, tokens and calls against the daily cap. |
-| POST | `/api/chat` | Streaming chat (SSE); stores both turns. Optional `provider` (`ollama`/`openrouter`) and `context`; falls back to local Ollama. |
+| GET | `/api/models/catalog` | The picker: local models plus allowed OpenRouter/Anthropic/Gemini models, per-provider status, and the default ([docs/25](docs/25-openrouter.md), [docs/26](docs/26-ai-providers.md)). |
+| GET | `/api/ai/usage[?provider=]` | Today's spend, tokens and calls of one provider (default OpenRouter) against its cap, plus the global total. |
+| POST | `/api/chat` | Streaming chat (SSE); stores both turns. Optional `provider` (`ollama`/`openrouter`/`anthropic`/`gemini`) and `context`; falls back to local Ollama. |
 | GET | `/api/conversations` | Your conversations, paginated. |
 | GET / DELETE | `/api/conversations/{id}` | One conversation with messages / delete it. |
 | POST | `/api/images/generate` | Queue an image job (202). |
@@ -169,6 +171,7 @@ Every variable is listed in [.env.example](.env.example).
 | `OLLAMA_CONNECT_TIMEOUT` / `OLLAMA_READ_TIMEOUT` | `5` / `300` | Connect timeout; longest silence between chunks. |
 | `OLLAMA_MODEL_CACHE_SECONDS` | `60` | `/api/tags` cache. |
 | `OPENROUTER_ENABLED`, `OPENROUTER_API_KEY`, `OPENROUTER_DEFAULT_MODEL`, `OPENROUTER_ALLOWED_MODELS`, `OPENROUTER_DAILY_LIMIT_USD`, `OPENROUTER_TIMEOUT_SECONDS`, `OPENROUTER_BASE_URL`, `AI_RESEARCH_EXTERNAL_ALLOWED` | `false`, empty, empty, empty, `0`, `60`, `https://openrouter.ai/api/v1`, `false` | Opt-in OpenRouter chat with a filter, a daily USD cap and local fallback ([docs/25](docs/25-openrouter.md)). |
+| `ANTHROPIC_*`, `GEMINI_*` (`ENABLED`, `API_KEY`, `BASE_URL`, `DEFAULT_MODEL`, `ALLOWED_MODELS`, `DAILY_LIMIT_USD`, `MODEL_PRICES`, `TIMEOUT_SECONDS`), `AI_DEFAULT_EXTERNAL_PROVIDER`, `AI_EXTERNAL_DAILY_LIMIT_USD`, `AI_EXTERNAL_MAX_OUTPUT_TOKENS`, `AI_EXTERNAL_MAX_RETRIES`, `AI_EXTERNAL_REQUESTS_PER_MINUTE` | off / empty / `0` / `{}` / `openrouter` / unset / `4096` / `1` / `30` | Direct provider APIs and shared external limits ([docs/26](docs/26-ai-providers.md)). |
 | `CHAT_TIMEOUT_SECONDS` | `900` | Whole chat request, including queue time. |
 | `CHAT_HEARTBEAT_SECONDS` | `15` | SSE keep-alive interval. |
 | `CHAT_DEFAULT_NUM_CTX` / `CHAT_MAX_NUM_CTX` | `4096` / `8192` | Context window default / cap. |
