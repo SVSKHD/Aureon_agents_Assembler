@@ -27,7 +27,7 @@ path (docs/25-openrouter.md) and uses the same gate.
    - The model is the default or on the allowlist.
    - The data classification filter (`app/services/chat_filter.py`) passes on the full payload.
    - Today's spend is under the provider's daily cap (shared by chat and every agent), the local per-minute limit, and the global cap `AI_EXTERNAL_DAILY_LIMIT_USD` if set. Anthropic/Gemini models must also be priced.
-3. **External call**: if it takes longer than `MODEL_ROUTER_EXTERNAL_TIMEOUT_SECONDS` (10 s), errors, or is rate limited, the same request goes to local Ollama (never to another external provider). A `model_router_fallback` log line and a recorded row say why.
+3. **External call**: if it takes longer than `MODEL_ROUTER_EXTERNAL_TIMEOUT_SECONDS` (10 s), errors, or is rate limited, the same request goes to the next provider in `AI_EXTERNAL_FALLBACK_PROVIDERS`, and to local Ollama after the last one ([30](30-external-first-ai.md)). A `model_router_fallback` log line and a recorded row say why.
 4. **Local call**: the agent's local model, through a separate bounded queue: one generation running, `MODEL_ROUTER_LOCAL_QUEUE` (2) waiting. A full queue raises `LocalBusy`, and the caller degrades (the news agent uses its keyword rules). Market data, the Dhan feed and risk checks never call a model, so a busy Ollama can't block them.
 
 The `news` context lets the soft `trading` category (market words) leave the server, because

@@ -48,6 +48,7 @@ from app.services.chat import (
 from app.services.inference import (
     Decision,
     ExternalGate,
+    choose,
     external_clients,
     gate_for,
     local_fallback_model,
@@ -72,9 +73,13 @@ def _gates(request: Request, settings: Settings) -> dict[str, ExternalGate]:
 
 
 def _default_external(settings: Settings, gates: dict[str, ExternalGate]) -> ExternalGate | None:
-    """AI_DEFAULT_EXTERNAL_PROVIDER's gate when it is usable (no other provider is tried)."""
-    gate = gates.get(settings.AI_DEFAULT_EXTERNAL_PROVIDER)
-    return gate if gate is not None and gate.usable else None
+    """The first usable gate in the chain: AI_DEFAULT_EXTERNAL_PROVIDER, then
+    AI_EXTERNAL_FALLBACK_PROVIDERS (docs/30). None = local."""
+    for p in settings.external_chain(settings.AI_DEFAULT_EXTERNAL_PROVIDER):
+        gate = gates.get(p)
+        if gate is not None and gate.usable:
+            return gate
+    return None
 
 
 def _provider_status(settings: Settings, gate: ExternalGate) -> ProviderStatus:
@@ -286,9 +291,13 @@ def _target(
         return "ollama", body.model
     if conv is not None:
         return conv.provider, conv.model
-    default_gate = _default_external(settings, gates)
-    if default_gate is not None:
-        return default_gate.provider, default_gate.default_model
+    # A new conversation: the first *enabled* provider in the chain, usable or not. It is
+    # stored on the conversation, so once the provider is fixed (key, price, budget) later
+    # turns use it; meanwhile the gate's refusal moves on down the chain with its reason
+    # shown, instead of the conversation silently becoming local for good.
+    for name in settings.external_chain(settings.AI_DEFAULT_EXTERNAL_PROVIDER):
+        if name in gates and settings.external(name).enabled:
+            return name, gates[name].default_model
     return "ollama", ""
 
 
@@ -331,6 +340,9 @@ async def chat(
     gate = gates.get(provider)
     ollama = _ollama(request)
     paused = bool(request.app.state.agent_paused.get("ollama"))
+    first_provider, first_model = provider, model
+    route_reason: str | None = None
+    remaining: tuple[str, ...] = ()
 
     if gate is not None:
         if body.model and not gate.allowed(model):
@@ -347,7 +359,22 @@ async def chat(
         except OllamaUnavailable:
             installed = None
         fallback = None if paused else local_fallback_model(settings, installed)
-        decision = await gate.decide(model, prompt, context=context, max_tokens=body.max_tokens)
+        pick = await choose(
+            gates,
+            settings.external_chain(provider),
+            model,
+            prompt,
+            context=context,
+            max_tokens=body.max_tokens,
+        )
+        decision = pick.decision
+        if pick.gate is not None:
+            # Possibly a later provider in the chain; the first one's refusal is the reason.
+            gate, remaining = pick.gate, pick.remaining
+            first_provider, first_model = gate.provider, pick.model
+            route_reason = pick.skipped_reason
+        else:
+            route_reason = decision.reason
     else:
         try:
             installed = [m.name for m in await _models_synced(request, db)]
@@ -363,7 +390,6 @@ async def chat(
         fallback = model
         decision = Decision(False)
 
-    first_provider, first_model = provider, model
     if gate is not None and not decision.external:
         if not fallback:
             raise HTTPException(
@@ -410,8 +436,10 @@ async def chat(
                 requested_provider=provider,
                 requested_model=model,
                 fallback_model=fallback,
-                route_reason=decision.reason if gate is not None else None,
+                route_reason=route_reason,
                 filter_categories=tuple(decision.categories),
+                context=context,
+                alternates=remaining,
                 temperature=body.temperature,
                 max_tokens=body.max_tokens,
                 user_id=current.user.id,
@@ -427,6 +455,7 @@ async def chat(
             limiter=request.app.state.chat_limiter,
             external=gate.client if gate is not None else None,
             usage=getattr(request.app.state, "ai_usage", None),
+            gates=gates,
         )
     except BaseException:
         if ticket is not None:

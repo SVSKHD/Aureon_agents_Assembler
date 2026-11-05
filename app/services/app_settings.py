@@ -181,6 +181,12 @@ REGISTRY: dict[str, Spec] = {
             "Provider for new conversations and 'auto' agents: openrouter | anthropic | gemini",
         ),
         _s(
+            "AI_EXTERNAL_FALLBACK_PROVIDERS",
+            "ai",
+            "csv",
+            "External providers tried next, in order, before local (e.g. openrouter)",
+        ),
+        _s(
             "AI_EXTERNAL_DAILY_LIMIT_USD",
             "ai",
             "decimal",
@@ -762,16 +768,14 @@ async def _gemini(s: Settings, http: httpx.AsyncClient) -> TestOutcome:
 
 async def _ai(s: Settings, http: httpx.AsyncClient) -> TestOutcome:
     """The shared routing settings are coherent (no network call)."""
-    p = s.AI_DEFAULT_EXTERNAL_PROVIDER
-    reason = s.external_unusable_reason(p)
-    if reason:
-        return TestOutcome(False, f"default external provider {p} is not usable ({reason})")
+    chain = s.external_chain(s.AI_DEFAULT_EXTERNAL_PROVIDER)
+    states = [(p, s.external_unusable_reason(p)) for p in chain]
+    order = " -> ".join(f"{p} ({r or 'usable'})" for p, r in states) + " -> local"
     cap = s.AI_EXTERNAL_DAILY_LIMIT_USD
-    return TestOutcome(
-        True,
-        f"default external provider {p} is usable; global cap "
-        + (f"{cap} USD" if cap is not None else "not set"),
-    )
+    cap_text = f"global cap {cap} USD" if cap is not None else "global cap not set"
+    if all(r for _, r in states):
+        return TestOutcome(False, f"no external provider is usable: {order}")
+    return TestOutcome(True, f"order: {order}; {cap_text}")
 
 
 async def _dhan(s: Settings, http: httpx.AsyncClient) -> TestOutcome:

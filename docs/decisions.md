@@ -20,6 +20,17 @@ that changed. The other rules are unchanged.
     unless `AI_RESEARCH_EXTERNAL_ALLOWED=true`. The Claude review exception stands as before.
   - Implementation: [25-openrouter.md](25-openrouter.md), decisions D-25-*.
 
+## 30 — External-first AI
+
+- **D-30-1: a failed or refused external provider may move to another one** (supersedes the
+  docs/26 rule "local is the only fallback"), but only to providers the operator listed in
+  `AI_EXTERNAL_FALLBACK_PROVIDERS`, each through its own gate and cap. Empty list = the old
+  behaviour.
+- **D-30-2: the classification filter ends the walk.** Its verdict does not depend on the
+  provider, so data that must stay local is offered to no external provider.
+- **D-30-3: a new conversation keeps an enabled-but-unusable default provider** instead of
+  becoming local for good; the refusal reason is shown on each turn.
+
 ## 28 — Dhan operations
 
 - **D-28-1: verify with the Profile API, never with an order call.** `GET /profile` is the

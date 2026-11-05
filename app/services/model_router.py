@@ -10,9 +10,11 @@ Routing per call, in order:
    (app/services/inference.py): provider enabled + key + budget, model allowed (and priced for
    the direct APIs), the data classification filter (app/services/chat_filter.py) on the full
    payload, the provider's daily cap (shared with chat) and the global cap. No second filter
-   exists, and a failed external call never moves to another external provider.
+   exists. A refusal or a failure moves to the next provider in AI_EXTERNAL_FALLBACK_PROVIDERS
+   (docs/30); a local-only verdict goes to no external provider.
 2. External: bounded by MODEL_ROUTER_EXTERNAL_TIMEOUT_SECONDS (10 s). An error, a timeout or
-   the cap -> the same request goes to local Ollama, and the fallback is logged + recorded.
+   the cap on every provider in the chain -> the same request goes to local Ollama, and the
+   fallback is logged + recorded.
 3. Local: the agent's local model (default qwen2.5:3b) through a bounded queue
    (MODEL_ROUTER_LOCAL_QUEUE). Full -> LocalBusy, and the caller degrades (the news agent
    uses its keyword rules). Market data, the feed and risk checks never call this.
@@ -40,7 +42,7 @@ from app.core.config import Settings
 from app.core.logging import get_logger
 from app.models.model_calls import ModelCall
 from app.services.ai_usage import UsageTracker
-from app.services.inference import ExternalGate, external_clients
+from app.services.inference import ExternalGate, choose, external_clients
 
 log = get_logger("services.model_router")
 
@@ -173,27 +175,37 @@ class ModelRouter:
         if force_local or cfg.provider == "ollama":
             reason = "forced_local"
         else:
-            gate = ExternalGate(
-                self.settings, self.clients.get(provider), self.usage, provider=provider
-            )
-            decision = await gate.decide(
-                external_model, msgs, context=context, max_tokens=max_tokens
-            )
-            if decision.external:
+            # The chain (docs/30): the agent's provider, then AI_EXTERNAL_FALLBACK_PROVIDERS.
+            gates = {
+                p: ExternalGate(self.settings, self.clients.get(p), self.usage, provider=p)
+                for p in self.settings.external_chain(provider)
+            }
+            chain = list(gates)
+            reason = None
+            while chain:
+                pick = await choose(
+                    gates, chain, external_model, msgs, context=context, max_tokens=max_tokens
+                )
+                if pick.gate is None:
+                    if reason is None:
+                        reason, local_only = pick.decision.reason, pick.decision.local_only
+                    break
+                reason = reason or pick.skipped_reason
                 try:
                     return await self._external(
                         agent,
-                        external_model,
+                        pick.model,
                         msgs,
                         max_tokens,
                         temperature,
-                        provider=provider,
-                        reserved_micro=decision.reserved_micro,
+                        provider=pick.gate.provider,
+                        reserved_micro=pick.decision.reserved_micro,
                     )
                 except RouterError as exc:
-                    reason, fallback = exc.code, True
-            else:
-                reason, local_only = decision.reason, decision.local_only
+                    reason, fallback = reason or exc.code, True
+                chain = list(pick.remaining)
+                if chain:
+                    external_model = gates[chain[0]].default_model
         return await self._local(
             agent, cfg, msgs, max_tokens, temperature, reason=reason,
             fallback=fallback, local_only=local_only,

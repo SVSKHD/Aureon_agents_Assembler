@@ -643,6 +643,11 @@ class Settings(BaseSettings):
     # Shared by every external provider:
     # - the provider new conversations and "auto" agents use when it is usable;
     AI_DEFAULT_EXTERNAL_PROVIDER: Literal["openrouter", "anthropic", "gemini"] = "openrouter"
+    # - the external providers tried next, in order, when the first one refuses (not usable,
+    #   unpriced, capped, rate-limited) or fails; local Ollama only after all of them
+    #   (e.g. "openrouter"). Empty = no second external provider. The classification filter
+    #   is never bypassed: data that must stay local goes to no external provider at all.
+    AI_EXTERNAL_FALLBACK_PROVIDERS: Annotated[list[str], NoDecode] = Field(default_factory=list)
     # - a cap on today's total external spend across providers (unset = per-provider caps only);
     AI_EXTERNAL_DAILY_LIMIT_USD: Decimal | None = Field(default=None, ge=0, le=Decimal("10000"))
     # - output tokens asked for when the caller sets none (Anthropic requires a value); also
@@ -897,6 +902,7 @@ class Settings(BaseSettings):
         "OPENROUTER_ALLOWED_MODELS",
         "ANTHROPIC_ALLOWED_MODELS",
         "GEMINI_ALLOWED_MODELS",
+        "AI_EXTERNAL_FALLBACK_PROVIDERS",
         "CF_ACCESS_AUD",
         "CF_ACCESS_BYPASS_PATHS",
         mode="before",
@@ -906,6 +912,23 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             return [o.strip() for o in v.split(",") if o.strip()]
         return v
+
+    @field_validator("AI_EXTERNAL_FALLBACK_PROVIDERS")
+    @classmethod
+    def _fallback_providers(cls, v: list[str]) -> list[str]:
+        out: list[str] = []
+        for p in (x.strip().lower() for x in v):
+            if p not in _PROVIDER_PREFIX:
+                raise ValueError(f"unknown provider {p!r} (openrouter | anthropic | gemini)")
+            if p not in out:
+                out.append(p)
+        return out
+
+    def external_chain(self, first: str) -> list[str]:
+        """The external providers to try, in order: `first`, then the fallback list."""
+        chain = [first] if first in _PROVIDER_PREFIX else []
+        chain += [p for p in self.AI_EXTERNAL_FALLBACK_PROVIDERS if p not in chain]
+        return chain
 
     @field_validator("SECRET_KEY")
     @classmethod

@@ -1,10 +1,11 @@
 """AI Research Agent: explains a stored signal or backtest with the local Ollama model.
 
-Explanation only. It reads stored rows, sends them to the local Ollama, and writes
-trading.ai_analyses. OpenRouter (docs/25-openrouter.md) is tried first ONLY when
-AI_RESEARCH_EXTERNAL_ALLOWED=true and the gate allows the payload (the content filter still
-blocks broker data, positions, finance records, secrets and logs); any refusal or error
-falls back to Ollama. It has no code path to order intents, risk decisions or signals: its
+Explanation only. It reads stored rows, sends them to a model, and writes
+trading.ai_analyses. The external providers (AI_DEFAULT_EXTERNAL_PROVIDER, then
+AI_EXTERNAL_FALLBACK_PROVIDERS; docs/30) are tried first, in order, ONLY when
+AI_RESEARCH_EXTERNAL_ALLOWED=true and each gate allows the payload (the content filter still
+blocks broker data, positions, finance records, secrets and logs); local Ollama answers when
+every one refuses or fails. It has no code path to order intents, risk decisions or signals: its
 output can never create or approve anything. The numbers it explains are the deterministic
 ones already stored; the prompt tells the model not to invent figures.
 """
@@ -15,6 +16,7 @@ import asyncio
 import json
 import time
 import uuid
+from collections.abc import Mapping
 from typing import Any, Literal
 
 from redis.asyncio import Redis
@@ -22,7 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.ollama.client import OllamaClient
-from app.agents.openrouter.client import OpenRouterError
+from app.agents.providers.base import ProviderError
 from app.core.logging import get_logger
 from app.models.trading import (
     AiAnalysis,
@@ -33,7 +35,7 @@ from app.models.trading import (
     TradingSignal,
 )
 from app.services import audit
-from app.services.inference import ExternalGate
+from app.services.inference import Decision, ExternalGate
 
 log = get_logger(__name__)
 
@@ -108,7 +110,7 @@ async def explain(
     subject_id: uuid.UUID,
     *,
     limit_s: float,
-    external: ExternalGate | None = None,
+    external: Mapping[str, ExternalGate] | ExternalGate | None = None,
 ) -> uuid.UUID | None:
     async with maker() as db:
         ctx = await _context(db, kind, subject_id)
@@ -119,10 +121,14 @@ async def explain(
         {"role": "user", "content": json.dumps(ctx, default=str, indent=1)},
     ]
     content = None
-    if external is not None and external.settings.AI_RESEARCH_EXTERNAL_ALLOWED:
-        content = await _try_external(maker, external, messages, kind, subject_id, limit_s)
-        if content is not None:
-            model = f"openrouter:{external.settings.OPENROUTER_DEFAULT_MODEL.strip()}"
+    gates = _as_gates(external)
+    if gates:
+        settings = next(iter(gates.values())).settings
+        if settings.AI_RESEARCH_EXTERNAL_ALLOWED:
+            chain = settings.external_chain(settings.AI_DEFAULT_EXTERNAL_PROVIDER)
+            got = await _try_external(maker, gates, chain, messages, kind, subject_id, limit_s)
+            if got is not None:
+                content, model = got
     if content is None:
         content = await _local(ollama, model, messages, limit_s)
     if not content:
@@ -140,20 +146,62 @@ async def explain(
     return row.id
 
 
+def _as_gates(
+    external: Mapping[str, ExternalGate] | ExternalGate | None,
+) -> dict[str, ExternalGate]:
+    """One gate (the original OpenRouter-only form) or the gates by provider."""
+    if external is None:
+        return {}
+    if isinstance(external, ExternalGate):
+        return {external.provider: external}
+    return dict(external)
+
+
 async def _try_external(
     maker: async_sessionmaker[AsyncSession],
+    gates: Mapping[str, ExternalGate],
+    chain: list[str],
+    messages: list[dict[str, str]],
+    kind: Kind,
+    subject_id: uuid.UUID,
+    limit_s: float,
+) -> tuple[str, str] | None:
+    """(explanation, "provider:model") from the first provider in the chain that answers,
+    or None (refused or failed everywhere: use Ollama). docs/30."""
+    for provider in chain:
+        gate = gates.get(provider)
+        if gate is None:
+            continue
+        model = gate.default_model
+        decision = await gate.decide(model, messages, context="research")
+        if not decision.external or gate.client is None or gate.usage is None:
+            log.info(
+                "research_ai_skip",
+                provider=provider,
+                reason=decision.reason,
+                categories=decision.categories,
+            )
+            await gate.release(decision)
+            if decision.local_only:
+                return None
+            continue
+        text = await _call(maker, gate, model, decision, messages, kind, subject_id, limit_s)
+        if text is not None:
+            return text, f"{provider}:{model}"
+    return None
+
+
+async def _call(
+    maker: async_sessionmaker[AsyncSession],
     gate: ExternalGate,
+    model: str,
+    decision: Decision,
     messages: list[dict[str, str]],
     kind: Kind,
     subject_id: uuid.UUID,
     limit_s: float,
 ) -> str | None:
-    """The explanation from OpenRouter, or None (refused or failed: use Ollama)."""
-    model = gate.settings.OPENROUTER_DEFAULT_MODEL.strip()
-    decision = await gate.decide(model, messages, context="research")
-    if not decision.external or gate.client is None or gate.usage is None:
-        log.info("research_ai_local", reason=decision.reason, categories=decision.categories)
-        return None
+    assert gate.client is not None and gate.usage is not None
     parts: list[str] = []
     usage: dict[str, Any] = {}
     outcome = "ok"
@@ -165,7 +213,7 @@ async def _try_external(
                     usage = chunk.get("usage") or {}
                     break
                 parts.append(str(chunk.get("content") or ""))
-    except OpenRouterError as exc:
+    except ProviderError as exc:
         outcome = f"error:{exc.code}"
     except TimeoutError:
         outcome = "timeout"
@@ -175,6 +223,7 @@ async def _try_external(
         prompt_tokens=int(usage.get("prompt_tokens") or 0),
         completion_tokens=int(usage.get("completion_tokens") or 0),
         failed=outcome != "ok",
+        reserved_micro=decision.reserved_micro,
     )
     async with maker() as db, db.begin():  # metadata only, never the content
         audit.record(
@@ -182,7 +231,7 @@ async def _try_external(
             "ai.external_call",
             audit.ClientInfo(),
             details={
-                "provider": "openrouter",
+                "provider": gate.provider,
                 "model": model,
                 "purpose": f"research:{kind}",
                 "subject_id": str(subject_id),
