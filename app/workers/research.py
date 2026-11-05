@@ -260,22 +260,64 @@ class ResearchWorker:
                 lane.offer(json.loads(got[1]))
 
     async def tick_bars_loop(self, stop: asyncio.Event) -> None:
-        """Dhan feed ticks → 1m candles (only when the dhan-feed worker publishes)."""
+        """Dhan feed ticks → 1m candles (only when the dhan-feed worker publishes).
+
+        Never ends on its own (docs/28): a malformed packet is skipped and counted
+        (`tick_errors`), a Redis error re-subscribes with backoff (`tick_resubscribes`), and
+        a database error keeps the finished bars for the next attempt instead of losing them.
+        The counters are in the market-data lane's heartbeat details."""
         assert self.redis is not None
-        pubsub = self.redis.pubsub()
-        await pubsub.subscribe(TICK_CHANNEL)
+        md = self.lane(MARKET_DATA)
+        held: list[tuple[str, Any]] = []
+        backoff = 1.0
+
+        def bump(name: str) -> None:
+            md.extra[name] = int(md.extra.get(name, 0)) + 1
+
+        while not stop.is_set():
+            pubsub = None
+            try:
+                pubsub = self.redis.pubsub()
+                await pubsub.subscribe(TICK_CHANNEL)
+                backoff = 1.0
+                while not stop.is_set():
+                    msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=5)
+                    if held:
+                        held = await self._store_bars(held)
+                    if not msg or md.paused:
+                        continue
+                    try:
+                        packet = json.loads(msg["data"])
+                        bars = self.ticks.add(packet) if isinstance(packet, dict) else []
+                    except (ValueError, TypeError, ArithmeticError):
+                        bump("tick_errors")
+                        continue
+                    if bars:
+                        held = await self._store_bars(held + bars)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # Redis gone: resubscribe with backoff
+                bump("tick_resubscribes")
+                log.warning("tick_bars_resubscribe", error=type(exc).__name__)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stop.wait(), backoff)
+                backoff = min(30.0, backoff * 2)
+            finally:
+                if pubsub is not None:
+                    with contextlib.suppress(Exception):
+                        await pubsub.aclose()  # type: ignore[no-untyped-call]
+
+    async def _store_bars(self, bars: list[tuple[str, Any]]) -> list[tuple[str, Any]]:
+        """Store finished bars; on a DB error keep them (bounded) for the next attempt."""
+        md = self.lane(MARKET_DATA)
         try:
-            while not stop.is_set():
-                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=5)
-                if not msg or self.lane(MARKET_DATA).paused:
-                    continue
-                bars = self.ticks.add(json.loads(msg["data"]))
-                if bars:
-                    n = await research.store_tick_bars(self.maker, bars)
-                    md = self.lane(MARKET_DATA)
-                    md.extra["tick_bars"] = int(md.extra.get("tick_bars", 0)) + n
-        finally:
-            await pubsub.aclose()  # type: ignore[no-untyped-call]
+            n = await research.store_tick_bars(self.maker, bars)
+        except Exception as exc:
+            md.extra["tick_store_errors"] = int(md.extra.get("tick_store_errors", 0)) + 1
+            log.warning("tick_bars_store_failed", error=type(exc).__name__, held=len(bars))
+            return bars[-5000:]
+        md.extra["tick_bars"] = int(md.extra.get("tick_bars", 0)) + n
+        return []
 
     def handlers(self) -> dict[str, Callable[[Any], Awaitable[None]]]:
         return {

@@ -20,5 +20,9 @@ async def integrations(request: Request, _: AdminRequired) -> dict[str, Any]:
     Ollama models, Discord, the DB role and backups. Read-only; admin only."""
     s = request.app.state
     return await IntegrationsSummary(
-        s.settings, s.sessionmaker, s.ollama, getattr(s, "claude_cli", None)
+        s.settings,
+        s.sessionmaker,
+        s.ollama,
+        getattr(s, "claude_cli", None),
+        redis=getattr(s, "redis", None),
     ).collect()

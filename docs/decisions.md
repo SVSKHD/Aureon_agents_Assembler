@@ -20,6 +20,32 @@ that changed. The other rules are unchanged.
     unless `AI_RESEARCH_EXTERNAL_ALLOWED=true`. The Claude review exception stands as before.
   - Implementation: [25-openrouter.md](25-openrouter.md), decisions D-25-*.
 
+## 28 — Dhan operations
+
+- **D-28-1: verify with the Profile API, never with an order call.** `GET /profile` is the
+  documented, read-only way to learn whose token it is and until when.
+- **D-28-2: an outage is not a verdict.** `unavailable` keeps the stored status; a login
+  during a Dhan outage is stored `unverified` (the tokenId is single-use) and checked later.
+  A token Dhan refuses, or one for another client id, is never stored.
+- **D-28-3: no automatic renewal.** RenewToken applies only to Dhan-Web tokens and its
+  response is undocumented; the API-key flow needs the user's consent + OTP. Credential
+  incidents have no recovery plan and escalate to a person at once.
+- **D-28-4: the worker stays up when unconfigured.** It reports `waiting_config` instead of
+  exiting (docker would restart it forever). Crash loops are bounded by a start counter in
+  Redis and an exponential startup delay.
+- **D-28-5: hold the newest tick, not every tick, during a Redis outage.** The hash is a
+  latest-value store and candles ignore late packets, so replaying a backlog would only
+  waste memory.
+- **D-28-6: one leader.** A Redis lock with a 30 s TTL keeps two workers (deploy overlap,
+  manual run) from opening two sockets (Dhan 805) and publishing duplicate ticks.
+- **D-28-7: one recovery action, market data only.** `reconnect_dhan_feed` with a cooldown
+  shared by admins and automation; the existing bounded attempts / escalation apply. The
+  feed agent itself is still never restarted by recovery.
+- **D-28-8: market-closed is its own status.** It is never `ok`; holidays come from
+  `DHAN_MARKET_HOLIDAYS` (no calendar service added).
+- **D-28-9: no executor for live kinds.** `FORBIDDEN_KIND_PREFIXES` in the approval registry;
+  Phase G must change it in a reviewed commit (docs/29).
+
 ## 26 — Direct AI providers
 
 Decisions D-26-1 to D-26-6 are recorded in [26-ai-providers.md](26-ai-providers.md#decisions):

@@ -286,9 +286,16 @@ class TickAggregator:
     def add(self, packet: dict[str, Any]) -> list[tuple[str, Any]]:
         if packet.get("ltp") in (None, "") or not packet.get("ltt"):
             return []
+        if not packet.get("segment") or not str(packet.get("security_id") or "").isdigit():
+            return []  # not an instrument we can key a candle on
         key = f"{packet.get('segment')}:{packet.get('security_id')}"
-        price = Decimal(str(packet["ltp"]))
-        ts = datetime.fromisoformat(str(packet["ltt"])).astimezone(UTC)
+        try:
+            price = Decimal(str(packet["ltp"]))
+            ts = datetime.fromisoformat(str(packet["ltt"])).astimezone(UTC)
+        except (ValueError, ArithmeticError):
+            return []
+        if not price.is_finite() or price <= 0:
+            return []
         minute = ts.replace(second=0, microsecond=0)
         vol = Decimal(0)
         if packet.get("volume") not in (None, ""):

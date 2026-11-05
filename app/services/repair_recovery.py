@@ -11,6 +11,11 @@ An allowlist of in-code actions; nothing here runs a shell or a command line:
 - `restart_container`: only when the docker-proxy allows POST restart
   (INCIDENT_DOCKER_PROXY_ALLOWS_RESTART) and the container is in INCIDENT_RESTART_CONTAINERS;
   the shipped proxy is read-only, so this records `manual`.
+- `reconnect_dhan_feed`: MARKET DATA ONLY. Asks the dhan-feed worker to re-open its WebSocket
+  (app/services/dhan_feed_control.py, shared cooldown). Used only for the Dhan monitor's
+  recoverable feed checks (app/services/dhan_monitor.py RECOVERABLE). It cannot touch an
+  account, order, execution mode, risk policy or credential; trading agents are still never
+  restarted (NEVER_RESTART_*), and a credential problem is never "recovered" here.
 
 Every attempt is audited (`incident_recovery_attempt`), idempotent, and limited to
 INCIDENT_MAX_RECOVERY_ATTEMPTS per incident, at least INCIDENT_RECOVERY_COOLDOWN_SECONDS
@@ -37,7 +42,7 @@ from app.core.logging import get_logger
 from app.integrations.github.client import GitHubClient, GitHubError
 from app.models.agents import Agent
 from app.models.repairs import Incident
-from app.services import audit, repairs
+from app.services import audit, dhan_feed_control, dhan_monitor, repairs
 from app.services import github as gh
 from app.services import github_actions as actions
 from app.services import github_ops as ops
@@ -168,20 +173,45 @@ async def restart_container(deps: Deps, inc: Incident) -> Result:
     return Result(name, "failed", f"docker-proxy answered {resp.status_code}")
 
 
+async def reconnect_dhan_feed(deps: Deps, inc: Incident) -> Result:
+    name = "reconnect_dhan_feed"
+    try:
+        res = await dhan_feed_control.request_reconnect(
+            deps.redis, deps.settings, f"recovery:{inc.id}"
+        )
+    except dhan_feed_control.ControlUnavailable as exc:
+        return Result(name, "failed", f"feed control unavailable: {exc}")
+    if not res.accepted:
+        return Result(name, "skipped", f"reconnect cooldown ({res.retry_after_s}s left)")
+    if res.receivers == 0:
+        return Result(name, "failed", "no dhan-feed worker is listening")
+    return Result(name, "done", "asked the dhan-feed worker to reconnect")
+
+
 ACTIONS: dict[str, ActionFn] = {
     "restart_agent": restart_agent,
     "clear_queue_lock": clear_queue_lock,
     "rerun_actions": rerun_actions,
     "restart_container": restart_container,
+    "reconnect_dhan_feed": reconnect_dhan_feed,
 }
 PLANS: dict[str, tuple[str, ...]] = {
     "heartbeat": ("restart_agent", "clear_queue_lock"),
     "actions": ("rerun_actions",),
     "docker": ("restart_container",),
 }
+# Market-data recovery, kept apart from everything else: the only actions a Dhan incident may
+# ever run. Nothing in this set can reach trading (tests/test_dhan_operations.py pins it).
+MARKET_DATA_ACTIONS = frozenset({"reconnect_dhan_feed"})
+DHAN_PLANS: dict[str, tuple[str, ...]] = {
+    f"feed_{code}": ("reconnect_dhan_feed",) for code in dhan_monitor.RECOVERABLE
+}
 
 
 def plan(inc: Incident) -> tuple[str, ...]:
+    if inc.source == dhan_monitor.SOURCE:
+        names = DHAN_PLANS.get(str((inc.details or {}).get("check") or ""), ())
+        return tuple(n for n in names if n in MARKET_DATA_ACTIONS)
     return PLANS.get(inc.source, ())
 
 

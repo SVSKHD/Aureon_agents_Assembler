@@ -42,7 +42,7 @@ UI_MODULE = ui_module("repairs", label="Repairs", group="dev", icon="wrench", or
 router = APIRouter(prefix="/v1/repairs", tags=["repairs"])
 
 IncidentStatus = Literal["open", "recovering", "repair_queued", "resolved", "ignored"]
-Source = Literal["exception", "heartbeat", "docker", "actions", "db", "api"]
+Source = Literal["exception", "heartbeat", "docker", "actions", "db", "api", "dhan"]
 RepairStatus = Literal[
     "queued",
     "running",

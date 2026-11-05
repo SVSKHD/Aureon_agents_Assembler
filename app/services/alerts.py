@@ -101,6 +101,8 @@ async def collect(
         ).all()
     # Most severe first, so the per-run cap keeps what matters.
     for inc in sorted(incidents, key=lambda i: -_RANK.get(i.severity, 0)):
+        if _covered_by_session_alert(inc):
+            continue
         alerts.append(
             Alert(
                 "incident",
@@ -162,6 +164,13 @@ async def collect(
             )
         )
     return alerts, info
+
+
+def _covered_by_session_alert(inc: Incident) -> bool:
+    """The Dhan monitor's "credential expired" incident says what the dhan_session alert
+    below already says; one Discord message is enough."""
+    d = inc.details or {}
+    return inc.source == "dhan" and d.get("check") == "auth" and d.get("status") == "expired"
 
 
 def _dhan_session_alert(settings: Settings, now: datetime) -> Alert | None:

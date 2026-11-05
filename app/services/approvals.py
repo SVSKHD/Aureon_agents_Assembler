@@ -114,11 +114,39 @@ class ExecutorSpec:
     policy_subject: SubjectFn | None = None
 
 
+# Approval kinds that would act on real money. No executor may be registered for them, so no
+# approval (human or not) can turn into a LIVE order, a risk-limit or execution-mode change.
+# Paper intents ("trading.paper_intent") are simulated and stay allowed. Trading Phase G must
+# change this list on purpose, in a reviewed commit (docs/29-trading-safety.md).
+FORBIDDEN_KIND_PREFIXES = (
+    "trading.live",
+    "trading.order",
+    "trading.mode",
+    "trading.risk",
+    "broker.",
+    "dhan.",
+    "mt5.order",
+)
+
+
+class ForbiddenApprovalKind(ValueError):
+    """An executor for a live-trading kind: refused until Trading Phase G."""
+
+
+def assert_kind_allowed(kind: str) -> None:
+    k = kind.strip().lower()
+    if any(k.startswith(p) for p in FORBIDDEN_KIND_PREFIXES):
+        raise ForbiddenApprovalKind(
+            f"approval kind {kind!r} would act on live trading; refused (docs/29)"
+        )
+
+
 @dataclass(slots=True)
 class ExecutorRegistry:
     _specs: dict[str, ExecutorSpec] = field(default_factory=dict)
 
     def register(self, spec: ExecutorSpec) -> None:
+        assert_kind_allowed(spec.kind)
         self._specs[spec.kind] = spec
 
     def get(self, kind: str) -> ExecutorSpec | None:

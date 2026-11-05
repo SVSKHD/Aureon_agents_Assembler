@@ -60,20 +60,61 @@ def _reset_process_settings() -> Any:
 
 
 class FakeDhan:
-    """The two Dhan auth endpoints; records what was sent."""
+    """The two Dhan auth endpoints and the Profile API; records what was sent.
+
+    `profile_status` / `profile_client` shape GET /v2/profile (the verification every new
+    session token goes through): 200 for the configured client by default."""
 
     def __init__(
-        self, client_id: str = CLIENT, expiry: str | None = None, secret: str = API_SECRET
+        self,
+        client_id: str = CLIENT,
+        expiry: str | None = None,
+        secret: str = API_SECRET,
+        *,
+        profile_status: int = 200,
+        profile_client: str | None = None,
+        valid_tokens: tuple[str, ...] = (ACCESS, MANUAL),
     ) -> None:
         self.calls: list[httpx.Request] = []
         self.client_id = client_id
         self.secret = secret
+        self.profile_status = profile_status
+        self.profile_client = profile_client or client_id
+        self.valid_tokens = set(valid_tokens)
         # Dhan answers in IST without an offset.
         ist = datetime.now(UTC) + timedelta(hours=5, minutes=30) + timedelta(hours=24)
         self.expiry = expiry or ist.strftime("%Y-%m-%dT%H:%M:%S")
 
+    def profile(self, req: httpx.Request) -> httpx.Response:
+        if self.profile_status >= 500:
+            return httpx.Response(self.profile_status, json={"errorCode": "DH-908"})
+        if self.profile_status != 200 or req.headers.get("access-token") not in self.valid_tokens:
+            return httpx.Response(
+                401,
+                json={
+                    "errorType": "Invalid_Authentication",
+                    "errorCode": "DH-901",
+                    "errorMessage": "Client ID or user generated access token is invalid",
+                },
+            )
+        validity = datetime.now(UTC) + timedelta(hours=5, minutes=30) + timedelta(hours=23)
+        return httpx.Response(
+            200,
+            json={
+                "dhanClientId": self.profile_client,
+                "tokenValidity": validity.strftime("%d/%m/%Y %H:%M"),
+                "activeSegment": "Equity, Derivative",
+                "ddpi": "Active",
+                "mtf": "Deactive",
+                "dataPlan": "Active",
+                "dataValidity": "2026-12-05 09:37:52.0",
+            },
+        )
+
     def __call__(self, req: httpx.Request) -> httpx.Response:
         self.calls.append(req)
+        if req.url.path.endswith("/profile") and req.method == "GET":
+            return self.profile(req)
         if req.headers.get("app_id") != API_KEY or req.headers.get("app_secret") != self.secret:
             # Echoes what it got, as a careless upstream might: must never reach the caller.
             sent = req.headers.get("app_secret", "")

@@ -42,6 +42,9 @@ ADMIN = {
     ("POST", "/api/v1/dhan/auth/start"),
     ("POST", "/api/v1/dhan/auth/consume"),
     ("DELETE", "/api/v1/dhan/auth/session"),
+    ("POST", "/api/v1/dhan/auth/verify"),
+    # Market-data recovery: admin (not a trading permission), cooldown + audit (docs/28).
+    ("POST", "/api/v1/dhan/feed/reconnect"),
     ("GET", "/api/v1/settings"),
     ("PUT", "/api/v1/settings/{key}"),
     ("DELETE", "/api/v1/settings/{key}"),

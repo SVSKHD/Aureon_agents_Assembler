@@ -38,27 +38,28 @@ names the check that would prove it. The feed's health is separate from the API'
   - LIVE cannot load without `PHASE_G_APPROVED=yes`.
 - The client's docstring was stale about where the token comes from; corrected.
 
-## Open findings (not changed here; each needs its own reviewed fix)
+## Open findings
 
-Inferred from the code, not reproduced live:
+Inferred from the code, not reproduced live. Findings 1–5 and 7 were fixed afterwards in
+[28-dhan-operations.md](28-dhan-operations.md) (marked **fixed** below); 6 and 8 remain open.
 
-1. **The feed's Redis writer can die silently** (`workers/dhan_feed.py`, the drain task). If
+1. **(fixed in 28)** **The feed's Redis writer can die silently** (`workers/dhan_feed.py`, the drain task). If
    one Redis error ends it, the socket and heartbeat keep going while the queue fills and
    drops ticks, and the health card stays green.
-2. **Crash loop when unconfigured.** The worker exits 1 without Dhan credentials or
+2. **(fixed in 28)** **Crash loop when unconfigured.** The worker exits 1 without Dhan credentials or
    `DHAN_FEED_INSTRUMENTS`, and `restart: unless-stopped` restarts it forever.
-3. **The feed token is read once.** After the login session expires, the feed doesn't switch
+3. **(fixed in 28)** **The feed token is read once.** After the login session expires, the feed doesn't switch
    to a valid manual `DHAN_ACCESS_TOKEN`. It stops until the next settings change.
-4. **An expired manual token keeps jobs alive.** `Settings.dhan_access_token()` returns an
+4. **(fixed in 28)** **An expired manual token keeps jobs alive.** `Settings.dhan_access_token()` returns an
    expired manual token (it never checks `exp`), so jobs keep running and failing every
    5 minutes with `CredentialsExpired`.
-5. **The integrations card is blind to a missing feed.** If the `dhan-feed` agent was never
+5. **(fixed in 28)** **The integrations card is blind to a missing feed.** If the `dhan-feed` agent was never
    registered (profile off), it reports no problem, and stale instruments are not counted as
    a problem.
 6. **Order modifications are missed.** Reconciliation skips an order whose price or quantity
    changed while its status and filled quantity did not, so `broker_orders` keeps the old
    values.
-7. **Rate-limit and Redis errors become 500s.** `RateLimitExceeded` and Redis errors in
+7. **(fixed in 28)** **Rate-limit and Redis errors become 500s.** `RateLimitExceeded` and Redis errors in
    `call_adapter` are not mapped to a clean API error.
 8. **Data gaps.** Holdings, quotes and option chains are never persisted, and ticks live only
    in Redis.

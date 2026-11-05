@@ -13,10 +13,12 @@ from typing import Any
 
 from fastapi import HTTPException, status
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.trading.base import BrokerAdapter, BrokerError, NotSupported
+from app.agents.trading.base import BrokerAdapter, BrokerError, CredentialsExpired, NotSupported
+from app.agents.trading.ratelimit import RateLimitExceeded
 from app.agents.trading.types import ExecutionMode
 from app.auth.deps import CurrentSession
 from app.core.config import Settings
@@ -174,6 +176,27 @@ async def call_adapter[T](awaitable: Awaitable[T], settings: Settings) -> T:
     except TimeoutError as exc:
         raise HTTPException(
             status.HTTP_504_GATEWAY_TIMEOUT, detail={"code": "broker_timeout"}
+        ) from exc
+    except CredentialsExpired as exc:
+        # The broker refused our credential: a person has to log in again. Not a 401 (that
+        # would read as "your Aureon session ended" to the SPA).
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "broker_credentials_invalid",
+                "detail": "the broker no longer accepts the stored credential; log in again",
+            },
+        ) from exc
+    except RateLimitExceeded as exc:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"code": "broker_rate_limited", "detail": "broker rate limit; try again"},
+            headers={"Retry-After": str(max(1, int(exc.wait_s + 0.999)))},
+        ) from exc
+    except RedisError as exc:  # the shared rate limiter needs Redis: fail closed, cleanly
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "unavailable", "detail": "rate limiter unavailable"},
         ) from exc
     except BrokerError as exc:
         raise HTTPException(

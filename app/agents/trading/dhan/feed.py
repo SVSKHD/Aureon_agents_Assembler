@@ -26,12 +26,18 @@ Connection rules (docs): at most 5000 instruments per connection and 100 per sub
 message. The server pings every 10 s; the websockets library answers the pings.
 
 **Security:** the URL carries the access token, so it is never logged.
+
+**Tokens** are read at every connect (a callable is accepted), so an expired login falls back
+to a valid manual token without a restart, and a replaced token is picked up on the next
+reconnect. Only a short sha256 prefix of the token in use is kept (`stats.token_fp`) so the
+worker can tell "the token that failed" from "a new token".
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import random
 import struct
@@ -228,9 +234,24 @@ class FeedStats:
     auth_failed: bool = False
     last_error: str | None = None
     started_at: float = field(default_factory=time.time)
+    # Connection attempts that ended without data since the last healthy connection.
+    consecutive_failures: int = 0
+    last_connected_at: float | None = None
+    # Instruments subscribed on the CURRENT connection (0 while disconnected).
+    subscribed: int = 0
+    # sha256 prefix of the token used for the current/last connection, and of the one Dhan
+    # refused (never the token itself).
+    token_fp: str | None = None
+    failed_token_fp: str | None = None
+    reconnects_requested: int = 0
 
 
 Connector = Callable[[str], Awaitable[Any]]
+TokenSource = str | Callable[[], str | None]
+
+
+def token_fp(token: str | None) -> str | None:
+    return hashlib.sha256(token.encode()).hexdigest()[:12] if token else None
 
 
 class DhanFeed:
@@ -246,32 +267,58 @@ class DhanFeed:
         *,
         url: str,
         client_id: str,
-        access_token: str,
+        access_token: TokenSource,
         instruments: list[tuple[str, str]],
         mode: Mode,
         queue_max: int,
         max_backoff: float,
         connector: Connector | None = None,
     ) -> None:
-        self._url = f"{url.rstrip('/')}?" + urlencode(
-            {"version": 2, "token": access_token, "clientId": client_id, "authType": 2}
-        )
+        self._base = url.rstrip("/")
+        self._client_id = client_id
+        self._token = access_token
         self.instruments = instruments
         self.mode = mode
         self.queue: asyncio.Queue[FeedPacket] = asyncio.Queue(maxsize=queue_max)
         self.max_backoff = max_backoff
         self.stats = FeedStats()
         self._connector = connector
+        self._reconnect = asyncio.Event()
+
+    def _current_token(self) -> str | None:
+        return self._token() if callable(self._token) else self._token
+
+    def _url(self, token: str) -> str:
+        return f"{self._base}?" + urlencode(
+            {"version": 2, "token": token, "clientId": self._client_id, "authType": 2}
+        )
+
+    def request_reconnect(self) -> None:
+        """Drop the current connection and reconnect now (re-reading the token)."""
+        self.stats.reconnects_requested += 1
+        self._reconnect.set()
+
+    def token_changed(self) -> bool:
+        """After an auth failure: is there now a different token than the one Dhan refused?"""
+        fp = token_fp(self._current_token())
+        return fp is not None and fp != self.stats.failed_token_fp
+
+    def reset_auth(self) -> None:
+        """Allow `run` again after an auth failure (only once the token has changed)."""
+        self.stats.auth_failed = False
+        self.stats.last_disconnect_reason = None
+        self.stats.consecutive_failures = 0
 
     def __repr__(self) -> str:
         return f"DhanFeed(instruments={len(self.instruments)}, mode={self.mode})"
 
-    async def _connect(self) -> Any:
+    async def _connect(self, token: str) -> Any:
+        url = self._url(token)
         if self._connector is not None:
-            return await self._connector(self._url)
+            return await self._connector(url)
         from websockets.asyncio.client import connect
 
-        return await connect(self._url, ping_interval=None, max_size=2**20, open_timeout=15)
+        return await connect(url, ping_interval=None, max_size=2**20, open_timeout=15)
 
     def _enqueue(self, p: FeedPacket) -> None:
         if self.queue.full():  # bounded: keep the newest data, count what we dropped
@@ -283,23 +330,45 @@ class DhanFeed:
     async def run(self, stopping: asyncio.Event) -> None:
         backoff = 1.0
         while not stopping.is_set() and not self.stats.auth_failed:
+            token = self._current_token()
+            if not token:
+                # No usable token at all: same as an auth failure (nothing to retry with).
+                self.stats.auth_failed = True
+                self.stats.last_error = "no_token"
+                self.stats.failed_token_fp = None
+                log.error("dhan_feed_no_token")
+                break
+            self.stats.token_fp = token_fp(token)
+            self._reconnect.clear()
             ws = None
+            got_data = False
+            requested = False
             try:
-                ws = await self._connect()
+                ws = await self._connect(token)
                 self.stats.connected = True
                 self.stats.connects += 1
+                self.stats.last_connected_at = time.time()
                 for msg in subscribe_messages(self.instruments, self.mode):
                     await ws.send(msg)
+                # One subscription set per connection: a reconnect is a new socket, so
+                # re-subscribing can never double-subscribe.
+                self.stats.subscribed = len(self.instruments)
                 log.info("dhan_feed_connected", instruments=len(self.instruments), mode=self.mode)
-                got_data = False
                 while not stopping.is_set():
                     recv = asyncio.ensure_future(ws.recv())
                     stop = asyncio.ensure_future(stopping.wait())
-                    done, _ = await asyncio.wait({recv, stop}, return_when=asyncio.FIRST_COMPLETED)
-                    if stop in done:
+                    again = asyncio.ensure_future(self._reconnect.wait())
+                    done, _ = await asyncio.wait(
+                        {recv, stop, again}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if stop in done or again in done:
                         recv.cancel()
+                        stop.cancel()
+                        again.cancel()
+                        requested = again in done and not stopping.is_set()
                         break
                     stop.cancel()
+                    again.cancel()
                     frame = recv.result()
                     if isinstance(frame, str):
                         continue  # server only sends binary; ignore stray text
@@ -314,6 +383,7 @@ class DhanFeed:
                         self._enqueue(p)
                     if packets and not got_data:
                         got_data, backoff = True, 1.0  # healthy again
+                        self.stats.consecutive_failures = 0
             except _ServerClosed:
                 pass
             except asyncio.CancelledError:
@@ -323,14 +393,23 @@ class DhanFeed:
                 log.warning("dhan_feed_dropped", error=type(exc).__name__)
             finally:
                 self.stats.connected = False
+                self.stats.subscribed = 0
                 if ws is not None:
                     with contextlib.suppress(Exception):
-                        if stopping.is_set():
+                        if stopping.is_set() or requested:
                             await ws.send(json.dumps({"RequestCode": DISCONNECT_REQUEST}))
                         await ws.close()
             if stopping.is_set() or self.stats.auth_failed:
                 break
             self.stats.reconnects += 1
+            if requested:
+                # An explicit reconnect (admin or bounded recovery): no backoff growth.
+                self.stats.last_error = "reconnect_requested"
+                log.info("dhan_feed_reconnect_requested")
+                backoff = 1.0
+                continue
+            if not got_data:
+                self.stats.consecutive_failures += 1
             wait = min(self.max_backoff, backoff) * random.uniform(0.8, 1.2)  # noqa: S311
             if self.stats.last_disconnect_reason == TOO_MANY:
                 wait = self.max_backoff  # another session took our slot; back off hard
@@ -343,6 +422,7 @@ class DhanFeed:
         self.stats.last_disconnect_reason = reason
         if reason in AUTH_REASONS:
             self.stats.auth_failed = True
+            self.stats.failed_token_fp = self.stats.token_fp
             log.error("dhan_feed_auth_failed", reason=reason)
         else:
             log.warning("dhan_feed_server_disconnect", reason=reason)
