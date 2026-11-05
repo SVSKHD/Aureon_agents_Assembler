@@ -4,8 +4,9 @@ Streaming design
 ----------------
 A *producer* task talks to the model (inside the request timeout) and puts events on a queue.
 With an external route (OpenRouter, Anthropic or Gemini; docs/25, docs/26) it tries that
-provider first and, on any error, falls back to local Ollama in the same stream (a
-`fallback` event says so). It never moves to another external provider.
+provider first; on an error it tries the next provider in AI_EXTERNAL_FALLBACK_PROVIDERS
+whose gate says yes (docs/30), and then local Ollama, all in the same stream (a `fallback`
+event names each switch).
 The SSE generator (*consumer*) reads that queue, sending a keep-alive comment whenever it
 has been quiet for CHAT_HEARTBEAT_SECONDS. A long CPU model load therefore never looks idle
 to Nginx or Cloudflare, and a disconnected client is noticed within one heartbeat.
@@ -22,7 +23,7 @@ import contextlib
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -47,7 +48,7 @@ from app.core.logging import get_logger
 from app.models.ai import Conversation, Message, ModelInventory
 from app.services import audit
 from app.services.ai_usage import UsageTracker
-from app.services.inference import LOCAL_ONLY_REASONS
+from app.services.inference import LOCAL_ONLY_REASONS, ExternalGate
 
 log = get_logger(__name__)
 
@@ -280,6 +281,10 @@ class ChatJob:
     client: audit.ClientInfo = field(default_factory=audit.ClientInfo)
     # Budget the gate reserved for the external call (released when it is recorded).
     reserved_micro: int = 0
+    # The conversation's classification context (asked again of each next provider's gate).
+    context: str = "general"
+    # External providers still to try, in order, if the first one fails (docs/30).
+    alternates: tuple[str, ...] = ()
 
 
 class ChatStream:
@@ -297,6 +302,7 @@ class ChatStream:
         openrouter: OpenRouterClient | None = None,
         usage: UsageTracker | None = None,
         external: ExternalChatClient | None = None,
+        gates: Mapping[str, ExternalGate] | None = None,
     ) -> None:
         self.registry = registry
         self.job = job
@@ -315,6 +321,11 @@ class ChatStream:
             if usage is not None and job.provider in EXTERNAL_PROVIDERS
             else usage
         )
+        # The current attempt's reservation, and the providers left to try (docs/30).
+        self.reserved_micro = job.reserved_micro
+        self.gates: Mapping[str, ExternalGate] = gates or {}
+        self.alternates: list[str] = list(job.alternates)
+        self.attempts: list[_External] = []
         self.timeout = timeout
         self.heartbeat = heartbeat
         self.turn = _Turn(provider=job.provider, model=job.model, fallback_reason=job.route_reason)
@@ -337,6 +348,10 @@ class ChatStream:
                     if await self._produce_external():
                         turn.status = "complete"
                         return
+                    while await self._next_external():
+                        if await self._produce_external():
+                            turn.status = "complete"
+                            return
                     if not self.job.fallback_model:
                         label = PROVIDER_LABELS.get(self.job.provider, self.job.provider)
                         turn.status, turn.error_code = "error", "fallback_unavailable"
@@ -396,6 +411,7 @@ class ChatStream:
         with turn.fallback_reason set and the partial text dropped (the SPA resets it)."""
         q, turn = self._queue, self.turn
         ext = self.external = _External(turn.model, time.monotonic(), turn.provider)
+        self.attempts.append(ext)
         client = self.external_client
         if client is None:
             turn.fallback_reason = ext.outcome = "not_configured"
@@ -437,6 +453,48 @@ class ChatStream:
     # The original name (tests and callers from before docs/26).
     _produce_openrouter = _produce_external
 
+    async def _next_external(self) -> bool:
+        """Switch to the next provider in the chain whose gate says yes (docs/30).
+
+        False when none is left: the caller falls back to local. Each gate is asked again
+        (its filter, caps and reservation); a local-only verdict ends the walk."""
+        q, turn = self._queue, self.turn
+        while self.alternates:
+            provider = self.alternates.pop(0)
+            gate = self.gates.get(provider)
+            if gate is None or gate.client is None:
+                continue
+            model = gate.default_model
+            decision = await gate.decide(
+                model, self.job.prompt, context=self.job.context, max_tokens=self.job.max_tokens
+            )
+            if not decision.external:
+                if decision.local_only:
+                    self.alternates.clear()
+                    return False
+                continue
+            failed = turn.provider
+            turn.provider, turn.model = provider, model
+            self.external_client = self.openrouter = gate.client
+            self.usage = gate.usage
+            self.reserved_micro = decision.reserved_micro
+            await q.put(
+                (
+                    "fallback",
+                    {
+                        "provider": provider,
+                        "model": model,
+                        "reason": turn.fallback_reason,
+                        "from_provider": failed,
+                        "local_only": False,
+                        "reset": True,
+                    },
+                )
+            )
+            log.info("external_next_provider", failed=failed, provider=provider)
+            return True
+        return False
+
     async def _record_external(self) -> None:
         ext = self.external
         if ext is None or ext.recorded:
@@ -446,14 +504,14 @@ class ChatStream:
         if self.usage is None:
             return
         if ext.outcome == "not_configured":
-            await self.usage.release(self.job.reserved_micro)
+            await self.usage.release(self.reserved_micro)
             return
         await self.usage.record(
             cost_usd=ext.cost_usd,
             prompt_tokens=ext.prompt_tokens,
             completion_tokens=ext.completion_tokens,
             failed=ext.outcome != "ok",
-            reserved_micro=self.job.reserved_micro,
+            reserved_micro=self.reserved_micro,
         )
 
     # --- persistence --------------------------------------------------------------------
@@ -494,24 +552,26 @@ class ChatStream:
                     .values(last_used_at=func.now())
                 )
             await db.flush()
-            if ext is not None and ext.outcome != "not_configured":
-                # Metadata only: never the prompt or the answer.
+            for a in self.attempts or ([ext] if ext is not None else []):
+                if a.outcome == "not_configured":
+                    continue
+                # Metadata only: never the prompt or the answer. One row per provider tried.
                 audit.record(
                     db,
                     "ai.external_call",
                     self.job.client,
                     actor_user_id=self.job.user_id,
                     details={
-                        "provider": ext.provider,
-                        "model": ext.model,
+                        "provider": a.provider,
+                        "model": a.model,
                         "conversation_id": str(self.job.conversation_id),
                         "message_id": msg.id,
-                        "outcome": ext.outcome,
-                        "prompt_tokens": ext.prompt_tokens,
-                        "completion_tokens": ext.completion_tokens,
-                        "cost_usd": str(ext.cost_usd) if ext.cost_usd is not None else None,
-                        "latency_ms": ext.latency_ms,
-                        "fell_back_to": t.model if t.provider == "ollama" else None,
+                        "outcome": a.outcome,
+                        "prompt_tokens": a.prompt_tokens,
+                        "completion_tokens": a.completion_tokens,
+                        "cost_usd": str(a.cost_usd) if a.cost_usd is not None else None,
+                        "latency_ms": a.latency_ms,
+                        "fell_back_to": (None if a.outcome == "ok" else f"{t.provider}:{t.model}"),
                     },
                 )
             self._persisted = msg.id

@@ -13,15 +13,18 @@ any of these hold, in this order:
     rate_limited_local                         AI_EXTERNAL_REQUESTS_PER_MINUTE for the provider
     daily_cap_reached | global_cap_reached     the call's worst case reserved against the caps
 
-A "no" sends the turn to local Ollama (CHAT_DEFAULT_MODEL, else the first installed model).
-Errors during the call (rate_limited, upstream_error, timeout, unavailable, rejected,
-refused) fall back the same way, from app/services/chat.py. A failed or refused external
-call never moves to ANOTHER external provider: the only fallback is local.
+A "no" moves on to the next provider in the chain (`Settings.external_chain`: the requested
+or default provider, then AI_EXTERNAL_FALLBACK_PROVIDERS), and to local Ollama
+(CHAT_DEFAULT_MODEL, else the first installed model) after the last one (`choose`). Errors
+during the call (rate_limited, upstream_error, timeout, unavailable, rejected, refused) move
+on the same way, from app/services/chat.py. A "no" for `filter` or `context` ends the walk:
+that payload goes to no external provider, only local. With an empty fallback list the only
+fallback is local (the behaviour before docs/30).
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Literal
@@ -221,6 +224,55 @@ def gate_for(
     return ExternalGate(settings, clients.get(provider), usage, provider=provider)
 
 
+@dataclass(slots=True)
+class Pick:
+    """The result of walking the provider chain (see `choose`)."""
+
+    # The provider that said yes, and its model; None = no external provider (use local).
+    gate: ExternalGate | None
+    model: str
+    # The yes (with its reservation), else the first refusal (its reason and categories).
+    decision: Decision
+    # Providers still untried after `gate`, for a runtime failure.
+    remaining: tuple[str, ...] = ()
+    # Why the first provider in the chain was skipped (None when it said yes).
+    skipped_reason: str | None = None
+
+
+async def choose(
+    gates: Mapping[str, ExternalGate],
+    chain: Sequence[str],
+    model: str,
+    messages: Iterable[Mapping[str, str]],
+    *,
+    context: str = "general",
+    max_tokens: int | None = None,
+) -> Pick:
+    """Ask each provider's gate in order; the first yes wins.
+
+    `model` is for the first provider; the others use their default model. A refusal for a
+    local-only reason (the classification filter) ends the walk at once: the verdict does
+    not depend on the provider, and that data goes to no external provider. Any other
+    refusal (disabled, not configured, unpriced, capped, rate-limited) moves on."""
+    msgs = list(messages)
+    first: Decision | None = None
+    for i, provider in enumerate(chain):
+        gate = gates.get(provider)
+        if gate is None:
+            continue
+        m = model if i == 0 else gate.default_model
+        decision = await gate.decide(m, msgs, context=context, max_tokens=max_tokens)
+        if decision.external:
+            reason = first.reason if first is not None else None
+            return Pick(gate, m, decision, tuple(chain[i + 1 :]), reason)
+        if first is None:
+            first = decision
+        if decision.local_only:
+            break
+    refusal = first if first is not None else Decision(False)
+    return Pick(None, model, refusal, (), refusal.reason)
+
+
 def local_fallback_model(settings: Settings, installed: list[str] | None) -> str | None:
     """CHAT_DEFAULT_MODEL when installed (or when the list is unknown), else the first."""
     default = settings.CHAT_DEFAULT_MODEL.strip()
@@ -236,9 +288,11 @@ __all__ = [
     "PROVIDERS",
     "Decision",
     "ExternalGate",
+    "Pick",
     "Provider",
     "build_external",
     "build_openrouter",
+    "choose",
     "estimate_cost",
     "external_clients",
     "gate_for",
