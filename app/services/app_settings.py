@@ -25,7 +25,6 @@ log scrubber (app/core/logging.py), which also covers incidents and AI incident 
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import json
 import os
@@ -46,7 +45,7 @@ from redis.asyncio import Redis
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.core.config import Settings, get_env_settings, set_effective_settings
+from app.core.config import Settings, get_env_settings, jwt_expiry, set_effective_settings
 from app.core.logging import register_secret_values
 from app.models.app_settings import AppSetting
 
@@ -249,6 +248,12 @@ REGISTRY: dict[str, Spec] = {
         _s("DHAN_BACKFILL_TIMEFRAMES", "dhan", "csv", "Backfill timeframes, comma-separated"),
         _s("DHAN_BACKFILL_DAYS", "dhan", "int", "Backfill depth (days)"),
         _s("DHAN_STATIC_IP", "dhan", "str", "Static IP registered with Dhan"),
+        _s("DHAN_SESSION_CHECK_CRON", "dhan", "str", "Credential verification schedule (cron)"),
+        _s("DHAN_MONITOR_CRON", "dhan", "str", "Dhan monitoring schedule (cron)"),
+        _s("DHAN_MARKET_HOLIDAYS", "dhan", "csv", "NSE holidays (YYYY-MM-DD, comma-separated)"),
+        _s("DHAN_FEED_STATUS_MAX_AGE_SECONDS", "dhan", "float", "Feed status max age (s)"),
+        _s("DHAN_FEED_CRASH_LOOP_STARTS", "dhan", "int", "Feed starts in 10 min before delaying"),
+        _s("DHAN_FEED_RECONNECT_COOLDOWN_SECONDS", "dhan", "float", "Feed reconnect cooldown (s)"),
         _s("GITHUB_TOKEN", "github", "secret", "GitHub token"),
         _s(
             "GITHUB_CODING_REPO_ALLOWLIST",
@@ -452,15 +457,7 @@ def as_utc(value: datetime | None) -> datetime | None:
 
 def dhan_token_expiry(token: str | None) -> datetime | None:
     """The `exp` claim of a Dhan access token (a JWT), read without verifying it."""
-    if not token or token.count(".") != 2:
-        return None
-    try:
-        part = token.split(".")[1]
-        claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
-        exp = claims.get("exp") if isinstance(claims, dict) else None
-        return datetime.fromtimestamp(float(exp), UTC) if exp is not None else None
-    except (ValueError, TypeError, OverflowError):
-        return None
+    return jwt_expiry(token)
 
 
 def secret_values(settings: Settings) -> list[str]:

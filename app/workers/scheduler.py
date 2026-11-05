@@ -51,6 +51,9 @@ from app.models.trading import BrokerAccount
 from app.services import (
     alerts,
     app_settings,
+    audit,
+    dhan_connection,
+    dhan_monitor,
     dhan_sync,
     github,
     github_actions,
@@ -60,6 +63,7 @@ from app.services import (
     news,
     paper,
     repair_recovery,
+    repairs,
 )
 from app.services.approvals import ApprovalGate
 
@@ -164,6 +168,37 @@ async def dhan_reconcile(ctx: TaskContext) -> dict[str, Any]:
     accounts = await dhan_sync.dhan_accounts(ctx.maker, adapter.client.client_id)
     out["accounts"] = [await dhan_sync.reconcile_account(ctx.maker, adapter, a) for a in accounts]
     return out
+
+
+async def dhan_session_check(ctx: TaskContext) -> dict[str, Any]:
+    """Verify the Dhan credential in use with GET /profile and store the result in
+    dhan.connections (docs/28). An outage never downgrades the stored verdict."""
+    v = await dhan_connection.verify_current(ctx.settings)
+    async with ctx.maker() as db, db.begin():
+        rec = await dhan_connection.record(db, ctx.settings, v)
+        if rec is not None and (rec.changed or rec.replaced):
+            audit.record(
+                db,
+                "dhan_connection_changed",
+                repairs.SYSTEM_CLIENT,
+                details={
+                    "from": rec.previous_status,
+                    "to": rec.row.status,
+                    "outcome": v.outcome,
+                    "source": v.source,
+                    "credential_replaced": rec.replaced,
+                },
+            )
+    return {
+        "outcome": v.outcome,
+        "status": rec.row.status if rec else None,
+        "error_code": v.error_code,
+    }
+
+
+async def dhan_monitor_job(ctx: TaskContext) -> dict[str, Any]:
+    """Auth, Redis, feed, subscriptions, staleness -> incidents (source `dhan`)."""
+    return await dhan_monitor.run(ctx.maker, ctx.settings, ctx.redis)
 
 
 async def dhan_backfill_candles(ctx: TaskContext) -> dict[str, Any]:
@@ -353,6 +388,8 @@ TASKS: dict[str, TaskFn] = {
     "dhan_refresh_instruments": dhan_refresh_instruments,
     "dhan_reconcile": dhan_reconcile,
     "dhan_backfill_candles": dhan_backfill_candles,
+    "dhan_session_check": dhan_session_check,
+    "dhan_monitor": dhan_monitor_job,
     "mt5_sync_status": mt5_sync_status,
     "mt5_ingest_watch": mt5_ingest_watch,
     "mt5_ingest_purge": mt5_ingest_purge,
@@ -384,6 +421,10 @@ def default_jobs(settings: Settings) -> list[tuple[str, str, str]]:
         jobs.append(("incident-scan", "incident_scan", settings.INCIDENT_SCAN_CRON))
     if settings.ALERTS_CRON and settings.discord_webhook_url:
         jobs.append(("alerts-dispatch", "alerts_dispatch", settings.ALERTS_CRON))
+    if settings.DHAN_CLIENT_ID:
+        # Even without a usable token: an expired/rejected credential must stay visible.
+        jobs.append(("dhan-session-check", "dhan_session_check", settings.DHAN_SESSION_CHECK_CRON))
+        jobs.append(("dhan-monitor", "dhan_monitor", settings.DHAN_MONITOR_CRON))
     if settings.dhan_configured:
         jobs += [
             (

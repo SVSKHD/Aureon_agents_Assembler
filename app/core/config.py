@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from functools import lru_cache
@@ -14,6 +15,20 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+
+def jwt_expiry(token: str | None) -> datetime | None:
+    """The `exp` claim of a JWT (a Dhan access token), read WITHOUT verifying it: only used to
+    stop using a token that has certainly expired. None when there is no readable claim."""
+    if not token or token.count(".") != 2:
+        return None
+    try:
+        part = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+        exp = claims.get("exp") if isinstance(claims, dict) else None
+        return datetime.fromtimestamp(float(exp), UTC) if exp is not None else None
+    except (ValueError, TypeError, OverflowError):
+        return None
 
 
 def _secret_text(value: SecretStr | str | None) -> str:
@@ -230,6 +245,21 @@ class Settings(BaseSettings):
     DHAN_SESSION_EXPIRES_AT: datetime | None = None
     # Discord alert when the Dhan session has expired or expires within this many minutes.
     DHAN_SESSION_ALERT_MINUTES: int = Field(default=60, ge=0, le=24 * 60)
+    # Credential verification against GET /profile (docs/28-dhan-operations.md). The result
+    # is kept in dhan.connections; a Dhan outage never downgrades a verdict.
+    DHAN_SESSION_CHECK_CRON: str = "*/15 * * * *"
+    # Monitoring: auth, feed, Redis, subscriptions, staleness -> incidents (source "dhan").
+    DHAN_MONITOR_CRON: str = "* * * * *"
+    # NSE trading holidays (YYYY-MM-DD, comma-separated). On these days a silent feed is
+    # "market_closed", not "stale". Weekends are always closed.
+    DHAN_MARKET_HOLIDAYS: Annotated[list[date], NoDecode] = Field(default_factory=list)
+    # The feed worker's status record (Redis) older than this = the worker is not reporting.
+    DHAN_FEED_STATUS_MAX_AGE_SECONDS: float = Field(default=30.0, gt=0)
+    # Crash-loop guard: this many starts within 10 minutes delays the next start
+    # (exponentially, up to 5 min) instead of hammering Dhan.
+    DHAN_FEED_CRASH_LOOP_STARTS: int = Field(default=5, ge=2, le=100)
+    # Minimum gap between two feed reconnects requested by an admin or by recovery.
+    DHAN_FEED_RECONNECT_COOLDOWN_SECONDS: float = Field(default=60.0, ge=5)
 
     def dhan_session_active(self, now: datetime | None = None) -> bool:
         """A login-flow token that has not expired yet."""
@@ -246,7 +276,14 @@ class Settings(BaseSettings):
         if self.dhan_session_active(now):
             return SecretStr(_secret_text(self.DHAN_SESSION_TOKEN))
         manual = _secret_text(self.DHAN_ACCESS_TOKEN)
-        return SecretStr(manual) if manual else None
+        if not manual:
+            return None
+        # A manual token whose own `exp` has passed is not usable: returning it would keep
+        # every Dhan job running (and failing) against a dead token (docs/27 finding 4).
+        exp = jwt_expiry(manual)
+        if exp is not None and exp <= (now or datetime.now(UTC)):
+            return None
+        return SecretStr(manual)
 
     @property
     def dhan_configured(self) -> bool:
@@ -850,6 +887,7 @@ class Settings(BaseSettings):
         "DHAN_FEED_INSTRUMENTS",
         "DHAN_BACKFILL_INSTRUMENTS",
         "DHAN_BACKFILL_TIMEFRAMES",
+        "DHAN_MARKET_HOLIDAYS",
         "RESEARCH_EMA_PERIODS",
         "CODE_PROTECTED_BRANCHES",
         "CODE_PUSH_BRANCH_PREFIXES",

@@ -1,6 +1,7 @@
 """Broker-specific tables: dhan.* and mt5.* (filled in by Trading Phases B and C).
 
-Credentials (Dhan access token, MT5 password) are NEVER stored here: they live in env only.
+Credentials (Dhan access token, MT5 password) are NEVER stored here: they live in env or in
+core.app_settings (encrypted). dhan.connections keeps only safe connection metadata.
 Each broker's full payload is kept in `raw`, so a field we don't model yet is never lost.
 """
 
@@ -82,6 +83,60 @@ class DhanAccountProfile(Base):
     data_plan: Mapped[str | None] = mapped_column(String(32))
     raw: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
     refreshed_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
+
+
+# What dhan.connections.status can be (docs/28-dhan-operations.md, "Connection states").
+DHAN_CONNECTION_STATES = (
+    "connected",  # GET /profile answered for the configured client id
+    "unverified",  # a token is in use but Dhan could not be asked yet (outage, just set)
+    "expired",  # the token's own expiry has passed (no Dhan call needed to know)
+    "rejected",  # Dhan refused the token: invalid, revoked, or no longer accepted
+    "mismatch",  # the token belongs to a different Dhan client id
+    "disconnected",  # an admin logged out and no manual token is in use
+    "not_configured",  # no client id, or no token at all
+)
+
+
+class DhanConnection(Base):
+    """The Dhan connection's SAFE metadata, one row per client id, kept across restarts.
+
+    Never a token: `credential_fp` is an HMAC (keyed by SECRET_KEY) of the token in use, only
+    so a replaced credential is noticed; it is never returned by the API. Logging out keeps the
+    row (and every broker account / profile row), it only changes the status.
+    """
+
+    __tablename__ = "connections"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN (" + ",".join(f"'{s}'" for s in DHAN_CONNECTION_STATES) + ")",
+            name="status",
+        ),
+        {"schema": "dhan"},
+    )
+
+    dhan_client_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    status: Mapped[str] = mapped_column(String(16))
+    token_source: Mapped[str] = mapped_column(String(8), server_default=text("'none'"))
+    credential_fp: Mapped[str | None] = mapped_column(String(32))
+    expires_at: Mapped[datetime | None] = mapped_column(TS)
+    connected_at: Mapped[datetime | None] = mapped_column(TS)
+    connected_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("core.users.id", ondelete="SET NULL")
+    )
+    disconnected_at: Mapped[datetime | None] = mapped_column(TS)
+    disconnected_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("core.users.id", ondelete="SET NULL")
+    )
+    data_plan: Mapped[str | None] = mapped_column(String(32))
+    data_valid_until: Mapped[str | None] = mapped_column(String(40))
+    active_segments: Mapped[list[str]] = mapped_column(JSONB, server_default=text("'[]'::jsonb"))
+    last_verified_at: Mapped[datetime | None] = mapped_column(TS)
+    last_check_at: Mapped[datetime | None] = mapped_column(TS)
+    last_check_outcome: Mapped[str | None] = mapped_column(String(24))
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    consecutive_failures: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    version: Mapped[int] = mapped_column(Integer, server_default=text("1"))
+    updated_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
 
 
 class DhanFundSnapshot(Base):

@@ -24,7 +24,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
 
-INCIDENT_SOURCES = ("exception", "heartbeat", "docker", "actions", "db", "api")
+INCIDENT_SOURCES = ("exception", "heartbeat", "docker", "actions", "db", "api", "dhan")
 INCIDENT_SEVERITIES = ("info", "warning", "error", "critical")
 INCIDENT_STATUSES = ("open", "recovering", "repair_queued", "resolved", "ignored")
 # An incident in one of these is "open": its fingerprint is unique among them.

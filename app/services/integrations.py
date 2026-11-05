@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from redis.asyncio import Redis
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -36,8 +37,9 @@ from app.agents.registry import effective_state
 from app.core.config import Settings
 from app.integrations.claude_cli import ClaudeCLI
 from app.models.agents import Agent, ScheduledJob
+from app.models.brokers import DhanConnection
 from app.models.github import GitHubWebhookEvent
-from app.services import dhan_auth
+from app.services import dhan_auth, dhan_connection, dhan_feed_control
 
 Section = dict[str, Any]
 SECTION_LIMIT_S = 4.0
@@ -123,12 +125,14 @@ class IntegrationsSummary:
         claude: ClaudeCLI | None,
         *,
         now: datetime | None = None,
+        redis: Redis | None = None,
     ) -> None:
         self.settings = settings
         self.maker = maker
         self.ollama = ollama
         self.claude = claude
         self.now = now or datetime.now(UTC)
+        self.redis = redis
 
     async def _agents(self, *ids: str) -> dict[str, Agent]:
         async with self.maker() as db:
@@ -170,19 +174,37 @@ class IntegrationsSummary:
         feed = (await self._agents("dhan-feed")).get("dhan-feed")
         async with self.maker() as db:
             job = await db.get(ScheduledJob, "dhan-reconcile")
+            conn_row = await db.get(DhanConnection, s.DHAN_CLIENT_ID.strip())
         view = _agent_view(feed, s.AGENT_STALE_SECONDS, self.now)
+        # The same verdict as GET /api/v1/dhan/feed/health (docs/28): a feed that was never
+        # started, or is connected without fresh data, is a problem, not silence.
+        health = await dhan_feed_control.load_health(self.maker, self.redis, s, self.now)
+        connection = dhan_connection.view(conn_row, s)
         problems = []
         if job is not None and job.last_status == "failed":
             problems.append("dhan-reconcile failed")
         if view["registered"] and view["state"] in DOWN_STATES:
             problems.append(f"dhan-feed {view['state']}")
+        if health["status"] not in ("ok", "market_closed", "not_configured"):
+            problems.extend(f"feed: {p}" for p in health["problems"] or [health["status"]])
+        if connection["status"] in dhan_connection.UNUSABLE:
+            problems.append(f"Dhan credential {connection['status']}")
         if session["expires_soon"]:
             problems.append("Dhan session expires soon")
         return {
             "configured": True,
             "read_only": True,
             "session": _jsonable(session),
+            "connection": _jsonable(connection),
             "feed": view,
+            "feed_health": {
+                "status": health["status"],
+                "healthy": health["healthy"],
+                "market": health["market"],
+                "problems": health["problems"],
+                "stale": (health["feed"] or {}).get("stale"),
+                "fresh": (health["feed"] or {}).get("fresh"),
+            },
             "reconcile": {
                 "last_status": job.last_status if job else None,
                 "last_run_at": job.last_run_at.isoformat() if job and job.last_run_at else None,
