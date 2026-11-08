@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased: live deploy progress
+
+Stage-by-stage progress of backend and frontend deploys on the Spasta Deploys and CI card
+([docs/33-deploy-progress.md](docs/33-deploy-progress.md)).
+
+### Added
+
+- `devops.deployment_stages` + progress columns on `devops.deployments` (migration `0026`,
+  additive, grants mirrored).
+- `scripts/deploy.sh` reports `pulling`, `validating`, `building`, `migrating`, `restarting`,
+  `health_checking`, `verifying` (the running api image carries the expected commit) and
+  `rolling_back`; exit 3 = failed before anything changed. ASTRA-FRONTEND's deploy script does
+  the same (companion PR).
+- `scripts/ops/deploy-poll.sh` runs the deploy in the background and reports progress every few
+  seconds into the running API (`python -m app.workers.deploy_progress`), plus a final report;
+  missed reports (the API restarting) are healed by the next.
+- `GET /api/v1/github/actions/monitor/deploys/{run_id}/progress` and `/logs` (admin, read-only);
+  monitor rows gain `stage`, `stale`, `stages_completed`, `stages_total`, and their status comes
+  from the recorded deploy (`success` only when health-verified, else `unverified`).
+- Expected vs deployed commit and `commit_verified`; PR number from a recorded merge or the
+  merge subject; stale detection (`DEVOPS_DEPLOY_STALE_SECONDS`).
+
 ## Unreleased: Dhan login survives a Spasta re-login
 
 The Dhan API-key login kept its one-time pending state under the Spasta session id, so when the

@@ -78,6 +78,7 @@ SAFETY_RULES: tuple[tuple[str, str, Danger, str], ...] = (
     ("*", r"^/api/v1/approvals/(policies|reauth)", "hidden", "approval policy / re-auth"),
     # Read-only monitoring of deploys (docs/32): reading history is not deploying.
     ("GET", r"^/api/v1/devops/", "none", "read-only monitoring"),
+    ("GET", r"^/api/v1/github/actions/monitor(/|$)", "none", "read-only monitoring"),
     ("*", r"deploy", "hidden", "deploy"),
     ("POST", r"^/api/code/tasks/[^/]+/(approve|reject)$", "approval", "code change approval"),
     ("POST", r"^/api/v1/repairs/[^/]+/(approve|reject|apply)", "approval", "repair approval"),

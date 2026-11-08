@@ -40,6 +40,8 @@ PUBLIC_RATE_LIMITED = {p for m, p in PUBLIC if p.startswith("/api/public/")}
 ADMIN = {
     ("GET", "/api/v1/ai/usage"),
     # DevOps dashboard (docs/32): admin only, like the GitHub data it is built from.
+    ("GET", "/api/v1/github/actions/monitor/deploys/{run_id}/progress"),
+    ("GET", "/api/v1/github/actions/monitor/deploys/{run_id}/logs"),
     ("GET", "/api/v1/devops/overview"),
     ("GET", "/api/v1/devops/repositories"),
     ("GET", "/api/v1/devops/events"),

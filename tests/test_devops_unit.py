@@ -368,15 +368,25 @@ def dep(tmp_path: Path) -> Deploy:
 
 def _phases(d: Deploy) -> dict[str, str]:
     lines = (d.logs / ".deploy-backend.phases").read_text().splitlines()
-    return dict(line.split("=", 1) for line in lines)
+    return dict(line.split("=", 1) for line in lines if not line.startswith("stage="))
+
+
+def _stages(d: Deploy) -> list[tuple[str, str]]:
+    lines = (d.logs / ".deploy-backend.phases").read_text().splitlines()
+    return [tuple(line[6:].split("|")[:2]) for line in lines if line.startswith("stage=")]  # type: ignore[misc]
 
 
 def test_deploy_writes_health_ok_only_after_readiness(dep: Deploy) -> None:
     r = dep.run([f"200|{READY}"])
     assert r.returncode == 0, r.stdout
     p = _phases(dep)
-    assert list(p) == ["build_started", "build_finished", "migrate_finished", "deploy_started",
-                       "deploy_finished", "health_ok"]  # fmt: skip
+    assert list(p) == ["sha", "build_started", "build_finished", "migrate_finished",
+                       "deploy_started", "deploy_finished", "health_ok"]  # fmt: skip
+    assert p["sha"] == dep.new
+    assert _stages(dep) == [
+        (n, st) for n in ("pulling", "validating", "building", "migrating", "restarting",
+                          "health_checking", "verifying") for st in ("running", "succeeded")
+    ]  # fmt: skip
     assert "AUREON_GIT_SHA" not in r.stdout  # exported to compose, never printed
 
 

@@ -524,6 +524,10 @@ class Settings(BaseSettings):
     DEVOPS_ONESHOT_SERVICES: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["mount-check", "migrate"]
     )
+    # A running deploy whose host has not reported progress for this long is shown as stale
+    # (docs/33-deploy-progress.md); the poller reports every few seconds and at least once a
+    # minute while a deploy runs.
+    DEVOPS_DEPLOY_STALE_SECONDS: float = Field(default=180.0, ge=30, le=24 * 3600)
     # Live feed (GET /api/v1/devops/stream).
     DEVOPS_STREAM_POLL_SECONDS: float = Field(default=2.0, gt=0, le=60)
     DEVOPS_STREAM_HEARTBEAT_SECONDS: float = Field(default=15.0, gt=0, le=300)

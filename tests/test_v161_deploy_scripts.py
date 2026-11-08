@@ -31,6 +31,13 @@ DOCKER = r"""#!/usr/bin/env bash
 printf '%s\n' "$*" >>"$FAKE/docker.log"
 case "$*" in
   "image inspect"*) exit 0 ;;
+  "compose config --quiet") exit "${CONFIG_RC:-0}" ;;
+  "compose ps --quiet api") echo "cid-api"; exit 0 ;;
+  "inspect --format"*) echo "${FAKE_REVISION-$AUREON_GIT_SHA}"; exit 0 ;;
+  *"app.workers.deploy_progress"*)
+    cat >>"$FAKE/progress.jsonl"
+    echo >>"$FAKE/progress.jsonl"
+    exit 0 ;;
   "tag aureon-agentic:rollback aureon-agentic:dev") touch "$FAKE/rolled"; exit 0 ;;
   *"app.workers.migrate --check"*)
     echo '=== aureon migration check ==='
@@ -223,7 +230,7 @@ def test_unhealthy_rollback_exits_2(dep: Deploy) -> None:
 # --- deploy-poll.sh: only a healthy rollback is recorded as rolled back -------------------
 
 
-def _poll(tmp: Path, deploy_rc: int) -> list[str]:
+def _poll(tmp: Path, deploy_rc: int, body: str = "", **env: str) -> list[str]:
     fake, bin_, logs = tmp / "fake", tmp / "bin", tmp / "logs"
     for d in (fake, bin_, logs):
         d.mkdir(exist_ok=True)
@@ -236,7 +243,7 @@ def _poll(tmp: Path, deploy_rc: int) -> list[str]:
     _git(repo, "checkout", "-q", "-b", "main")
     (repo / "scripts").mkdir()
     stub = repo / "scripts" / "deploy.sh"
-    stub.write_text(f"#!/usr/bin/env bash\nexit {deploy_rc}\n")
+    stub.write_text(f"#!/usr/bin/env bash\n{body}\nexit {deploy_rc}\n")
     stub.chmod(0o755)
     _git(repo, "add", ".")
     _git(repo, "commit", "-q", "-m", "x")
@@ -250,6 +257,7 @@ def _poll(tmp: Path, deploy_rc: int) -> list[str]:
             "DEPLOY_LOG_DIR": str(logs),
             "BACKEND_DIR": str(repo),
             "FRONTEND_DIR": str(tmp / "absent"),
+            **env,
         },
         capture_output=True,
         text=True,
@@ -273,3 +281,47 @@ def test_poll_never_records_an_unhealthy_rollback_as_rolled_back(tmp_path: Path)
 def test_poll_records_success(tmp_path: Path) -> None:
     (finish,) = _poll(tmp_path, 0)
     assert "--status succeeded" in finish
+
+
+# A deploy script that reports stages and log lines while it runs, like scripts/deploy.sh.
+PROGRESSING = r"""
+p="$DEPLOY_LOG_DIR/.deploy-backend.phases"
+say() { printf '%s backend %s\n' "$(date -u +%FT%TZ)" "$1" >>"$DEPLOY_LOG_DIR/deploy.log"; }
+printf 'stage=pulling|running|%s|\n' "$(date -u +%FT%TZ)" >>"$p"
+say "fetching"
+printf 'sha=%s\npr=46\n' "$(printf 'a%.0s' {1..40})" >>"$p"
+printf 'stage=pulling|succeeded|%s|aaaa\n' "$(date -u +%FT%TZ)" >>"$p"
+printf 'stage=building|running|%s|\n' "$(date -u +%FT%TZ)" >>"$p"
+say "building image"
+sleep 2.5
+say "secret in output: Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz01234567"
+printf 'stage=building|succeeded|%s|\n' "$(date -u +%FT%TZ)" >>"$p"
+"""
+
+
+def test_poll_reports_progress_live_and_once_more_at_the_end(tmp_path: Path) -> None:
+    from app.workers import deploy_progress
+
+    _poll(tmp_path, 0, PROGRESSING, PROGRESS_SECONDS="1")
+    calls = (tmp_path / "fake" / "docker.log").read_text().splitlines()
+    live = [c for c in calls if "exec -T api python -m app.workers.deploy_progress" in c]
+    final = [c for c in calls if "run --rm --no-deps -T api python -m app.workers.deploy_progress"
+             in c]  # fmt: skip
+    assert live and len(final) == 1
+    # The final report comes before the deploy is recorded as finished.
+    assert calls.index(final[0]) < next(i for i, c in enumerate(calls) if " finish " in c)
+    sent = (tmp_path / "fake" / "progress.jsonl").read_text().splitlines()
+    docs = [deploy_progress.parse(line.encode()) for line in sent if line]
+    assert len(docs) == len(live) + 1
+    last = docs[-1]
+    assert last.run_id == 17 and last.target == "backend" and last.pr == 46
+    assert last.sha == "a" * 40
+    assert [(s.name, s.status) for s in last.stages] == [
+        ("pulling", "running"), ("pulling", "succeeded"), ("building", "running"),
+        ("building", "succeeded"),
+    ]  # fmt: skip
+    assert last.log is not None and "building image" in last.log
+    assert " poll " not in last.log  # only this deploy's own lines
+    # A live report saw the deploy mid-way.
+    assert any(("building", "running") == (s.name, s.status) and len(d.stages) == 3
+               for d in docs for s in d.stages)  # fmt: skip

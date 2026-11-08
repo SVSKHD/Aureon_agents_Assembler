@@ -40,6 +40,72 @@ print(json.dumps(out)[:4000])
 ' "$1" 2>/dev/null || echo '{}'
 }
 
+# One aureon.deploy.progress/v1 report (docs/33-deploy-progress.md): the stage lines the deploy
+# script wrote so far, the commit it checked out, and this deploy's own lines of deploy.log
+# since `offset` (lines tagged with the target name; the poller's own lines are left out).
+progress_json() { # name run_id phases_file log_offset
+  python3 - "$1" "$2" "$3" "$4" "$LOG_FILE" <<'PY' 2>/dev/null
+import json, os, sys
+
+name, run_id, phases, offset, log_file = sys.argv[1:6]
+stages, sha, pr = [], None, None
+try:
+    with open(phases, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            k, _, v = line.rstrip("\n").partition("=")
+            if k == "stage":
+                parts = v.split("|", 3)
+                if len(parts) == 4:
+                    stages.append({"name": parts[0], "status": parts[1], "at": parts[2],
+                                   "detail": parts[3] or None})
+            elif k == "sha":
+                sha = v
+            elif k == "pr" and v.isdigit():
+                pr = int(v)
+except OSError:
+    pass
+lines, truncated = [], False
+try:
+    with open(log_file, "rb") as f:
+        f.seek(int(offset))
+        data = f.read(4 * 1024 * 1024)
+        truncated = bool(f.read(1))
+    for raw in data.decode("utf-8", "replace").splitlines():
+        parts = raw.split(" ", 2)
+        if len(parts) == 3 and parts[1] == name:
+            lines.append(parts[0] + " " + parts[2])
+except (OSError, ValueError):
+    pass
+if len(lines) > 600:
+    lines, truncated = lines[-600:], True
+doc = {"schema": "aureon.deploy.progress/v1", "run_id": int(run_id), "target": name,
+       "stages": stages[-200:], "log": "\n".join(lines)[-256 * 1024:],
+       "log_truncated": truncated}
+if sha:
+    doc["sha"] = sha
+if pr:
+    doc["pr"] = pr
+print(json.dumps(doc))
+PY
+}
+
+# Send a progress report; best effort, never blocks or fails a deploy. `live`: into the running
+# API container (a backend deploy restarts it: missed reports are healed by the next one).
+# `final`: through a one-shot container, so the end of a deploy is always recorded.
+report_progress() { # live|final name run_id phases_file log_offset
+  local doc mode="$1"
+  shift
+  doc="$(progress_json "$@")" || return 0
+  [[ -n "$doc" ]] || return 0
+  if [[ "$mode" == "live" ]]; then
+    printf '%s' "$doc" | (cd "$BACKEND_DIR" && timeout 20 docker compose exec -T api \
+      python -m app.workers.deploy_progress) >/dev/null 2>&1 || true
+  else
+    printf '%s' "$doc" | (cd "$BACKEND_DIR" && timeout 120 docker compose run --rm --no-deps -T \
+      api python -m app.workers.deploy_progress) >/dev/null 2>>"$LOG_FILE" || true
+  fi
+}
+
 if [[ -e "$LOG_DIR/DEPLOY_PAUSED" ]]; then
   exit 0
 fi
@@ -71,8 +137,28 @@ for t in "${TARGETS[@]}"; do
 
   phases_file="$LOG_DIR/.deploy-$name.phases"
   rm -f "$phases_file" # never report a previous deploy's phases
+  offset="$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)"
   drc=0
-  "$script" || drc=$?
+  # Run the deploy and report its progress while it runs (every PROGRESS_SECONDS when the
+  # stages or the log changed, and at least once a minute so it never looks stale).
+  "$script" &
+  dpid=$!
+  last_sig=""
+  last_sent=$SECONDS
+  while kill -0 "$dpid" 2>/dev/null; do
+    sleep "${PROGRESS_SECONDS:-4}"
+    [[ -n "$run_id" ]] || continue
+    sig="$(stat -c '%s.%Y' "$phases_file" "$LOG_FILE" 2>/dev/null | tr '\n' ' ' || true)"
+    if [[ "$sig" != "$last_sig" ]] || ((SECONDS - last_sent >= 60)); then
+      report_progress live "$name" "$run_id" "$phases_file" "$offset"
+      last_sig="$sig"
+      last_sent=$SECONDS
+    fi
+  done
+  wait "$dpid" || drc=$?
+  if [[ -n "$run_id" ]]; then
+    report_progress final "$name" "$run_id" "$phases_file" "$offset"
+  fi
   phases_json="$(phases_json "$phases_file")"
   if ((drc == 0)); then
     log "$name: deployed ${remote:0:12}"
@@ -82,14 +168,18 @@ for t in "${TARGETS[@]}"; do
         --phases-json "$phases_json" >/dev/null
     fi
   else
-    # deploy.sh: 1 = failed and rolled back healthy; 2 = the rollback is unhealthy too. Only
-    # a healthy rollback is recorded as rolled back (the frontend script only uses 0/1).
-    rolled=(--rolled-back)
-    what="rolled back"
-    if ((drc != 1)); then
-      rolled=()
-      what="ROLLBACK UNHEALTHY, needs a human"
-    fi
+    # deploy.sh: 1 = failed and rolled back healthy; 2 = the rollback is unhealthy too;
+    # 3 = failed before anything changed. Only a healthy rollback is recorded as rolled back.
+    rolled=()
+    case "$drc" in
+      1)
+        rolled=(--rolled-back)
+        what="rolled back"
+        ;;
+      2) what="ROLLBACK UNHEALTHY, needs a human" ;;
+      3) what="nothing changed, the previous release is still live" ;;
+      *) what="exit $drc" ;;
+    esac
     log "$name: deploy FAILED for ${remote:0:12}, $what (exit $drc; see $LOG_FILE)"
     echo "$remote" >"$LOG_DIR/.failed-$name"
     if [[ -n "$run_id" ]]; then
