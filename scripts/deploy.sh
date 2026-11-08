@@ -4,9 +4,13 @@
 #   scripts/deploy.sh            # deploy if origin/main moved since the last good deploy
 #   scripts/deploy.sh --force    # rebuild and redeploy even if nothing moved
 #
-# fetch -> reset to origin/main -> docker compose build -> migrate -> up -d -> wait up to 60 s
-# for /api/health/ready. If the health check fails, the previous image and commit come back
-# (`aureon-agentic:rollback` -> `:dev`, git reset to the old SHA, up -d) and it exits 1.
+# fetch -> reset to origin/main -> docker compose build -> migrate -> verify the schema is at
+# head (`migrate --check`, read-only) -> up -d -> wait up to 60 s for /api/health/ready to pass
+# READY_PASSES (2) checks in a row. A pass is HTTP 200 AND a JSON body with status "ready" and
+# every check ok: a 2xx alone (a proxy page, a half-started app) never promotes a release.
+# On any failure the previous image and commit come back (`aureon-agentic:rollback` -> `:dev`,
+# git reset to the old SHA, up -d) and the last-good marker is left untouched.
+# Exit: 0 deployed | 1 failed, rolled back healthy | 2 failed AND the rollback is unhealthy.
 # Lock-protected (flock): a second deploy waits for the first. Server-local files (.env,
 # .env.migrate, compose.override.yaml, scripts/ops/ops.env) are untracked and never touched;
 # local edits to tracked files are stashed (named), never lost. Migrations are additive, so the
@@ -60,8 +64,8 @@ main() {
   done
 
   git reset --quiet --hard "$want"
-  if docker compose build --quiet && docker compose run --rm migrate && docker compose up -d \
-    && wait_ready 60; then
+  if docker compose build --quiet && docker compose run --rm migrate && migrations_at_head \
+    && docker compose up -d && wait_ready "${DEPLOY_READY_SECONDS:-60}"; then
     echo "$want" >"$state"
     echo "OK ${want:0:12} healthy"
     return 0
@@ -74,25 +78,84 @@ main() {
       docker tag "$img:rollback" "$img:dev"
     fi
   done
-  if docker compose up -d && wait_ready 90; then
+  if docker compose up -d && wait_ready "${DEPLOY_ROLLBACK_READY_SECONDS:-90}"; then
     echo "ROLLED BACK to ${cur:0:12} (healthy)"
-  else
-    echo "ROLLBACK UNHEALTHY at ${cur:0:12}: needs a human (scripts/ops/healthcheck.sh)"
+    return 1
   fi
+  echo "ROLLBACK UNHEALTHY at ${cur:0:12}: needs a human (scripts/ops/healthcheck.sh)"
+  return 2
+}
+
+# Read-only: the database's recorded revision must be the image's head. `migrate` already
+# verifies this after upgrading; checked again here so a deploy never proceeds on a pending
+# (exit 3) or diverged (exit 4) schema even if the migrate service is overridden locally.
+migrations_at_head() {
+  local out rc=0
+  out="$(docker compose run --rm --no-deps -T migrate python -m app.workers.migrate --check 2>&1)" \
+    || rc=$?
+  printf '%s\n' "$out" | grep -A1 -F '=== aureon migration check ===' | tail -n 1 || true
+  case "$rc" in
+    0) echo "migrations: at head" ;;
+    3) echo "migrations: PENDING after migrate (see the report above)" ;;
+    4) echo "migrations: DIVERGED (the database records revisions this build lacks)" ;;
+    *) echo "migrations: check failed (exit $rc)" ;;
+  esac
+  return "$rc"
+}
+
+# One readiness probe: HTTP 200 and {"status": "ready", "checks": {name: {"ok": true}, ...}}.
+ready_once() {
+  local body code
+  body="$(mktemp)"
+  code="$(curl -sS -o "$body" -w '%{http_code}' --max-time 4 "$READY_URL" 2>/dev/null)" || code=000
+  if [[ "$code" != "200" ]]; then
+    last_ready="HTTP ${code:-000}"
+    rm -f "$body"
+    return 1
+  fi
+  if last_ready="$(python3 - "$body" <<'PY'
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    print("HTTP 200 but the body is not JSON"); sys.exit(1)
+if not isinstance(doc, dict) or doc.get("status") != "ready":
+    status = doc.get("status") if isinstance(doc, dict) else None
+    print(f"HTTP 200 but status={status!r}"); sys.exit(1)
+checks = doc.get("checks")
+if not isinstance(checks, dict) or not checks:
+    print("HTTP 200 but no checks in the body"); sys.exit(1)
+bad = sorted(k for k, v in checks.items() if not (isinstance(v, dict) and v.get("ok") is True))
+if bad:
+    print("HTTP 200 but failing: " + ", ".join(bad)); sys.exit(1)
+print("ready")
+PY
+  )"; then
+    rm -f "$body"
+    return 0
+  fi
+  rm -f "$body"
   return 1
 }
 
-wait_ready() { # $1 = seconds
-  local deadline=$((SECONDS + $1))
+wait_ready() { # $1 = seconds; needs READY_PASSES consecutive passing probes
+  local deadline=$((SECONDS + $1)) passes=0 need="${READY_PASSES:-2}"
+  last_ready="no answer"
   while ((SECONDS < deadline)); do
-    if curl -fsS -o /dev/null --max-time 4 http://127.0.0.1:8000/api/health/ready; then
-      return 0
+    if ready_once; then
+      passes=$((passes + 1))
+      ((passes >= need)) && return 0
+    else
+      passes=0
     fi
-    sleep 3
+    sleep "${DEPLOY_READY_INTERVAL:-3}"
   done
-  echo "health: /api/health/ready not ok within $1 s"
+  echo "health: $READY_URL not ready within $1 s (last: $last_ready)"
   return 1
 }
+
+READY_URL="${DEPLOY_READY_URL:-http://127.0.0.1:8000/api/health/ready}"
+last_ready=""
 
 # Whole file is parsed before main runs, so `git reset` replacing this file mid-deploy is safe.
 main "$@"

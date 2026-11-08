@@ -14,16 +14,22 @@ Each run collects what needs a human:
   DHAN_SESSION_ALERT_MINUTES. Keyed by the expiry time, so a new login starts fresh.
 
 and sends each through the Phase 20 Discord adapter. Deduplicated: one alert per fingerprint
-per ALERTS_DEDUP_MINUTES (a Redis key `SET NX EX`; an in-process map without Redis). A failed
-send releases its key so the next run retries. A no-op when DISCORD_WEBHOOK_URL is unset.
+per ALERTS_DEDUP_MINUTES (a Redis key; an in-process map without Redis). Each delivery first
+takes a short lease (`lease_seconds`) with a fencing token, and only a successful send turns it
+into the full window: a failed send releases it, and a send cancelled by the scheduler timeout
+or killed with the worker loses it when the lease expires, so the next run retries instead of
+the alert being silenced for the whole window. Only the token holder can commit or release.
+A no-op when DISCORD_WEBHOOK_URL is unset.
 Nothing here can act on anything: alerts only inform, and the link only opens the app.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -206,28 +212,103 @@ def _dhan_session_alert(settings: Settings, now: datetime) -> Alert | None:
     return None
 
 
-class Dedup:
-    """One send per fingerprint per window. Redis when available (shared, survives restarts),
-    else an in-process map."""
+# Claim, commit and release are each one atomic Redis script. The key's value says who owns it:
+#   "sending:<token>"  a delivery lease (short TTL): one worker is sending right now
+#   "sent:<token>"     delivered; nothing is resent for ALERTS_DEDUP_MINUTES
+# The token is the fencing token: only the lease holder may commit or release, so a worker
+# whose lease expired (it hung, or was cancelled mid-send) can never clobber a newer attempt.
+_COMMIT = """
+local v = redis.call('GET', KEYS[1])
+if v == ARGV[1] or not v then
+  redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+  return 1
+end
+return 0
+"""
+_RELEASE = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
 
-    def __init__(self, redis: Redis | None, window_s: int) -> None:
+
+def lease_seconds(settings: Settings) -> int:
+    """How long one delivery may hold its claim: every Discord attempt with its backoff (or a
+    capped 429 Retry-After), plus a margin. A worker that dies or is cancelled mid-send loses
+    the claim after this, and the next run retries (not after the whole dedup window)."""
+    n = settings.DISCORD_MAX_ATTEMPTS
+    waits = sum(
+        min(settings.DISCORD_RETRY_BASE_SECONDS * 2 ** (a - 1), discord.MAX_RETRY_AFTER)
+        for a in range(1, n)
+    )
+    return int(n * settings.DISCORD_REQUEST_SECONDS + waits) + 30
+
+
+class Dedup:
+    """One delivery per fingerprint per window, with crash-safe leases. Redis when available
+    (shared, survives restarts), else an in-process map.
+
+    claim() takes a short delivery lease and returns its fencing token (None = someone else
+    holds a lease or already sent it). commit() turns the lease into the dedup window;
+    release() gives it up after a failed send so the next run retries. Both are no-ops for a
+    token that no longer owns the key. Delivery is at-least-once: a crash after Discord
+    accepted the message but before commit() resends it once the lease expires."""
+
+    def __init__(self, redis: Redis | None, window_s: int, lease_s: int | None = None) -> None:
         self.redis = redis
         self.window_s = window_s
-        self._local: dict[str, float] = {}
+        self.lease_s = max(1, min(lease_s or window_s, window_s))
+        self._local: dict[str, tuple[float, str]] = {}
 
-    async def claim(self, fp: str) -> bool:
+    async def claim(self, fp: str) -> str | None:
+        token = uuid.uuid4().hex
         if self.redis is not None:
-            return bool(await self.redis.set(DEDUP_PREFIX + fp, "1", nx=True, ex=self.window_s))
+            got = await self.redis.set(
+                DEDUP_PREFIX + fp, f"sending:{token}", nx=True, ex=self.lease_s
+            )
+            return token if got else None
         now = time.monotonic()
-        if self._local.get(fp, 0.0) > now:
-            return False
-        self._local[fp] = now + self.window_s
-        return True
+        held = self._local.get(fp)
+        if held is not None and held[0] > now:
+            return None
+        self._local[fp] = (now + self.lease_s, f"sending:{token}")
+        return token
 
-    async def release(self, fp: str) -> None:
+    async def commit(self, fp: str, token: str) -> bool:
+        """Delivered: hold the key for the full window. False when the lease had been taken
+        over by a newer attempt (that attempt's state is left alone)."""
         if self.redis is not None:
-            await self.redis.delete(DEDUP_PREFIX + fp)
-        else:
+            done = await self.redis.eval(
+                _COMMIT,
+                1,
+                DEDUP_PREFIX + fp,
+                f"sending:{token}",
+                f"sent:{token}",
+                str(self.window_s),
+            )
+            return bool(done)
+        now = time.monotonic()
+        held = self._local.get(fp)
+        if held is None or held[0] <= now or held[1] == f"sending:{token}":
+            self._local[fp] = (now + self.window_s, f"sent:{token}")
+            return True
+        return False
+
+    async def release(self, fp: str, token: str | None = None) -> None:
+        """Failed: drop our lease so the next run retries. A stale token deletes nothing."""
+        if token is None:  # legacy callers: unconditional
+            if self.redis is not None:
+                await self.redis.delete(DEDUP_PREFIX + fp)
+            else:
+                self._local.pop(fp, None)
+            return
+        if self.redis is not None:
+            key = DEDUP_PREFIX + fp
+            await self.redis.eval(_RELEASE, 1, key, f"sending:{token}")
+            return
+        held = self._local.get(fp)
+        if held is not None and held[1] == f"sending:{token}":
             self._local.pop(fp, None)
 
 
@@ -259,11 +340,12 @@ async def dispatch(
     if not settings.discord_webhook_url:
         return {"skipped": "discord not configured", "sent": 0}
     window = settings.ALERTS_DEDUP_MINUTES * 60
+    lease = lease_seconds(settings)
     if dedup is None:
         if redis is not None:
-            dedup = Dedup(redis, window)
+            dedup = Dedup(redis, window, lease)
         else:  # keep the in-process map across runs of this process
-            dedup = _LOCAL_DEDUP.setdefault(window, Dedup(None, window))
+            dedup = _LOCAL_DEDUP.setdefault(window, Dedup(None, window, lease))
     alerts, info = await collect(maker, settings, now)
     sent, failed, deduped, capped = 0, 0, 0, 0
     kinds: dict[str, int] = {}
@@ -271,20 +353,30 @@ async def dispatch(
         if sent + failed >= settings.ALERTS_MAX_PER_RUN:
             capped += 1
             continue
-        if not await dedup.claim(alert.fingerprint):
+        token = await dedup.claim(alert.fingerprint)
+        if token is None:
             deduped += 1
             continue
         try:
             ok = await sender(settings, asdict(alert))
+        except asyncio.CancelledError:
+            # The scheduler's timeout (or shutdown) cancelled us mid-send: give the lease back
+            # so the next run retries now, then keep cancelling. If even this cannot run (the
+            # process died), the lease expires on its own after `lease` seconds.
+            with contextlib.suppress(Exception):
+                await asyncio.shield(dedup.release(alert.fingerprint, token))
+            raise
         except Exception as exc:  # a notifier never fails the run on one alert
             log.warning("alert_send_failed", error=type(exc).__name__)
             ok = False
         if ok:
             sent += 1
             kinds[alert.kind] = kinds.get(alert.kind, 0) + 1
+            if not await dedup.commit(alert.fingerprint, token):
+                log.warning("alert_lease_lost", kind=alert.kind)
         else:
             failed += 1
-            await dedup.release(alert.fingerprint)  # retried next run
+            await dedup.release(alert.fingerprint, token)  # retried next run
     return {
         "candidates": len(alerts),
         "sent": sent,

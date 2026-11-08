@@ -55,6 +55,15 @@ from app.services.research import TF_SECONDS, Checks, _num, _policy_snapshot, tf
 
 IST = ZoneInfo("Asia/Kolkata")
 OPEN_STATUSES = ("PENDING_RISK", "APPROVED", "SUBMITTED")
+TERMINAL_STATUSES = ("REJECTED", "FILLED", "CANCELLED", "EXPIRED")
+# The only legal moves of an intent's status. Terminal statuses have no way out, so a late
+# writer (a scheduler run that read the row before a cancel) can never revive or refill it.
+TRANSITIONS: dict[str, frozenset[str]] = {
+    "PENDING_RISK": frozenset({"REJECTED", "APPROVED", "CANCELLED", "EXPIRED"}),
+    "APPROVED": frozenset({"SUBMITTED", "FILLED", "CANCELLED", "EXPIRED"}),
+    "SUBMITTED": frozenset({"FILLED", "CANCELLED", "EXPIRED"}),
+    **{s: frozenset() for s in TERMINAL_STATUSES},
+}
 
 
 class IntentRefused(Exception):
@@ -112,6 +121,17 @@ class IntentRequest:
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def transition(intent: OrderIntent, new: str, now: datetime | None = None) -> None:
+    """Move `intent` to `new`, or raise 409 `invalid_transition`. The UPDATE itself is a
+    compare-and-set on the old status (OrderIntent maps `status` as its version column), so a
+    concurrent writer that changed it first makes this flush fail instead of overwriting."""
+    old = intent.status
+    if new not in TRANSITIONS.get(old, frozenset()):
+        raise IntentRefused("invalid_transition", f"intent is {old}; it cannot become {new}")
+    intent.status = new
+    intent.updated_at = now or _now()
 
 
 def _event(db: AsyncSession, intent: OrderIntent, kind: str, **payload: Any) -> None:
@@ -518,8 +538,7 @@ async def create_intent(
     if decision.approved:
         _event(db, intent, "RISK_PASSED", risk_decision_id=decision.id)
     else:
-        intent.status = "REJECTED"
-        intent.updated_at = _now()
+        transition(intent, "REJECTED")
         _event(db, intent, "RISK_REJECTED", risk_decision_id=decision.id, reason=decision.reason)
     return intent, True
 
@@ -543,12 +562,10 @@ async def approve_and_execute(
         db, redis, adapters, settings, PaperConfig.from_settings(settings), intent
     )
     if not decision.approved:
-        intent.status = "REJECTED"
-        intent.updated_at = _now()
+        transition(intent, "REJECTED")
         _event(db, intent, "RISK_REJECTED", risk_decision_id=decision.id, reason=decision.reason)
         return intent
-    intent.status = "APPROVED"
-    intent.updated_at = _now()
+    transition(intent, "APPROVED")
     _event(db, intent, "APPROVED", by=str(admin_id), risk_decision_id=decision.id)
     await execute(db, redis, adapters, settings, intent)
     return intent
@@ -588,7 +605,7 @@ async def execute(
     ref = await reference_price(db, redis, adapters, inst, cfg.price_max_age, now)
     if ref is None:
         if intent.status == "APPROVED":
-            intent.status = "SUBMITTED"
+            transition(intent, "SUBMITTED", now)
             _event(db, intent, "SUBMITTED", note="waiting for a fresh price")
         return None
     spread, slip = cfg.spread(inst.broker)
@@ -600,8 +617,7 @@ async def execute(
         )
         if not marketable:
             if intent.status == "APPROVED":
-                intent.status = "SUBMITTED"
-                intent.updated_at = now
+                transition(intent, "SUBMITTED", now)
                 _event(db, intent, "SUBMITTED", limit_price=intent.limit_price, market=price)
             return None
     if intent.status == "APPROVED":
@@ -651,8 +667,7 @@ async def execute(
             )
         )
     await _snapshot(db, account, book, {inst.id: ref.price}, now)
-    intent.status = "FILLED"
-    intent.updated_at = now
+    transition(intent, "FILLED", now)
     _event(
         db,
         intent,
@@ -731,8 +746,7 @@ async def _snapshot(
 async def cancel(db: AsyncSession, intent: OrderIntent, user_id: uuid.UUID) -> OrderIntent:
     if intent.status not in OPEN_STATUSES:
         raise IntentRefused("not_open", f"intent is {intent.status}")
-    intent.status = "CANCELLED"
-    intent.updated_at = _now()
+    transition(intent, "CANCELLED")
     _event(db, intent, "CANCELLED", by=str(user_id))
     return intent
 
@@ -748,21 +762,31 @@ async def process_open(
     day. Never fills anything that is not already approved."""
     now = now or _now()
     out = {"filled": 0, "expired": 0, "waiting": 0}
-    rows = (
+    ids = (
         await db.scalars(
-            select(OrderIntent).where(
+            select(OrderIntent.id).where(
                 OrderIntent.status.in_(OPEN_STATUSES), OrderIntent.mode == "PAPER"
             )
         )
     ).all()
-    for intent in rows:
+    for intent_id in ids:
+        # Lock the row and re-read it: a cancel or an approval may have committed since the
+        # id list was read. SKIP LOCKED leaves a row another transaction holds (a cancel in
+        # flight, an approval executing, another scheduler run) to that transaction.
+        intent = await db.scalar(
+            select(OrderIntent)
+            .where(OrderIntent.id == intent_id, OrderIntent.status.in_(OPEN_STATUSES))
+            .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
+        )
+        if intent is None:
+            continue
         inst = await db.get(Instrument, intent.instrument_id)
         assert inst is not None
         if intent.validity == "DAY" and market_day(inst.broker, intent.created_at) < market_day(
             inst.broker, now
         ):
-            intent.status = "EXPIRED"
-            intent.updated_at = now
+            transition(intent, "EXPIRED", now)
             _event(db, intent, "EXPIRED", reason="DAY validity ended")
             out["expired"] += 1
             continue

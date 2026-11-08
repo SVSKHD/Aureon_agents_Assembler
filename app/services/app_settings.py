@@ -47,6 +47,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings, get_env_settings, jwt_expiry, set_effective_settings
 from app.core.logging import register_secret_values
+from app.core.prod_checks import (
+    INGEST_TOKEN_DISTINCT_FROM,
+    ingest_token_reuse_problem,
+    ingest_token_strength_problem,
+)
 from app.models.app_settings import AppSetting
 
 log = structlog.get_logger(__name__)
@@ -379,6 +384,9 @@ def normalize(spec: Spec, raw: str) -> str:
         if not isinstance(items, list) or not all(isinstance(i, str) for i in items):
             raise SettingsError("invalid_value", f"{spec.key} must be a JSON list of strings")
         return json.dumps([i.strip() for i in items if i.strip()])
+    if spec.key == "MT5_INGEST_TOKEN" and (problem := ingest_token_strength_problem(value)):
+        # Same bar as the ENV=prod checklist; a managed value never bypasses it.
+        raise SettingsError("invalid_value", problem)
     if spec.key == "DISCORD_WEBHOOK_URL":
         parts = urlsplit(value)
         if (
@@ -414,13 +422,19 @@ def overlay(env: Settings, overrides: Mapping[str, str]) -> Settings:
 
 def checked_overlay(env: Settings, overrides: Mapping[str, str], key: str) -> Settings:
     try:
-        return overlay(env, overrides)
+        merged = overlay(env, overrides)
     except ValidationError as exc:
         # Field names and error types only: pydantic's messages include the input value.
         fields = sorted({str(e["loc"][0]) for e in exc.errors() if e.get("loc")} or {key})
         raise SettingsError(
             "invalid_value", f"rejected by validation: {', '.join(fields)}"
         ) from None
+    # One value must never serve as two credentials (the MT5 ingest token vs any other).
+    if key in ("MT5_INGEST_TOKEN", *INGEST_TOKEN_DISTINCT_FROM) and (
+        problem := ingest_token_reuse_problem(merged)
+    ):
+        raise SettingsError("invalid_value", problem)
+    return merged
 
 
 def current_value(settings: Settings, key: str) -> str | None:
@@ -820,8 +834,8 @@ async def _mt5(s: Settings, http: httpx.AsyncClient) -> TestOutcome:
     token = current_value(s, "MT5_INGEST_TOKEN")
     if not token:
         return TestOutcome(False, "MT5_INGEST_TOKEN is not set")
-    if len(token) < 24:
-        return TestOutcome(False, "MT5_INGEST_TOKEN is set but shorter than 24 characters")
+    if problem := ingest_token_strength_problem(token) or ingest_token_reuse_problem(s):
+        return TestOutcome(False, problem)
     return TestOutcome(True, "MT5_INGEST_TOKEN is set (the bot proves it on its next push)")
 
 

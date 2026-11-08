@@ -36,8 +36,9 @@ from app.agents.trading.mt5.push import (
 from app.agents.trading.ratelimit import BrokerRateLimiter, RateLimitExceeded, Window
 from app.api.ui import ui_module
 from app.auth.deps import Current, DbSession, SettingsDep
-from app.core.config import Settings
+from app.core.config import Environment, Settings
 from app.core.logging import get_logger
+from app.core.prod_checks import ingest_token_reuse_problem, ingest_token_strength_problem
 from app.schemas.mt5 import (
     Mt5BotStatusOut,
     Mt5FailuresOut,
@@ -65,10 +66,22 @@ def _err(code: int, key: str, detail: str, headers: dict[str, str] | None = None
 
 def check_ingest_token(settings: Settings, authorization: str | None) -> None:
     """503 when ingest is off; 401 unless `Authorization: Bearer <MT5_INGEST_TOKEN>`.
-    Constant-time: hmac.compare_digest on bytes, evaluated even for a wrong scheme."""
+    Constant-time: hmac.compare_digest on bytes, evaluated even for a wrong scheme.
+
+    The token is single-purpose: it authorizes this one route and nothing else (no session,
+    no CSRF exemption elsewhere), and no other credential authorizes this route. It is
+    re-checked on every request because it can change at runtime through managed settings,
+    which the ENV=prod startup checklist never sees: a token that reuses another credential's
+    value (any env), or is weak in prod, fails closed with 503 `ingest_misconfigured`."""
     token = settings.MT5_INGEST_TOKEN.get_secret_value() if settings.MT5_INGEST_TOKEN else ""
     if not token:
         raise _err(503, "ingest_disabled", "MT5 ingest is disabled (MT5_INGEST_TOKEN unset)")
+    problem = ingest_token_reuse_problem(settings)
+    if problem is None and settings.ENV is Environment.PROD:
+        problem = ingest_token_strength_problem(token)
+    if problem is not None:
+        log.error("mt5_ingest_token_misconfigured", problem=problem)
+        raise _err(503, "ingest_misconfigured", "MT5 ingest is disabled: " + problem)
     scheme, _, got = (authorization or "").partition(" ")
     match = hmac.compare_digest(got.strip().encode(), token.encode())
     if not (match and scheme.lower() == "bearer"):
@@ -120,7 +133,10 @@ async def _read_capped(request: Request, cap: int) -> bytes:
         415: {"description": "Content-Encoding other than gzip"},
         422: {"description": "not aureon.mt5.push/v1"},
         429: {"description": "too many pushes"},
-        503: {"description": "ingest disabled (MT5_INGEST_TOKEN unset) or storage unavailable"},
+        503: {
+            "description": "ingest disabled (MT5_INGEST_TOKEN unset, or misconfigured: reused "
+            "or weak) or storage unavailable"
+        },
     },
     openapi_extra={
         "requestBody": {
