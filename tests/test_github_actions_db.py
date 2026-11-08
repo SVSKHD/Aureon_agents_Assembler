@@ -681,7 +681,7 @@ async def test_worker_processes_workflow_events_and_fires_the_failure_hook(env: 
 async def test_worker_retries_then_poisons(env: ActEnv, monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
 
-    async def broken(db: Any, ev: Any) -> None:
+    async def broken(db: Any, ev: Any, settings: Any) -> None:
         calls.append(ev.delivery_id)
         await db.execute(text("INSERT INTO github.workflow_jobs (id, run_id) VALUES (1, 1)"))
         raise RuntimeError(f"handler bug {TOKEN}")
