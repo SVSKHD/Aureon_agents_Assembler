@@ -144,3 +144,40 @@ def test_login_url_is_built_safely(settings: Settings) -> None:
     )
     assert not dhan_auth.ID_RE.match("../../evil")
     assert not dhan_auth.ID_RE.match("a b c d e f g h")
+
+
+# --- one-time login handoff + log scrubbing (no DB) -------------------------------------------
+
+
+def test_login_state_is_random_and_validated() -> None:
+    from app.services import dhan_login_handoff as handoff
+
+    states = {handoff.new_state() for _ in range(200)}
+    assert len(states) == 200  # 256-bit, never repeats
+    assert all(handoff.valid_state(s) and len(s) >= 43 for s in states)
+    for bad in (None, "", "short", "x" * 65, "a" * 40 + "!", "a" * 40 + ";"):
+        assert not handoff.valid_state(bad)
+
+
+def test_login_cookie_name(settings: Settings) -> None:
+    from app.services import dhan_login_handoff as handoff
+
+    assert handoff.cookie_name(settings) == "__Secure-aureon_dhan_login"  # COOKIE_SECURE
+    plain = settings.model_copy(update={"COOKIE_SECURE": False})
+    assert handoff.cookie_name(plain) == "aureon_dhan_login"
+
+
+def test_logs_never_carry_one_time_login_ids() -> None:
+    from app.core.logging import scrub
+
+    lines = [
+        "HTTP Request: GET https://auth.dhan.co/app/consumeApp-consent?tokenId=7f3c2a10-9e8b-4d2c "
+        '"HTTP/1.1 200 OK"',
+        "GET /api/v1/dhan/auth/callback/?tokenId=7f3c2a10-9e8b-4d2c",
+        "https://auth.dhan.co/login/consentApp-login?consentAppId=940b0ca1-3ff4&x=1",
+        "/dev/settings?dhan_token_id=7f3c2a10-9e8b-4d2c",
+    ]
+    for line in lines:
+        out = scrub(line)
+        assert "7f3c2a10" not in out and "940b0ca1" not in out, out
+    assert scrub("/x?page=2&limit=5") == "/x?page=2&limit=5"  # ordinary params untouched

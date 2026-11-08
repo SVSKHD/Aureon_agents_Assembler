@@ -29,6 +29,14 @@ _API_KEY = re.compile(r"\bsk-(?:or-v1-|proj-|ant-)?[A-Za-z0-9_-]{16,}|\bAIza[0-9
 _DISCORD_WEBHOOK = re.compile(
     r"(?P<p>discord(?:app)?\.com/api/webhooks/\d+/)[A-Za-z0-9._-]+", re.IGNORECASE
 )
+# One-time login ids and tokens passed in a URL query (Dhan's consent flow: tokenId,
+# consentAppId; OAuth-style code/state/access_token). httpx logs every request URL, so the
+# server's own exchange call to Dhan would otherwise put the tokenId in the logs.
+_QUERY_SECRET = re.compile(
+    r"(?P<k>[?&](?:tokenId|token_id|dhan_token_id|consentAppId|consent_id|access_token|"
+    r"accessToken|code|state)=)[^&\s\"']+",
+    re.IGNORECASE,
+)
 _MAX_DEPTH = 6
 # Secret VALUES known to this process (core.app_settings and their .env fallbacks), replaced
 # wherever they appear: a token's shape is not always recognisable, its exact value is.
@@ -50,6 +58,7 @@ def _scrub_text(value: str) -> str:
     value = _DISCORD_WEBHOOK.sub(lambda m: f"{m['p']}{REDACTED}", value)
     value = _URL_CREDS.sub(lambda m: f"{m['scheme']}{m['user']}:{REDACTED}@", value)
     value = _BEARER.sub(lambda m: f"{m['p']}{REDACTED}", value)
+    value = _QUERY_SECRET.sub(lambda m: f"{m['k']}{REDACTED}", value)
     value = _GITHUB_TOKEN.sub(REDACTED, value)
     return _API_KEY.sub(REDACTED, value)
 

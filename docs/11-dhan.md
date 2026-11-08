@@ -38,19 +38,35 @@ secret"). It is read-only: it only obtains the data session, and there is no ord
 
 | Step | Who | What |
 | --- | --- | --- |
-| 1 | SPA → `POST /api/v1/dhan/auth/start` (admin + CSRF) | Aureon calls `POST {DHAN_AUTH_URL}/app/generate-consent?client_id=…` with the `app_id`/`app_secret` headers, records a one-time pending login for this session (Redis, 10 min), and returns the login URL |
+| 1 | SPA → `POST /api/v1/dhan/auth/start` (admin + CSRF) | Aureon calls `POST {DHAN_AUTH_URL}/app/generate-consent?client_id=…` with the `app_id`/`app_secret` headers, records a one-time pending login bound to the admin's **user** (Redis, 10 min, keyed by the hash of a random 256-bit state), sets that state as the `aureon_dhan_login` cookie (HttpOnly, Secure, `SameSite=Lax`, path `/api/v1/dhan/auth`, 10 min), and returns the login URL |
 | 2 | browser | Opens `{DHAN_AUTH_URL}/login/consentApp-login?consentAppId=…`, logs in on Dhan, and Dhan redirects it to the redirect URL with `?tokenId=…` |
-| 3 | `GET /api/v1/dhan/auth/callback` (public) | Only redirects (303) to `/dev/settings?dhan_token_id=…` |
-| 4 | SPA → `POST /api/v1/dhan/auth/consume` (admin + CSRF) | Needs the pending login from step 1 (used once). Calls `GET {DHAN_AUTH_URL}/app/consumeApp-consent?tokenId=…`. The token must be for `DHAN_CLIENT_ID`. Stores `accessToken` and `expiryTime` (IST, converted to UTC) as `DHAN_SESSION_TOKEN` / `DHAN_SESSION_EXPIRES_AT` |
+| 3 | `GET /api/v1/dhan/auth/callback` (public) | Accepts the tokenId only for a live login started from this browser (the cookie); keeps it server-side, encrypted, first callback wins; redirects (303) to `/dev/settings?dhan_login=ready`. Otherwise `?dhan_error=no_pending_login` (unsolicited), `login_expired`, `duplicate_callback` or `bad_callback` |
+| 4 | SPA → `POST /api/v1/dhan/auth/consume` (admin + CSRF) | Claims the pending login atomically and once, only for the admin who started it (even after they signed in to Spasta again). Calls `GET {DHAN_AUTH_URL}/app/consumeApp-consent?tokenId=…`. The token must be for `DHAN_CLIENT_ID`. Stores `accessToken` and `expiryTime` (IST, converted to UTC) as `DHAN_SESSION_TOKEN` / `DHAN_SESSION_EXPIRES_AT` |
 
 Why step 3 is a redirect: the return from auth.dhan.co is a cross-site navigation, and the
 session and CSRF cookies are `SameSite=Strict`, so it arrives without a session. The SPA page
 it lands on is same-origin, so its `POST` carries both.
 
-Why there is no state parameter: Dhan's flow has none. Instead, `consume` needs a login started
-from the same session in the last 10 minutes, and the token's `dhanClientId` must equal
-`DHAN_CLIENT_ID`. A crafted callback link carrying someone else's tokenId is refused
-(`403 dhan_client_mismatch`).
+Why there is no state parameter in Dhan's URL: Dhan's flow has none, so the state travels in
+the login cookie instead (`SameSite=Lax` so it rides Dhan's top-level redirect; the Spasta
+cookies are Strict and do not). The pending login is bound to the admin's user id, not the
+Spasta session: if the session expired meanwhile, the Settings page asks the admin to sign in
+again and then finishes the login (`app/services/dhan_login_handoff.py`). What is refused:
+
+| Case | Answer |
+|---|---|
+| another user presents the login cookie | `403 dhan_login_other_user`; the login stays for its owner |
+| no login started from this browser | `409 no_pending_login` (callback: `?dhan_error=no_pending_login`) |
+| older than 10 minutes | `409 login_expired` |
+| used already (replay) | `409 login_already_used` |
+| Dhan has not sent the browser back yet | `409 login_not_returned` |
+| Dhan unreachable during the exchange | `502 dhan_unavailable`, `retry: true`: the tokenId was not spent, the login is kept |
+| Dhan refuses the tokenId | `502 dhan_refused`, `retry: false`: start again |
+
+The token's `dhanClientId` must also equal `DHAN_CLIENT_ID` and pass the Profile API, so a
+tokenId from someone else's Dhan login is refused (`403 dhan_client_mismatch`). The state is
+stored only as a hash and the tokenId only encrypted; neither, nor the consent id, is ever
+returned or logged (the log scrubber also redacts `tokenId=` / `consentAppId=` in any URL).
 
 **After login:**
 
