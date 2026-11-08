@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased: DevOps monitoring for ASTRA-FRONTEND
+
+Verified repository, PR, build, deployment, runtime and notification data for the DevOps
+dashboard ([docs/32-devops-monitoring.md](docs/32-devops-monitoring.md)). No trading, risk or
+strategy code changed; no live-trading path added.
+
+### Added
+
+- **`devops` schema** (migration `0025`, additive): `repo_events`, `deployments`, `services`,
+  `service_snapshots`, `events`, `notification_prefs`, `notification_reads`. Builds reuse
+  `github.workflow_runs` / `workflow_jobs`.
+- **GitHub activity**: `pull_request`, `deployment`, `deployment_status` webhooks are
+  normalized (dedup keys shared with the backfill); workflow runs emit `build.*` transitions
+  from the webhook worker and `github_actions_sync`; `devops_backfill` job after outages,
+  stopping on a rate limit.
+- **Server deploys**: `deploy.sh` records phase timestamps, a failure reason and `health_ok`
+  only after its readiness gate; `deploy-poll.sh` passes them and the exit code to
+  `deploy_record`, which writes `devops.deployments` (succeeded only when health-verified;
+  unverified, rolled back, failed otherwise). Images carry their commit as the OCI revision.
+- **Runtime collector**: `scripts/ops/runtime-collect.sh` + systemd timer on the host, piping
+  `aureon.runtime/v1` reports into `python -m app.workers.runtime_record`; no Docker access
+  for the API.
+- **Read API** `/api/v1/devops/{overview,repositories,events,builds,deployments,services,feed}`,
+  **SSE** `/api/v1/devops/stream` with `Last-Event-ID` replay, **notifications** with
+  per-user unread counts, mark-read, preferences, repository subscriptions, failures-only.
+- Separate PR / CI / deployment / runtime status vocabularies with `UNKNOWN`.
+- `devops_purge` retention job.
+
+### Changed
+
+- The Dhan connection response model is named `DhanConnectionOut` (OpenAPI schema title only;
+  the JSON is unchanged), so GitHub's `ConnectionOut` keeps its name in generated clients.
+- UI manifest: read-only `GET /api/v1/devops/*` is not floored to `hidden` by the generic
+  "deploy" rule.
+- `deploy/sql/roles.sql` grants the new `devops` schema like the other app schemas.
+
+### Files
+
+`app/models/devops.py`, `alembic/versions/20261108_0025_devops_monitoring.py`,
+`app/services/devops.py`, `app/services/devops_read.py`, `app/schemas/devops.py`,
+`app/api/v1/devops.py`, `app/workers/runtime_record.py`, `app/workers/deploy_record.py`,
+`app/workers/scheduler.py`, `app/services/github_webhooks.py`, `app/services/github_actions.py`,
+`app/core/config.py`, `app/api/ui.py`, `app/api/router.py`, `app/api/v1/dhan_auth.py`,
+`app/models/__init__.py`, `scripts/deploy.sh`, `scripts/ops/deploy-poll.sh`,
+`scripts/ops/runtime-collect.sh`, `deploy/systemd/aureon-runtime-collect.{service,timer}`,
+`deploy/sql/roles.sql`, `Dockerfile`, `compose.yaml`, `.env.example`, docs, tests
+(`tests/test_devops_unit.py`, `tests/test_devops_db.py`, `tests/test_route_auth.py`,
+`tests/test_db_roles.py`).
+
 ## V1.6.1: concurrency, credential and deployment hardening
 
 The six V1.6.1 items (A1–A6), mapped to this repository's real components. Full mapping,

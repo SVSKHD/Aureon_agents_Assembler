@@ -11,6 +11,7 @@ from app.api.v1 import (
     audit_events,
     auth,
     code,
+    devops,
     dhan_auth,
     dhan_feed,
     finance,
@@ -59,4 +60,5 @@ api_router.include_router(app_settings.router)  # /api/v1/settings (runtime sett
 api_router.include_router(dhan_auth.router)  # /api/v1/dhan/auth (Dhan API key login)
 api_router.include_router(dhan_feed.router)  # /api/v1/dhan/feed (feed health, reconnect)
 api_router.include_router(ui_manifest.router)  # /api/v1/ui/manifest + /api/openapi.json (auth)
+api_router.include_router(devops.router)  # /api/v1/devops (DevOps dashboard, docs/32)
 api_router.include_router(system.router)  # /api/v1/system (Phase 22 integrations card)

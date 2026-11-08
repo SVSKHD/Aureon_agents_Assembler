@@ -449,6 +449,7 @@ async def test_default_jobs_and_builtin_tasks(make_env: EnvFactory) -> None:
             "paper-reconcile",
             "incident-scan",
             "approval-expire",
+            "devops-purge",  # DevOps retention (docs/32)
         }
         assert all(j["next_run_at"] for j in jobs)
         # Keep the every-minute incident scan and approval sweep out of the ticks below.

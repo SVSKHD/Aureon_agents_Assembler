@@ -25,6 +25,21 @@ record() { # best effort: never blocks or fails a deploy
     python -m app.workers.deploy_record "$@") 2>>"$LOG_FILE" | tail -n 1; } || true
 }
 
+# The `name=value` lines deploy.sh wrote, as one JSON object ("{}" when there are none, e.g. a
+# deploy script that records no phases: the record then says health was not verified).
+phases_json() {
+  [[ -s "$1" ]] || { echo '{}'; return 0; }
+  python3 -c '
+import json, sys
+out = {}
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    k, sep, v = line.rstrip("\n").partition("=")
+    if sep and k.isidentifier():
+        out[k] = v[:300]
+print(json.dumps(out)[:4000])
+' "$1" 2>/dev/null || echo '{}'
+}
+
 if [[ -e "$LOG_DIR/DEPLOY_PAUSED" ]]; then
   exit 0
 fi
@@ -54,12 +69,18 @@ for t in "${TARGETS[@]}"; do
   run_id="$(record start --target "$name" --sha "$remote" --from "${deployed:-none}" --log "$LOG_FILE")"
   [[ "$run_id" =~ ^[0-9]+$ ]] || { log "$name: deploy not recorded (recorder unavailable)"; run_id=""; }
 
+  phases_file="$LOG_DIR/.deploy-$name.phases"
+  rm -f "$phases_file" # never report a previous deploy's phases
   drc=0
   "$script" || drc=$?
+  phases_json="$(phases_json "$phases_file")"
   if ((drc == 0)); then
     log "$name: deployed ${remote:0:12}"
     rm -f "$LOG_DIR/.failed-$name"
-    if [[ -n "$run_id" ]]; then record finish --run-id "$run_id" --status succeeded >/dev/null; fi
+    if [[ -n "$run_id" ]]; then
+      record finish --run-id "$run_id" --status succeeded --exit-code 0 \
+        --phases-json "$phases_json" >/dev/null
+    fi
   else
     # deploy.sh: 1 = failed and rolled back healthy; 2 = the rollback is unhealthy too. Only
     # a healthy rollback is recorded as rolled back (the frontend script only uses 0/1).
@@ -74,7 +95,7 @@ for t in "${TARGETS[@]}"; do
     if [[ -n "$run_id" ]]; then
       record finish --run-id "$run_id" --status failed \
         --error "deploy.sh failed for ${remote:0:12} ($what); see $LOG_FILE" "${rolled[@]}" \
-        >/dev/null
+        --exit-code "$drc" --phases-json "$phases_json" >/dev/null
     fi
     rc=1
   fi

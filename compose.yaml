@@ -101,6 +101,9 @@ services:
     build:
       context: .
       target: runtime   # the last stage is the opt-in imaging worker
+      args:
+        # The commit being built, as the image's OCI revision label (scripts/deploy.sh).
+        GIT_SHA: ${AUREON_GIT_SHA:-}
     image: aureon-agentic:${IMAGE_TAG:-dev}
     container_name: aureon-api
     env_file: .env

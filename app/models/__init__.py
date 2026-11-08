@@ -11,6 +11,15 @@ from app.models.approvals import (
     ApprovalRequest,
 )
 from app.models.auth import AuditEvent, Role, User, UserSession
+from app.models.devops import (
+    Deployment,
+    DevopsEvent,
+    NotificationPrefs,
+    NotificationRead,
+    RepoEvent,
+    Service,
+    ServiceSnapshot,
+)
 from app.models.finance import FinanceAttachment, FinanceIdentity, FinanceTombstone
 from app.models.github import (
     GitHubConnection,
@@ -38,6 +47,8 @@ __all__ = [
     "ApprovalRequest",
     "AuditEvent",
     "Conversation",
+    "Deployment",
+    "DevopsEvent",
     "FinanceAttachment",
     "FinanceIdentity",
     "FinanceTombstone",
@@ -55,10 +66,15 @@ __all__ = [
     "Message",
     "ModelCall",
     "ModelInventory",
+    "NotificationPrefs",
+    "NotificationRead",
     "RepairTask",
+    "RepoEvent",
     "Review",
     "Role",
     "ScheduledJob",
+    "Service",
+    "ServiceSnapshot",
     "User",
     "UserSession",
 ]
