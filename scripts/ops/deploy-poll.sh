@@ -54,16 +54,27 @@ for t in "${TARGETS[@]}"; do
   run_id="$(record start --target "$name" --sha "$remote" --from "${deployed:-none}" --log "$LOG_FILE")"
   [[ "$run_id" =~ ^[0-9]+$ ]] || { log "$name: deploy not recorded (recorder unavailable)"; run_id=""; }
 
-  if "$script"; then
+  drc=0
+  "$script" || drc=$?
+  if ((drc == 0)); then
     log "$name: deployed ${remote:0:12}"
     rm -f "$LOG_DIR/.failed-$name"
     if [[ -n "$run_id" ]]; then record finish --run-id "$run_id" --status succeeded >/dev/null; fi
   else
-    log "$name: deploy FAILED for ${remote:0:12} (see $LOG_FILE)"
+    # deploy.sh: 1 = failed and rolled back healthy; 2 = the rollback is unhealthy too. Only
+    # a healthy rollback is recorded as rolled back (the frontend script only uses 0/1).
+    rolled=(--rolled-back)
+    what="rolled back"
+    if ((drc != 1)); then
+      rolled=()
+      what="ROLLBACK UNHEALTHY, needs a human"
+    fi
+    log "$name: deploy FAILED for ${remote:0:12}, $what (exit $drc; see $LOG_FILE)"
     echo "$remote" >"$LOG_DIR/.failed-$name"
     if [[ -n "$run_id" ]]; then
       record finish --run-id "$run_id" --status failed \
-        --error "deploy.sh failed for ${remote:0:12}; see $LOG_FILE" --rolled-back >/dev/null
+        --error "deploy.sh failed for ${remote:0:12} ($what); see $LOG_FILE" "${rolled[@]}" \
+        >/dev/null
     fi
     rc=1
   fi

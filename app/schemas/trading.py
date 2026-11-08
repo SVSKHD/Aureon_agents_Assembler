@@ -60,13 +60,26 @@ class RiskPolicyIn(BaseModel):
     max_position_size: NonNegDecimal
     max_drawdown_pct: Annotated[Decimal, Field(ge=0, le=100, decimal_places=3)]
     allowed_sessions: list[Session] = Field(min_length=1, max_length=3)
-    kill_switch: bool = False
+    # Omitted = keep the stored value (false for a new policy). Before V1.6.1 an omitted
+    # kill_switch meant false, so a PUT that only edited limits silently released it.
+    kill_switch: bool | None = None
+    # Optimistic concurrency: the `updated_at` of the policy the caller read. A mismatch is 409
+    # `stale_policy`. Required to release an engaged kill switch (true -> false), so a stale
+    # form can never undo a lock another admin set in the meantime.
+    expected_updated_at: datetime | None = None
 
     @field_validator("allowed_sessions")
     @classmethod
     def _unique(cls, v: list[Session]) -> list[Session]:
         if len(set(v)) != len(v):
             raise ValueError("allowed_sessions must not repeat")
+        return v
+
+    @field_validator("expected_updated_at")
+    @classmethod
+    def _aware(cls, v: datetime | None) -> datetime | None:
+        if v is not None and v.tzinfo is None:
+            raise ValueError("expected_updated_at needs a timezone (copy updated_at as returned)")
         return v
 
 

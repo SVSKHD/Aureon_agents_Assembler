@@ -35,15 +35,19 @@ STATES = (
 )
 
 
+# The full, final name. Wrapped in op.f() wherever Alembic takes a name: a bare string goes
+# through the "ck_%(table_name)s_%(constraint_name)s" naming convention again and becomes
+# ck_incidents_ck_incidents_source, which does not exist (0016 created it with op.f), so the
+# V1.6 version of this migration failed on every database (fixed in V1.6.1).
 INCIDENT_CHECK = "ck_incidents_source"
 OLD_SOURCES = "'exception','heartbeat','docker','actions','db','api'"
 NEW_SOURCES = OLD_SOURCES + ",'dhan'"
 
 
 def upgrade() -> None:
-    op.drop_constraint(INCIDENT_CHECK, "incidents", schema="agents", type_="check")
+    op.drop_constraint(op.f(INCIDENT_CHECK), "incidents", schema="agents", type_="check")
     op.create_check_constraint(
-        INCIDENT_CHECK, "incidents", f"source IN ({NEW_SOURCES})", schema="agents"
+        op.f(INCIDENT_CHECK), "incidents", f"source IN ({NEW_SOURCES})", schema="agents"
     )
     op.create_table(
         "connections",
@@ -103,7 +107,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("connections", schema="dhan")
-    op.drop_constraint(INCIDENT_CHECK, "incidents", schema="agents", type_="check")
+    op.drop_constraint(op.f(INCIDENT_CHECK), "incidents", schema="agents", type_="check")
     op.execute(
         f"ALTER TABLE agents.incidents ADD CONSTRAINT {INCIDENT_CHECK} "
         f"CHECK (source IN ({OLD_SOURCES})) NOT VALID"

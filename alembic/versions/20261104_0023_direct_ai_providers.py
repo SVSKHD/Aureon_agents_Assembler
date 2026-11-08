@@ -40,9 +40,17 @@ def upgrade() -> None:
     )
 
 
+# What the constraint is really called. 0020 created it with the bare NAME, which the
+# "ck_%(table_name)s_%(constraint_name)s" naming convention expanded to this; upgrade() above
+# drops/creates it through the same expansion. The raw SQL in downgrade() is not expanded, so
+# it must spell the expanded name, or 0020's downgrade cannot find the constraint (V1.6.1 fix;
+# downgrade only, every existing database keeps its constraint name).
+REAL_NAME = f"ck_conversations_{NAME}"
+
+
 def downgrade() -> None:
     op.drop_constraint(NAME, "conversations", schema="ai", type_="check")
     op.execute(
-        f"ALTER TABLE ai.conversations ADD CONSTRAINT {NAME} "
+        f"ALTER TABLE ai.conversations ADD CONSTRAINT {REAL_NAME} "
         "CHECK (provider IN ('ollama','openrouter')) NOT VALID"
     )

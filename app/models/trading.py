@@ -298,6 +298,15 @@ class OrderIntent(Base):
     created_at: Mapped[datetime] = _created()
     updated_at: Mapped[datetime] = _created()
 
+    # Compare-and-set on status (no schema change): every ORM UPDATE of an intent carries
+    # `WHERE status = <the status this session read>`, and 0 rows matched raises StaleDataError.
+    # A writer working from a stale read (a cancel committed meanwhile) can then never
+    # overwrite the newer status; app.services.paper.transition() also refuses illegal moves.
+    __mapper_args__ = {  # noqa: RUF012 (SQLAlchemy reads it once, at mapping time)
+        "version_id_col": status,
+        "version_id_generator": False,
+    }
+
 
 class BrokerOrderRow(Base):
     __tablename__ = "broker_orders"

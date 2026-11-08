@@ -41,10 +41,18 @@ GitHub (merge)                 server (pulls; nothing pushes to it)
    The profile workers are only built and updated when the server's `.env` names them in
    `COMPOSE_PROFILES` (this server: `COMPOSE_PROFILES=coding,imaging`). Without it, they keep
    running their old image after a deploy.
-4. `docker compose build`, `docker compose run --rm migrate`, `docker compose up -d`.
-5. Up to 60 s for `GET /api/health/ready` = 200 (Postgres, Redis, Ollama, HDD all ok).
-6. On failure: `:rollback` → `:dev`, `git reset --hard <previous SHA>`, `up -d`, exit 1. The
-   failed SHA is remembered (`.failed-backend`) and not retried until the next commit.
+4. `docker compose build`, `docker compose run --rm migrate` (upgrade, then it verifies the
+   recorded revision is head), then `python -m app.workers.migrate --check` (read-only; exit 3
+   = migrations pending, 4 = diverged: the database records a revision this build lacks).
+   Only then `docker compose up -d`.
+5. Up to 60 s (`DEPLOY_READY_SECONDS`) for `GET /api/health/ready` to pass twice in a row
+   (`READY_PASSES`). A pass is HTTP 200 **and** a JSON body with `"status": "ready"` and every
+   check `"ok": true`; a 2xx alone (a proxy page, a half-started app) is not a pass (V1.6.1).
+6. On failure: `:rollback` → `:dev`, `git reset --hard <previous SHA>`, `up -d`. Exit 1 when
+   the rollback is healthy again, **exit 2 when the rollback is unhealthy too** (needs a
+   human). The last-good marker (`.deployed-backend`) is only written by a promoted release.
+   The failed SHA is remembered (`.failed-backend`) and not retried until the next commit;
+   the deployer run is recorded as rolled back only for exit 1.
 
 Migrations are additive (project rule), so the previous image runs on the new schema. Deploys
 never touch Postgres data, `.env` or `TRADING_LIVE_ENABLED` / `PHASE_G_APPROVED`.

@@ -17,6 +17,7 @@ from fastapi import APIRouter, Header, HTTPException, Path, Query, Request, stat
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
 
 from app.agents.registry import effective_state
 from app.agents.research import ai as research_ai
@@ -216,6 +217,9 @@ async def change_mode(
     settings: SettingsDep,
 ) -> AccountOut:
     acct = await get_visible_account(db, admin, account_id)
+    # Lock the account row: concurrent mode changes serialize, and `old` (audited as "from")
+    # is the committed mode, not a stale read.
+    await db.refresh(acct, with_for_update=True)
     client = ClientInfo.from_request(request)
     old = acct.mode
     try:
@@ -266,14 +270,54 @@ async def get_risk_policy(account_id: uuid.UUID, db: DbSession, current: Current
     return RiskPolicyOut.model_validate(policy)
 
 
-@router.put("/accounts/{account_id}/risk-policy", response_model=RiskPolicyOut)
+@router.put(
+    "/accounts/{account_id}/risk-policy",
+    response_model=RiskPolicyOut,
+    responses={409: {"description": "stale_policy, kill_switch_release_needs_version"}},
+)
 async def put_risk_policy(
     account_id: uuid.UUID, body: RiskPolicyIn, request: Request, db: DbSession, admin: AdminRequired
 ) -> RiskPolicyOut:
+    """Create or replace the account's risk policy. Atomic: the policy row is locked
+    (SELECT ... FOR UPDATE) for the read-check-write, so two admins' PUTs serialize. An engaged
+    kill switch is only released by a PUT that names the `expected_updated_at` it read."""
     acct = await get_visible_account(db, admin, account_id)
-    policy = await risk_policy(db, acct.id)
-    values = body.model_dump()
+    admin_id = admin.user.id  # read before any rollback expires the ORM objects
+    policy = await db.scalar(
+        select(RiskPolicy)
+        .where(RiskPolicy.broker_account_id == acct.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    values = body.model_dump(exclude={"expected_updated_at"})
     values["allowed_sessions"] = [s.value for s in body.allowed_sessions]
+    if values["kill_switch"] is None:  # omitted: keep what is stored
+        values["kill_switch"] = policy.kill_switch if policy is not None else False
+    if policy is not None:
+        if body.expected_updated_at is not None and body.expected_updated_at != policy.updated_at:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "stale_policy",
+                    "detail": "the risk policy changed since it was read; reload and retry",
+                    "updated_at": policy.updated_at.isoformat(),
+                },
+            )
+        if policy.kill_switch and not values["kill_switch"] and body.expected_updated_at is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "kill_switch_release_needs_version",
+                    "detail": "releasing the kill switch needs expected_updated_at from a fresh "
+                    "read of the policy",
+                    "updated_at": policy.updated_at.isoformat(),
+                },
+            )
+    elif body.expected_updated_at is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {"code": "stale_policy", "detail": "no risk policy exists for this account yet"},
+        )
     before = RiskPolicyOut.model_validate(policy).model_dump(mode="json") if policy else None
     if policy is None:
         policy = RiskPolicy(broker_account_id=acct.id, **values)
@@ -282,15 +326,22 @@ async def put_risk_policy(
         for k, v in values.items():
             setattr(policy, k, v)
         policy.updated_at = datetime.now(UTC)
-    policy.updated_by = admin.user.id
-    await db.flush()
+    policy.updated_by = admin_id
+    try:
+        await db.flush()
+    except IntegrityError:  # two first PUTs raced on the unique account row
+        await db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {"code": "stale_policy", "detail": "the risk policy was created concurrently; retry"},
+        ) from None
     await db.refresh(policy)
     after = RiskPolicyOut.model_validate(policy).model_dump(mode="json")
     audit.record(
         db,
         "risk_policy_updated",
         ClientInfo.from_request(request),
-        actor_user_id=admin.user.id,
+        actor_user_id=admin_id,
         details={"account": str(acct.id), "before": before, "after": after},
     )
     await db.commit()

@@ -27,13 +27,14 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.exc import StaleDataError
 
 from app.agents.trading.base import BrokerAdapter
 from app.api.ui import ui_module
@@ -86,6 +87,32 @@ def _adapters(request: Request) -> dict[str, BrokerAdapter]:
 
 def _refused(exc: paper.IntentRefused) -> HTTPException:
     return HTTPException(exc.status, {"code": exc.code, "detail": exc.message})
+
+
+IntentStatus = Literal[
+    "PENDING_RISK", "REJECTED", "APPROVED", "SUBMITTED", "FILLED", "CANCELLED", "EXPIRED"
+]
+
+
+def check_expected_status(intent: OrderIntent, expected: str | None) -> None:
+    """Optional optimistic check: the caller says which status it saw; anything else is 409
+    `status_mismatch` (with the current status), and nothing changes."""
+    if expected is not None and intent.status != expected:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": "status_mismatch",
+                "detail": f"intent is {intent.status}, not {expected}",
+                "status": intent.status,
+            },
+        )
+
+
+def _conflict() -> HTTPException:
+    return HTTPException(
+        status.HTTP_409_CONFLICT,
+        {"code": "conflict", "detail": "the intent changed concurrently; reload and retry"},
+    )
 
 
 async def _visible_intent(
@@ -258,6 +285,15 @@ class IntentApproveIn(BaseModel):
     # The admin's password. With it (and a single-approval policy) the request is approved in
     # this call; without it the call only files the request (202).
     password: str | None = Field(default=None, min_length=1, max_length=1024)
+    # Optional optimistic check (409 status_mismatch when the intent is no longer in it).
+    expected_status: IntentStatus | None = None
+
+
+class IntentCancelIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Optional optimistic check (409 status_mismatch when the intent is no longer in it).
+    expected_status: IntentStatus | None = None
 
 
 async def intent_artifacts(db: Any, intent: OrderIntent) -> dict[str, dict[str, Any]]:
@@ -332,7 +368,13 @@ async def _execute_paper(ctx: ExecContext, req: ApprovalRequest) -> dict[str, An
             actor_user_id=ctx.actor_user_id,
             details={"intent": str(intent_id), "status": status_, "approval_id": str(req.id)},
         )
-        await db.commit()
+        try:
+            await db.commit()
+        except StaleDataError:  # the row lock makes this unreachable; never overwrite
+            await db.rollback()
+            raise paper.IntentRefused(
+                "conflict", "the intent changed concurrently; nothing was executed"
+            ) from None
         return {"intent_id": str(intent_id), "intent_status": status_}
 
 
@@ -393,6 +435,7 @@ async def approve_order_intent(
     risk). Otherwise 202 with the approval id, to approve from the inbox."""
     admin_id = admin.user.id  # read before any rollback expires the ORM objects
     intent = await _visible_intent(db, admin, intent_id)
+    check_expected_status(intent, body.expected_status if body is not None else None)
     client = ClientInfo.from_request(request)
     account = await db.get(BrokerAccount, intent.broker_account_id)
     refusal: paper.IntentRefused | None = None
@@ -457,11 +500,18 @@ async def approve_order_intent(
 
 @router.post("/order-intents/{intent_id}/cancel", response_model=OrderIntentDetail)
 async def cancel_order_intent(
-    intent_id: uuid.UUID, request: Request, db: DbSession, current: CsrfProtected
+    intent_id: uuid.UUID,
+    request: Request,
+    db: DbSession,
+    current: CsrfProtected,
+    body: IntentCancelIn | None = None,
 ) -> OrderIntentDetail:
+    """Cancel while still open (PENDING_RISK, APPROVED, SUBMITTED). The row is locked, so a
+    concurrent fill or expiry either happens first (409 not_open) or waits for this cancel."""
     intent = await _visible_intent(db, current, intent_id, lock=True)
     if intent.created_by != current.user.id and not is_admin(current):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "only the creator or an admin can cancel")
+    check_expected_status(intent, body.expected_status if body is not None else None)
     try:
         await paper.cancel(db, intent, current.user.id)
     except paper.IntentRefused as exc:
@@ -473,7 +523,11 @@ async def cancel_order_intent(
         actor_user_id=current.user.id,
         details={"intent": str(intent.id)},
     )
-    await db.commit()
+    try:
+        await db.commit()
+    except StaleDataError:
+        await db.rollback()
+        raise _conflict() from None
     await db.refresh(intent)
     return await _detail(db, intent)
 
