@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased: Dhan login survives a Spasta re-login
+
+The Dhan API-key login kept its one-time pending state under the Spasta session id, so when the
+admin had to sign in to Spasta again after Dhan's redirect (a new session), `POST
+/api/v1/dhan/auth/consume` answered `409 no_pending_login` (docs/11-dhan.md).
+
+### Fixed
+
+- **One-time login handoff bound to the admin, not the session**
+  (`app/services/dhan_login_handoff.py`): `/start` creates a random 256-bit state, stored in
+  Redis only as a hash (10 min) and given to the browser as an HttpOnly, Secure,
+  `SameSite=Lax` cookie scoped to `/api/v1/dhan/auth`. `/callback` keeps Dhan's tokenId
+  server-side (Fernet-encrypted, first callback wins) and redirects with `?dhan_login=ready`;
+  the tokenId is no longer put in a URL. `/consume` (still admin + CSRF) claims it atomically
+  and once (one Lua script) for the same user only.
+- Specific refusals: `dhan_login_other_user` (403, the login stays for its owner),
+  `no_pending_login`, `login_expired`, `login_already_used`, `login_not_returned`,
+  `duplicate_callback`, `token_mismatch`; `dhan_unavailable` keeps the login so it can be
+  retried (`retry: true`).
+- The log scrubber redacts `tokenId=`, `consentAppId=` and similar one-time ids in any URL:
+  httpx logged the server's own exchange call to Dhan with the tokenId.
+
+Unchanged: client id check, Profile API verification, encrypted session storage, audit events.
+
+### Files
+
+`app/services/dhan_login_handoff.py` (new), `app/api/v1/dhan_auth.py`, `app/core/logging.py`,
+`docs/11-dhan.md`, `tests/test_dhan_auth_db.py`, `tests/test_dhan_auth.py`.
+
 ## Unreleased: DevOps monitoring for ASTRA-FRONTEND
 
 Verified repository, PR, build, deployment, runtime and notification data for the DevOps

@@ -1,9 +1,10 @@
 """Dhan API key login against Postgres + Redis with Dhan mocked (app/api/v1/dhan_auth.py).
 
 Fixtures follow https://dhanhq.co/docs/v2/authentication/ (generate-consent, consentApp-login,
-consumeApp-consent). What must hold: admin + CSRF, a login started from this session, the
-configured client id, the token stored encrypted and never returned, audited without values,
-used by the Dhan adapter at once, logout falls back to the manual token.
+consumeApp-consent). What must hold: admin + CSRF, a login started by this admin from this
+browser (the one-time login handoff, which survives a Spasta re-login), the configured client
+id, the token stored encrypted and never returned, audited without values, used by the Dhan
+adapter at once, logout falls back to the manual token.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from pydantic import SecretStr
 from app.core.config import Settings, set_effective_settings
 from app.core.logging import register_secret_values
 from app.services import app_settings as svc
+from app.services import dhan_auth as dhan_svc
+from app.services import dhan_login_handoff as handoff
 from tests import test_finance_db
 from tests.test_finance_db import Env, EnvFactory
 
@@ -74,8 +77,11 @@ class FakeDhan:
         profile_status: int = 200,
         profile_client: str | None = None,
         valid_tokens: tuple[str, ...] = (ACCESS, MANUAL),
+        consume_fails: str | None = None,
     ) -> None:
         self.calls: list[httpx.Request] = []
+        # "network" (Dhan unreachable) or "refuse" (Dhan answers 400) on consumeApp-consent.
+        self.consume_fails = consume_fails
         self.client_id = client_id
         self.secret = secret
         self.profile_status = profile_status
@@ -130,6 +136,10 @@ class FakeDhan:
                 },
             )
         if req.url.path == "/app/consumeApp-consent" and req.method == "GET":
+            if self.consume_fails == "network":
+                raise httpx.ConnectError("dhan down", request=req)
+            if self.consume_fails == "refuse":
+                return httpx.Response(400, json={"error": "token already used " + TOKEN_ID})
             assert req.url.params["tokenId"] == TOKEN_ID
             return httpx.Response(
                 200,
@@ -154,8 +164,72 @@ async def _audit(env: Env) -> str:
     return json.dumps([list(r) for r in rows])
 
 
-async def test_full_login_stores_encrypted_session_and_uses_it(make_env: EnvFactory) -> None:
+def _login_cookie(env: Env, who: str = "admin") -> str | None:
+    name = handoff.cookie_name(env.app.state.settings)
+    for c in env.clients[who].cookies.jar:
+        if c.name == name:
+            return c.value
+    return None
+
+
+async def dhan_returns(
+    env: Env, who: str = "admin", token: str = TOKEN_ID, state: str | None = "own"
+) -> httpx.Response:
+    """Dhan sends the browser back: a cross-site navigation, so only the Lax login cookie
+    rides along (the Spasta session cookies are SameSite=Strict)."""
+    name = handoff.cookie_name(env.app.state.settings)
+    value = _login_cookie(env, who) if state == "own" else state
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=env.app), base_url="https://test",
+        cookies={name: value} if value else None,
+    ) as browser:  # fmt: skip
+        return await browser.get(f"{URL}/callback/", params={"tokenId": token})
+
+
+def _watch_logs(caplog: pytest.LogCaptureFixture) -> None:
+    """create_app() replaces the root handlers (configure_logging): re-attach the capture."""
+    import logging
+
+    root = logging.getLogger()
+    if caplog.handler not in root.handlers:
+        root.addHandler(caplog.handler)
+    caplog.set_level(logging.INFO)
+
+
+def _assert_logs_scrubbed(caplog: pytest.LogCaptureFixture, secrets: tuple[str, ...]) -> None:
+    """httpx logs every request URL, including the server's exchange call to Dhan
+    (`consumeApp-consent?tokenId=...`). What the log handler writes is the record after
+    app.core.logging's scrubber: no secret may survive it."""
+    from app.core.logging import scrub
+
+    lines = [r.getMessage() for r in caplog.records]
+    assert any("consumeApp-consent" in line for line in lines)  # the exchange was logged
+    for line in lines:
+        written = scrub(line)
+        for secret in secrets:
+            assert secret not in written, written
+
+
+async def consume(env: Env, who: str = "admin", **body: Any) -> httpx.Response:
+    r: httpx.Response = await env.send(who, "POST", f"{URL}/consume", json=body or None)
+    return r
+
+
+async def relogin(env: Env, who: str = "admin") -> None:
+    """Sign in to Spasta again in the same browser: a NEW session (and CSRF token)."""
+    email = "admin@spasta.online" if who == "admin" else f"{who}@spasta.online"
+    r = await env.clients[who].post(
+        "/api/auth/login", json={"email": email, "password": test_finance_db.PASSWORD}
+    )
+    assert r.status_code == 200, r.text
+    env.csrf[who] = r.json()["csrf_token"]
+
+
+async def test_full_login_stores_encrypted_session_and_uses_it(
+    make_env: EnvFactory, caplog: pytest.LogCaptureFixture
+) -> None:
     async with make_env() as env:
+        _watch_logs(caplog)
         fake = FakeDhan()
         _install(env, fake)
         r = await env.send("admin", "POST", f"{URL}/start")
@@ -163,18 +237,29 @@ async def test_full_login_stores_encrypted_session_and_uses_it(make_env: EnvFact
         assert r.json()["login_url"] == (f"{AUTH}/login/consentApp-login?consentAppId={CONSENT}")
         assert API_SECRET not in r.text and API_KEY not in r.text
 
-        # Dhan sends the browser back (cross-site, no cookies): just a redirect to the SPA.
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=env.app), base_url="https://test"
-        ) as anon:
-            cb = await anon.get(f"{URL}/callback/", params={"tokenId": TOKEN_ID})
-            assert cb.status_code == 303
-            assert cb.headers["location"] == f"/dev/settings?dhan_token_id={TOKEN_ID}"
-            assert cb.headers["cache-control"] == "no-store"
-            bad = await anon.get(f"{URL}/callback", params={"tokenId": "<script>"})
-            assert bad.headers["location"] == "/dev/settings?dhan_error=bad_callback"
+        # The one-time login cookie: HttpOnly, Lax (rides Dhan's redirect), scoped, short.
+        setc = r.headers["set-cookie"]
+        assert "HttpOnly" in setc and "SameSite=lax" in setc and "Secure" in setc
+        assert "Path=/api/v1/dhan/auth" in setc and "Max-Age=600" in setc
+        state = _login_cookie(env)
+        assert state and len(state) >= 43
 
-        r = await env.send("admin", "POST", f"{URL}/consume", json={"token_id": TOKEN_ID})
+        # Dhan sends the browser back: the tokenId stays on the server.
+        cb = await dhan_returns(env)
+        assert cb.status_code == 303
+        assert cb.headers["location"] == "/dev/settings?dhan_login=ready"
+        assert TOKEN_ID not in cb.headers["location"]
+        assert cb.headers["cache-control"] == "no-store"
+        bad = await dhan_returns(env, token="<script>")
+        assert bad.headers["location"] == "/dev/settings?dhan_error=bad_callback"
+        # In Redis: the state only hashed, the tokenId only encrypted.
+        redis = env.app.state.redis
+        keys = [k.decode() for k in await redis.keys("dhan:auth:handoff:*")]
+        assert len(keys) == 1 and state not in keys[0]
+        stored = (await redis.get(keys[0])).decode()
+        assert TOKEN_ID not in stored and state not in stored
+
+        r = await consume(env)
         assert r.status_code == 200, r.text
         body = r.json()
         assert ACCESS not in r.text
@@ -200,30 +285,162 @@ async def test_full_login_stores_encrypted_session_and_uses_it(make_env: EnvFact
         assert item["managed"] and item["source"] == "db" and item["expires_at"]
         assert ACCESS not in s.text and API_SECRET not in s.text
 
+        assert _login_cookie(env) is None  # cleared once used
         events = await _audit(env)
         assert "dhan_login_started" in events and "dhan_login_completed" in events
-        for secret in (ACCESS, API_KEY, API_SECRET, TOKEN_ID):
+        for secret in (ACCESS, API_KEY, API_SECRET, TOKEN_ID, CONSENT, state):
             assert secret not in events
+        _assert_logs_scrubbed(caplog, (ACCESS, API_KEY, API_SECRET, TOKEN_ID, CONSENT, state))
 
 
-async def test_consume_needs_a_login_started_from_this_session(make_env: EnvFactory) -> None:
+async def test_unsolicited_callbacks_and_consumes_are_refused(make_env: EnvFactory) -> None:
+    async with make_env() as env:
+        fake = FakeDhan()
+        _install(env, fake)
+        # A callback with no login started from this browser.
+        cb = await dhan_returns(env, state=None)
+        assert cb.headers["location"] == "/dev/settings?dhan_error=no_pending_login"
+        # A forged / unknown state.
+        cb = await dhan_returns(env, state=handoff.new_state())
+        assert cb.headers["location"] == "/dev/settings?dhan_error=login_expired"
+        r = await consume(env, token_id=TOKEN_ID)
+        assert r.status_code == 409 and r.json()["detail"]["code"] == "no_pending_login"
+        # Started, but Dhan has not sent the browser back yet.
+        await env.send("admin", "POST", f"{URL}/start")
+        r = await consume(env)
+        assert r.status_code == 409 and r.json()["detail"]["code"] == "login_not_returned"
+        assert (await env.sql("SELECT count(*) FROM core.app_settings"))[0][0] == 0
+        assert not any("consumeApp-consent" in str(c.url) for c in fake.calls)
+
+
+async def test_login_survives_a_spasta_relogin_by_the_same_admin(make_env: EnvFactory) -> None:
+    """The reported bug: callback, Spasta says 401, the admin signs in again, consume = 409."""
     async with make_env() as env:
         _install(env, FakeDhan())
-        r = await env.send("admin", "POST", f"{URL}/consume", json={"token_id": TOKEN_ID})
-        assert r.status_code == 409 and r.json()["detail"]["code"] == "no_pending_login"
-        # One-time: a second consume after a successful one is refused too.
+        assert (await env.send("admin", "POST", f"{URL}/start")).status_code == 200
+        assert (await dhan_returns(env)).headers["location"].endswith("dhan_login=ready")
+        # The Spasta session expires meanwhile.
+        await env.sql("UPDATE core.sessions SET expires_at = now() - interval '1 minute'")
+        r = await consume(env)
+        assert r.status_code == 401  # admin authentication is not weakened
+        await relogin(env)
+        r = await consume(env)
+        assert r.status_code == 200, r.text
+        assert r.json()["source"] == "session"
+        assert "dhan_login_completed" in await _audit(env)
+
+
+async def test_another_user_cannot_claim_the_login(make_env: EnvFactory) -> None:
+    async with make_env() as env:
+        _install(env, FakeDhan())
+        await env.sql("UPDATE core.users SET role_id = 1 WHERE email = 'a@spasta.online'")
         await env.send("admin", "POST", f"{URL}/start")
-        assert (await env.send("admin", "POST", f"{URL}/consume",
-                               json={"token_id": TOKEN_ID})).status_code == 200  # fmt: skip
-        r = await env.send("admin", "POST", f"{URL}/consume", json={"token_id": TOKEN_ID})
+        await dhan_returns(env)
+        # Another admin presents the stolen / shared login cookie.
+        name = handoff.cookie_name(env.app.state.settings)
+        state = _login_cookie(env)
+        assert state
+        env.clients["a"].cookies.set(name, state, domain="test.local", path="/api/v1/dhan/auth")
+        r = await consume(env, who="a")
+        assert r.status_code == 403 and r.json()["detail"]["code"] == "dhan_login_other_user"
+        assert (await env.sql("SELECT count(*) FROM core.app_settings"))[0][0] == 0
+        assert "dhan_login_other_user" in await _audit(env)
+        # The admin who started it can still finish it.
+        r = await consume(env)
+        assert r.status_code == 200, r.text
+
+
+async def test_expired_login(make_env: EnvFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    async with make_env() as env:
+        _install(env, FakeDhan())
+        monkeypatch.setattr(dhan_svc, "CONSENT_TTL_S", 1)
+        await env.send("admin", "POST", f"{URL}/start")
+        import asyncio
+
+        await asyncio.sleep(1.3)
+        cb = await dhan_returns(env)
+        assert cb.headers["location"] == "/dev/settings?dhan_error=login_expired"
+        r = await consume(env)
         assert r.status_code == 409
+        assert r.json()["detail"]["code"] in ("login_expired", "no_pending_login")
+        # Expired after Dhan returned, before the admin finished.
+        monkeypatch.setattr(dhan_svc, "CONSENT_TTL_S", 2)
+        await env.send("admin", "POST", f"{URL}/start")
+        assert (await dhan_returns(env)).headers["location"].endswith("dhan_login=ready")
+        await asyncio.sleep(2.3)
+        r = await consume(env)
+        # The browser drops the cookie when it expires with the login; a client that kept it
+        # gets login_expired. Either way nothing is exchanged.
+        assert r.status_code == 409
+        assert r.json()["detail"]["code"] in ("login_expired", "no_pending_login")
+        name = handoff.cookie_name(env.app.state.settings)
+        env.clients["admin"].cookies.set(name, handoff.new_state(), domain="test.local",
+                                         path="/api/v1/dhan/auth")  # fmt: skip
+        r = await consume(env)
+        assert r.status_code == 409 and r.json()["detail"]["code"] == "login_expired"
+        assert (await env.sql("SELECT count(*) FROM core.app_settings"))[0][0] == 0
+
+
+async def test_duplicate_consumption_and_callbacks(make_env: EnvFactory) -> None:
+    async with make_env() as env:
+        fake = FakeDhan()
+        _install(env, fake)
+        await env.send("admin", "POST", f"{URL}/start")
+        state = _login_cookie(env)
+        assert (await dhan_returns(env)).headers["location"].endswith("dhan_login=ready")
+        # The same callback again is harmless; a different tokenId for this login is refused.
+        assert (await dhan_returns(env)).headers["location"].endswith("dhan_login=ready")
+        other = await dhan_returns(env, token="0" * 36)
+        assert other.headers["location"] == "/dev/settings?dhan_error=duplicate_callback"
+        # A tokenId in the body must be the one Dhan returned (older pages still send it).
+        assert (await consume(env, token_id=TOKEN_ID)).status_code == 200
+        # Replay with the old cookie (the response cleared it; an attacker could have kept it).
+        name = handoff.cookie_name(env.app.state.settings)
+        assert state
+        env.clients["admin"].cookies.set(name, state, domain="test.local", path="/api/v1/dhan/auth")
+        r = await consume(env)
+        assert r.status_code == 409 and r.json()["detail"]["code"] == "login_already_used"
+        consumes = [c for c in fake.calls if "consumeApp-consent" in str(c.url)]
+        assert len(consumes) == 1  # Dhan was asked exactly once
+
+
+async def test_dhan_api_failures(make_env: EnvFactory, caplog: pytest.LogCaptureFixture) -> None:
+    async with make_env() as env:
+        _watch_logs(caplog)
+        fake = FakeDhan(consume_fails="network")
+        _install(env, fake)
+        await env.send("admin", "POST", f"{URL}/start")
+        await dhan_returns(env)
+        # Dhan unreachable: the tokenId was not spent, so the login can be retried.
+        r = await consume(env)
+        assert r.status_code == 502
+        assert r.json()["detail"] == {"code": "dhan_unavailable", "detail": "could not reach Dhan",
+                                      "retry": True}  # fmt: skip
+        fake.consume_fails = None
+        r = await consume(env)
+        assert r.status_code == 200, r.text
+
+        # Dhan refuses the tokenId: final, the handoff is spent and nothing is stored.
+        await env.send("admin", "DELETE", f"{URL}/session")
+        fake.consume_fails = "refuse"
+        await env.send("admin", "POST", f"{URL}/start")
+        await dhan_returns(env)
+        r = await consume(env)
+        assert r.status_code == 502 and r.json()["detail"]["code"] == "dhan_refused"
+        assert r.json()["detail"]["retry"] is False and TOKEN_ID not in r.text
+        assert (await consume(env)).status_code == 409
+        assert (await env.sql("SELECT count(*) FROM core.app_settings"))[0][0] == 0
+        events = await _audit(env)
+        assert "dhan_login_failed" in events and TOKEN_ID not in events
+        _assert_logs_scrubbed(caplog, (ACCESS, TOKEN_ID))
 
 
 async def test_token_for_another_client_id_is_refused(make_env: EnvFactory) -> None:
     async with make_env() as env:
         _install(env, FakeDhan(client_id="9999999999"))
         await env.send("admin", "POST", f"{URL}/start")
-        r = await env.send("admin", "POST", f"{URL}/consume", json={"token_id": TOKEN_ID})
+        await dhan_returns(env)
+        r = await consume(env)
         assert r.status_code == 403 and r.json()["detail"]["code"] == "dhan_client_mismatch"
         assert ACCESS not in r.text
         assert (await env.sql("SELECT count(*) FROM core.app_settings"))[0][0] == 0
@@ -261,7 +478,8 @@ async def test_logout_falls_back_to_the_manual_token(make_env: EnvFactory) -> No
     async with make_env() as env:
         _install(env, FakeDhan())
         await env.send("admin", "POST", f"{URL}/start")
-        await env.send("admin", "POST", f"{URL}/consume", json={"token_id": TOKEN_ID})
+        await dhan_returns(env)
+        assert (await consume(env)).status_code == 200
         r = await env.send("admin", "DELETE", f"{URL}/session")
         assert r.status_code == 200 and r.json()["source"] == "manual"
         assert (await env.sql("SELECT count(*) FROM core.app_settings"))[0][0] == 0

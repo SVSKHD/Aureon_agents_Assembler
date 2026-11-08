@@ -1,8 +1,10 @@
 """Dhan API key login: /api/v1/dhan/auth (docs/11-dhan.md, "Log in with the API key").
 
-    POST   /start            admin+CSRF  -> {login_url}: Dhan's consent login page
-    GET    /callback?tokenId=  public     -> 303 to the Settings page, which POSTs /consume
-    POST   /consume          admin+CSRF  {token_id} -> exchanges it, stores the session
+    POST   /start            admin+CSRF  -> {login_url}: Dhan's consent login page; sets the
+                                         one-time login cookie (app/services/dhan_login_handoff.py)
+    GET    /callback?tokenId=  public     -> keeps the tokenId server-side for that login, then
+                                         303 to the Settings page (?dhan_login=ready)
+    POST   /consume          admin+CSRF  -> exchanges it, stores the session
     GET    /status           signed in   -> session state (no token)
     GET    /connection       signed in   -> persisted connection state (dhan.connections)
     POST   /verify           admin+CSRF  -> verify the credential in use (GET /profile) now
@@ -18,10 +20,15 @@ auth.dhan.co, a cross-site navigation, and the session/CSRF cookies are SameSite
 that request arrives without a session. The SPA page it lands on is same-origin, so its POST
 /consume carries the session and the CSRF header.
 
-State check: Dhan's flow has no state parameter, so /start records a one-time pending consent
-for THIS session (Redis, 10 min) and /consume needs it (GETDEL). The exchanged token must also
-belong to the configured DHAN_CLIENT_ID, so a tokenId from a crafted link (someone else's Dhan
-login) is refused. Every step is audited without values; no Dhan body is ever returned.
+State check: Dhan's flow has no state parameter, so /start creates a random one-time state
+bound to the admin's USER id (Redis, 10 min) and hands it to the browser as an HttpOnly,
+SameSite=Lax cookie scoped to /api/v1/dhan/auth. The callback accepts a tokenId only for a live
+state from that cookie; /consume claims it atomically, once, and only for the same user. So the
+login survives the admin signing in to Spasta again (a new session id), while another user, a
+replay, an expired login or an unsolicited callback is refused. The exchanged token must also
+belong to the configured DHAN_CLIENT_ID (and pass the Profile API), so a tokenId from someone
+else's Dhan login is refused. Every step is audited without values; no Dhan body, state,
+tokenId or consent id is ever returned or logged.
 Read-only: this only obtains the data session; there is no order code anywhere.
 """
 
@@ -32,7 +39,7 @@ from typing import Literal
 
 import httpx
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -45,6 +52,7 @@ from app.services import app_settings as svc
 from app.services import app_settings_runtime, audit
 from app.services import dhan_auth as dhan
 from app.services import dhan_connection as conn
+from app.services import dhan_login_handoff as handoff
 from app.services.audit import ClientInfo
 
 log = structlog.get_logger(__name__)
@@ -66,7 +74,9 @@ class StartOut(BaseModel):
 
 class ConsumeIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    token_id: str = Field(min_length=8, max_length=256)
+    # Optional: the callback keeps the tokenId server-side now. When sent (older pages), it
+    # must equal the one Dhan returned for this login.
+    token_id: str | None = Field(default=None, min_length=8, max_length=256)
 
 
 class StatusOut(BaseModel):
@@ -113,8 +123,45 @@ def _error(exc: dhan.DhanAuthError) -> HTTPException:
     return HTTPException(exc.status, {"code": exc.code, "detail": exc.detail})
 
 
-def _pending_key(admin: AdminRequired) -> str:
-    return f"dhan:auth:pending:{admin.session.id}"
+# How long a claimed login is remembered as "used" (so a replay says so, not "expired").
+USED_TTL_S = 24 * 3600
+
+# What the browser is told when the callback cannot be used (?dhan_error=<code>).
+CALLBACK_ERRORS = {
+    "missing": "login_expired",
+    "duplicate": "duplicate_callback",
+}
+
+
+def _login_cookie(response: Response, settings: Settings, state: str | None) -> None:
+    """Set (state) or clear (None) the one-time login cookie."""
+    name = handoff.cookie_name(settings)
+    if state is None:
+        response.delete_cookie(
+            name, path=handoff.COOKIE_PATH, secure=settings.COOKIE_SECURE, httponly=True,
+            samesite="lax",
+        )  # fmt: skip
+        return
+    response.set_cookie(
+        name, state, max_age=dhan.CONSENT_TTL_S, path=handoff.COOKIE_PATH,
+        secure=settings.COOKIE_SECURE, httponly=True, samesite="lax",
+    )  # fmt: skip
+
+
+def _cleared_cookie_header(settings: Settings) -> dict[str, str]:
+    r = Response()
+    _login_cookie(r, settings, None)
+    return {"set-cookie": r.headers["set-cookie"]}
+
+
+def _refusal(
+    status: int, code: str, detail: str, settings: Settings, *, clear: bool
+) -> HTTPException:
+    return HTTPException(
+        status,
+        {"code": code, "detail": detail},
+        headers=_cleared_cookie_header(settings) if clear else None,
+    )
 
 
 def _transport(request: Request) -> httpx.AsyncBaseTransport | None:
@@ -154,7 +201,9 @@ async def start_limited(request: Request, admin: AdminRequired) -> None:
 
 
 @router.post("/start", response_model=StartOut, dependencies=[Depends(start_limited)])
-async def start(request: Request, admin: AdminRequired, db: DbSession) -> StartOut:
+async def start(
+    request: Request, response: Response, admin: AdminRequired, db: DbSession
+) -> StartOut:
     """Ask Dhan for a consent and return the login page the browser should open."""
     settings: Settings = request.app.state.settings
     if svc.cipher_for(request.app.state.env_settings) is None:
@@ -168,7 +217,13 @@ async def start(request: Request, admin: AdminRequired, db: DbSession) -> StartO
         except dhan.DhanAuthError as exc:
             log.warning("dhan_login_start_failed", code=exc.code)
             raise _error(exc) from None
-    await request.app.state.redis.set(_pending_key(admin), "1", ex=dhan.CONSENT_TTL_S)
+    try:
+        state = await handoff.begin(request.app.state.redis, str(admin.user.id), dhan.CONSENT_TTL_S)
+    except Exception as exc:  # Redis down: the login could not be finished, so do not start
+        raise HTTPException(
+            503, {"code": "unavailable", "detail": "Dhan login is unavailable"}
+        ) from exc
+    _login_cookie(response, settings, state)
     audit.record(
         db,
         "dhan_login_started",
@@ -182,59 +237,144 @@ async def start(request: Request, admin: AdminRequired, db: DbSession) -> StartO
 
 @router.get("/callback", include_in_schema=False)
 @router.get("/callback/", include_in_schema=False)  # Dhan appends "/?tokenId=…"
-async def callback(token_id: str | None = Query(default=None, alias="tokenId")) -> RedirectResponse:
-    """Where Dhan sends the browser. Does nothing but hand the tokenId to the SPA page (see
-    the module docstring); a malformed or missing one becomes an error flag instead."""
-    if token_id and dhan.ID_RE.match(token_id):
-        target = f"{SETTINGS_PAGE}?dhan_token_id={token_id}"
+async def callback(
+    request: Request,
+    token_id: str | None = Query(default=None, alias="tokenId"),
+) -> RedirectResponse:
+    """Where Dhan sends the browser (cross-site: no Spasta session). It only accepts a tokenId
+    for a login THIS browser started (the login cookie) that is still pending, keeps it
+    server-side (encrypted), and sends the browser to the Settings page, which finishes the
+    login once the admin is signed in. The tokenId never appears in a URL we create."""
+    settings: Settings = request.app.state.settings
+    state = request.cookies.get(handoff.cookie_name(settings))
+    error: str | None = None
+    clear = False
+    if not (token_id and dhan.ID_RE.match(token_id)):
+        error = "bad_callback"
+    elif not handoff.valid_state(state):
+        error = "no_pending_login"  # unsolicited: no login was started from this browser
     else:
-        target = f"{SETTINGS_PAGE}?dhan_error=bad_callback"
+        cipher = svc.cipher_for(request.app.state.env_settings)
+        if cipher is None:
+            error = "settings_key_missing"
+        else:
+            try:
+                result = await handoff.record_return(
+                    request.app.state.redis, cipher, str(state), token_id
+                )
+            except Exception:
+                result = None
+            if result is None:
+                error = "unavailable"
+            elif result in CALLBACK_ERRORS:
+                error = CALLBACK_ERRORS[result]
+                clear = result == "missing"
+    log.info("dhan_login_callback", outcome=error or "ready")
+    target = f"{SETTINGS_PAGE}?dhan_error={error}" if error else f"{SETTINGS_PAGE}?dhan_login=ready"
     resp = RedirectResponse(target, status_code=303)
     resp.headers["Cache-Control"] = "no-store"
     resp.headers["Referrer-Policy"] = "no-referrer"
+    if clear:
+        _login_cookie(resp, settings, None)
     return resp
 
 
 @router.post("/consume", response_model=StatusOut)
 async def consume(
-    body: ConsumeIn, request: Request, admin: AdminRequired, db: DbSession
+    request: Request,
+    response: Response,
+    admin: AdminRequired,
+    db: DbSession,
+    body: ConsumeIn | None = None,
 ) -> StatusOut:
-    """Exchange the tokenId for the session token and store it (encrypted)."""
+    """Finish the login this admin started: claim the tokenId Dhan returned (once, for this
+    user only), exchange it for the session token and store it (encrypted). Works after the
+    admin signed in to Spasta again: the login is bound to the user, not the session."""
+    settings: Settings = request.app.state.settings
     redis = request.app.state.redis
-    try:
-        pending = await redis.getdel(_pending_key(admin))
-    except Exception as exc:
-        raise HTTPException(
-            503, {"code": "unavailable", "detail": "Dhan login is unavailable"}
-        ) from exc
-    if not pending:
-        raise HTTPException(
-            409,
-            {
-                "code": "no_pending_login",
-                "detail": "no Dhan login was started from this session (or it timed out)",
-            },
-        )
+    client = ClientInfo.from_request(request)
+    state = request.cookies.get(handoff.cookie_name(settings))
+    if not handoff.valid_state(state):
+        raise _refusal(
+            409, "no_pending_login",
+            "no Dhan login was started from this browser; start it again", settings, clear=False,
+        )  # fmt: skip
     cipher = svc.cipher_for(request.app.state.env_settings)
     if cipher is None:
         raise HTTPException(
             503, {"code": "settings_key_missing", "detail": "SETTINGS_MASTER_KEY is not set"}
         )
-    settings: Settings = request.app.state.settings
+    try:
+        claimed = await handoff.claim(redis, cipher, str(state), str(admin.user.id), USED_TTL_S)
+    except Exception as exc:
+        raise HTTPException(
+            503, {"code": "unavailable", "detail": "Dhan login is unavailable"}
+        ) from exc
+
+    def refused(code: str) -> None:
+        log.warning("dhan_login_consume_refused", code=code)
+        audit.record(db, "dhan_login_failed", client, actor_user_id=admin.user.id,
+                     details={"code": code, "step": "handoff"})  # fmt: skip
+
+    if claimed == "other_user":
+        refused("dhan_login_other_user")
+        await db.commit()
+        # The pending login stays for the admin who started it; this user cannot claim it.
+        raise _refusal(
+            403, "dhan_login_other_user",
+            "this Dhan login was started by another account; sign in as that admin to finish it",
+            settings, clear=False,
+        )  # fmt: skip
+    if claimed == "not_returned":
+        raise _refusal(
+            409, "login_not_returned",
+            "Dhan has not sent this login back yet; finish it on Dhan's page", settings,
+            clear=False,
+        )  # fmt: skip
+    if claimed == "used":
+        refused("login_already_used")
+        await db.commit()
+        raise _refusal(
+            409, "login_already_used", "this Dhan login was already completed", settings,
+            clear=True,
+        )  # fmt: skip
+    if claimed == "missing":
+        raise _refusal(
+            409, "login_expired", "the Dhan login timed out; start it again", settings,
+            clear=True,
+        )  # fmt: skip
+    assert isinstance(claimed, handoff.Claimed)
+    if body is not None and body.token_id is not None and body.token_id != claimed.token_id:
+        refused("token_mismatch")
+        await db.commit()
+        raise _refusal(
+            409, "token_mismatch", "that is not the login Dhan returned; start it again",
+            settings, clear=True,
+        )  # fmt: skip
     async with _http(request) as http:
         try:
-            session = await dhan.consume_consent(settings, http, body.token_id)
+            session = await dhan.consume_consent(settings, http, claimed.token_id)
         except dhan.DhanAuthError as exc:
             log.warning("dhan_login_consume_failed", code=exc.code)
+            retry = False
+            if exc.code == "dhan_unavailable":  # never reached Dhan: the tokenId is unspent
+                try:
+                    retry = await handoff.restore(redis, str(state), claimed)
+                except Exception:
+                    retry = False
             audit.record(
                 db,
                 "dhan_login_failed",
-                ClientInfo.from_request(request),
+                client,
                 actor_user_id=admin.user.id,
-                details={"code": exc.code},
+                details={"code": exc.code, "retry": retry},
             )
             await db.commit()
-            raise _error(exc) from None
+            raise HTTPException(
+                exc.status,
+                {"code": exc.code, "detail": exc.detail, "retry": retry},
+                headers=None if retry else _cleared_cookie_header(settings),
+            ) from None
     # Before storing: ask Dhan's Profile API whose token this is. Refused or foreign = never
     # stored; Dhan unreachable = stored as unverified (the scheduled check finishes it).
     verified = await conn.verify_token(
@@ -259,7 +399,11 @@ async def consume(
             details={"code": refusal.code, "step": "profile"},
         )
         await db.commit()
-        raise _error(refusal)
+        raise HTTPException(
+            refusal.status,
+            {"code": refusal.code, "detail": refusal.detail},
+            headers=_cleared_cookie_header(settings),
+        )
     await dhan.store_session(db, cipher, session, admin.user.id)
     await conn.mark_login(db, settings, verified, session.expires_at, admin.user.id)
     audit.record(
@@ -278,6 +422,7 @@ async def consume(
     await svc.publish(redis, list(dhan.SESSION_KEYS))
     out = StatusOut.model_validate(dhan.status(request.app.state.settings))
     out.verification = "ok" if verified.outcome == "ok" else "unavailable"
+    _login_cookie(response, settings, None)
     return out
 
 
