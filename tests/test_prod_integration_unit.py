@@ -79,6 +79,9 @@ def test_mt5_routes_are_read_only(settings: Settings) -> None:
         ("GET", "/api/trading/mt5/failures"),
         ("GET", "/api/trading/mt5/strategy"),
         ("GET", "/api/trading/mt5/report"),
+        # Aureon V1.6.3 (docs/34): the Windows collector uploads broker deal history into OUR
+        # database (collector bearer token); nothing is sent to the bot or MT5.
+        ("POST", "/api/v1/ingest/mt5_deals"),
     }
 
 
