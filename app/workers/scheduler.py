@@ -52,6 +52,7 @@ from app.services import (
     alerts,
     app_settings,
     audit,
+    devops,
     dhan_connection,
     dhan_monitor,
     dhan_sync,
@@ -323,6 +324,26 @@ async def github_actions_sync(ctx: TaskContext) -> dict[str, Any]:
     return out
 
 
+async def devops_backfill(ctx: TaskContext) -> dict[str, Any]:
+    """Recent PRs and GitHub deployments of the allowlisted repos -> devops.* (fills what the
+    webhooks missed during an outage; idempotent). Actions runs: github_actions_sync."""
+    client = ctx.github
+    if client is None:
+        raise RuntimeError("GitHub is not configured (GITHUB_TOKEN)")
+    if await AgentRegistry(ctx.maker).is_paused(GITHUB.id):
+        return {"skipped": "github agent is paused"}
+    out = await devops.backfill(ctx.maker, client, ctx.settings)
+    if out["errors"] and not out["pr_events"] and not out["deployments"]:
+        raise RuntimeError(f"DevOps backfill failed: {'; '.join(out['errors'][:5])}")
+    return out
+
+
+async def devops_purge(ctx: TaskContext) -> dict[str, Any]:
+    """DevOps retention: feed + repo events, collector snapshots, old deployment records."""
+    async with ctx.maker() as db, db.begin():
+        return await devops.purge(db, ctx.settings)
+
+
 async def incident_scan(ctx: TaskContext) -> dict[str, Any]:
     """Incident detection + safe recovery / escalation (docs/21-self-repair.md). Each probe
     runs even when another fails; a failing probe fails the run after the rest are done."""
@@ -401,6 +422,8 @@ TASKS: dict[str, TaskFn] = {
     "incident_scan": incident_scan,
     "approval_expire": approval_expire,
     "alerts_dispatch": alerts_dispatch,
+    "devops_backfill": devops_backfill,
+    "devops_purge": devops_purge,
 }
 
 # (id, task, cron) — created if missing; an admin's later edits (pause etc.) are kept.
@@ -445,11 +468,15 @@ def default_jobs(settings: Settings) -> list[tuple[str, str, str]]:
         jobs.append(("mt5-ingest-purge", "mt5_ingest_purge", settings.MT5_INGEST_PURGE_CRON))
     if settings.NEWS_FEED_URLS:
         jobs.append(("news-pull", "news_pull", settings.NEWS_PULL_CRON))
+    if settings.DEVOPS_PURGE_CRON:
+        jobs.append(("devops-purge", "devops_purge", settings.DEVOPS_PURGE_CRON))
     if settings.github_configured:
         jobs.append(("github-sync", "github_sync", settings.GITHUB_SYNC_CRON))
         jobs.append(
             ("github-actions-sync", "github_actions_sync", settings.GITHUB_ACTIONS_SYNC_CRON)
         )
+        if settings.DEVOPS_BACKFILL_CRON:
+            jobs.append(("devops-backfill", "devops_backfill", settings.DEVOPS_BACKFILL_CRON))
     return jobs
 
 

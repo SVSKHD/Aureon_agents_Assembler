@@ -501,6 +501,34 @@ class Settings(BaseSettings):
         }
     )
 
+    # --- DevOps monitoring (docs/32-devops-monitoring.md) ---
+    # Environment name recorded for host deploys (deploy_record) unless --environment is given.
+    DEVOPS_ENVIRONMENT: str = Field(default="production", min_length=1, max_length=100)
+    # Recent GitHub activity re-read from the API after an outage (PRs and deployments per
+    # repo); Actions runs are backfilled by github_actions_sync.
+    DEVOPS_BACKFILL_CRON: str = "*/15 * * * *"
+    DEVOPS_BACKFILL_PER_REPO: int = Field(default=30, ge=1, le=100)
+    DEVOPS_BACKFILL_MAX_REPOS: int = Field(default=20, ge=1, le=200)
+    # Feed events (build.*, pr.merged, ...) are only created for facts this recent, so a first
+    # backfill does not flood the feed with history.
+    DEVOPS_EVENT_MAX_AGE_HOURS: int = Field(default=48, ge=1, le=24 * 90)
+    # Retention (the devops_purge job): feed events + repo events, collector snapshots,
+    # deployment records.
+    DEVOPS_PURGE_CRON: str = "41 3 * * *"
+    DEVOPS_RETENTION_DAYS: int = Field(default=90, ge=1, le=3650)
+    DEVOPS_SNAPSHOT_RETENTION_DAYS: int = Field(default=7, ge=1, le=365)
+    DEVOPS_DEPLOYMENT_RETENTION_DAYS: int = Field(default=365, ge=1, le=3650)
+    # A service the host collector has not reported for this long reads as UNKNOWN.
+    DEVOPS_RUNTIME_STALE_SECONDS: float = Field(default=180.0, ge=30)
+    # Compose services that are expected to exit (exit 0 = healthy).
+    DEVOPS_ONESHOT_SERVICES: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["mount-check", "migrate"]
+    )
+    # Live feed (GET /api/v1/devops/stream).
+    DEVOPS_STREAM_POLL_SECONDS: float = Field(default=2.0, gt=0, le=60)
+    DEVOPS_STREAM_HEARTBEAT_SECONDS: float = Field(default=15.0, gt=0, le=300)
+    DEVOPS_STREAM_MAX_SECONDS: float = Field(default=3600.0, ge=10, le=24 * 3600)
+
     # --- Approval gate (docs/19-github-issues-prs.md; grown by the Phase 20 engine). ---
     # A pending approval request expires this many minutes after it was created.
     APPROVALS_TTL_MINUTES: int = Field(default=30, ge=1, le=24 * 60)
@@ -905,6 +933,7 @@ class Settings(BaseSettings):
         "AI_EXTERNAL_FALLBACK_PROVIDERS",
         "CF_ACCESS_AUD",
         "CF_ACCESS_BYPASS_PATHS",
+        "DEVOPS_ONESHOT_SERVICES",
         mode="before",
     )
     @classmethod

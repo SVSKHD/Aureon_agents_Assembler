@@ -193,13 +193,13 @@ async def test_role_attributes_and_ownership(cluster: Cluster) -> None:
     owners = _psql(
         cluster.admin,
         "SELECT DISTINCT nspowner::regrole FROM pg_namespace WHERE nspname IN "
-        "('core','ai','agents','trading','dhan','mt5','github','audit','spasta')",
+        "('core','ai','agents','trading','dhan','mt5','github','devops','audit','spasta')",
     )
     assert owners == r["migrator"]
     tables = _psql(
         cluster.admin,
         "SELECT DISTINCT tableowner FROM pg_tables WHERE schemaname IN "
-        "('core','ai','agents','trading','dhan','mt5','github','audit')",
+        "('core','ai','agents','trading','dhan','mt5','github','devops','audit')",
     )
     assert tables == r["migrator"]
     # spasta: created empty and documented.

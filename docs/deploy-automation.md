@@ -54,6 +54,9 @@ GitHub (merge)                 server (pulls; nothing pushes to it)
    The failed SHA is remembered (`.failed-backend`) and not retried until the next commit;
    the deployer run is recorded as rolled back only for exit 1.
 
+Every deploy is also recorded for the DevOps dashboard with its phase timestamps, health
+verification and rollback outcome (`.deploy-backend.phases`, docs/32-devops-monitoring.md).
+
 Migrations are additive (project rule), so the previous image runs on the new schema. Deploys
 never touch Postgres data, `.env` or `TRADING_LIVE_ENABLED` / `PHASE_G_APPROVED`.
 

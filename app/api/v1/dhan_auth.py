@@ -84,7 +84,7 @@ class StatusOut(BaseModel):
     verification: Literal["ok", "unavailable"] | None = None
 
 
-class ConnectionOut(BaseModel):
+class DhanConnectionOut(BaseModel):
     """dhan.connections, safe fields only (docs/28-dhan-operations.md)."""
 
     client_id: str | None
@@ -127,10 +127,10 @@ def _http(request: Request) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=_transport(request))
 
 
-async def _connection(db: DbSession, settings: Settings) -> ConnectionOut:
+async def _connection(db: DbSession, settings: Settings) -> DhanConnectionOut:
     cid = (settings.DHAN_CLIENT_ID or "").strip()
     row = await db.get(DhanConnection, cid) if cid else None
-    return ConnectionOut.model_validate(conn.view(row, settings))
+    return DhanConnectionOut.model_validate(conn.view(row, settings))
 
 
 async def start_limited(request: Request, admin: AdminRequired) -> None:
@@ -310,8 +310,8 @@ async def logout(request: Request, admin: AdminRequired, db: DbSession) -> Statu
     return StatusOut.model_validate(dhan.status(request.app.state.settings))
 
 
-@router.get("/connection", response_model=ConnectionOut)
-async def connection(request: Request, db: DbSession, _: Current) -> ConnectionOut:
+@router.get("/connection", response_model=DhanConnectionOut)
+async def connection(request: Request, db: DbSession, _: Current) -> DhanConnectionOut:
     """The persisted connection state: verified when, by which source, what to do next."""
     return await _connection(db, request.app.state.settings)
 
@@ -336,8 +336,8 @@ async def verify_limited(request: Request, admin: AdminRequired) -> None:
         ) from exc
 
 
-@router.post("/verify", response_model=ConnectionOut, dependencies=[Depends(verify_limited)])
-async def verify(request: Request, admin: AdminRequired, db: DbSession) -> ConnectionOut:
+@router.post("/verify", response_model=DhanConnectionOut, dependencies=[Depends(verify_limited)])
+async def verify(request: Request, admin: AdminRequired, db: DbSession) -> DhanConnectionOut:
     """Verify the credential every Dhan call uses right now (one GET /profile) and store the
     result. Dhan being unreachable is a 200 with `last_check_outcome: unavailable`: the
     previous verdict is kept, never downgraded."""

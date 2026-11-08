@@ -39,6 +39,7 @@ from app.core.config import Settings
 from app.core.logging import get_logger
 from app.integrations.github.redact import redact, redact_obj
 from app.models.github import GitHubConnection, GitHubRepository, GitHubWebhookEvent
+from app.services import devops
 from app.services import github as gh
 from app.services import github_actions as actions
 
@@ -47,7 +48,18 @@ log = get_logger("services.github_webhooks")
 QUEUE_KEY = "github:webhooks"
 REJECTED_KEY = "github:webhooks:rejected"
 QUEUE_MAX = 10_000  # the list is trimmed; anything dropped is still found by the DB scan
-HANDLED = frozenset({"workflow_run", "workflow_job", "pull_request", "issues", "push", "ping"})
+HANDLED = frozenset(
+    {
+        "workflow_run",
+        "workflow_job",
+        "pull_request",
+        "issues",
+        "push",
+        "ping",
+        "deployment",
+        "deployment_status",
+    }
+)
 EVENT_RE = re.compile(r"^[a-z_]{1,64}$")
 DELIVERY_RE = re.compile(r"^[A-Za-z0-9-]{1,100}$")
 MAX_BACKOFF_SECONDS = 3600
@@ -65,7 +77,17 @@ HEAVY_KEYS = (
     "installation",
     "repository",
 )
-KEEP_KEYS = ("action", "repository", "workflow_run", "workflow_job", "ref", "number", "zen")
+KEEP_KEYS = (
+    "action",
+    "repository",
+    "workflow_run",
+    "workflow_job",
+    "deployment",
+    "deployment_status",
+    "ref",
+    "number",
+    "zen",
+)
 _SUMMARY_FIELDS = (
     "id",
     "number",
@@ -288,7 +310,9 @@ def _obj(payload: dict[str, Any], key: str) -> dict[str, Any]:
     return v
 
 
-async def _handle(db: AsyncSession, ev: GitHubWebhookEvent) -> WorkflowFailure | None:
+async def _handle(
+    db: AsyncSession, ev: GitHubWebhookEvent, settings: Settings
+) -> WorkflowFailure | None:
     p = ev.payload or {}
     full = ev.repo or repo_of(p)
     if ev.event == "workflow_run":
@@ -296,7 +320,9 @@ async def _handle(db: AsyncSession, ev: GitHubWebhookEvent) -> WorkflowFailure |
             raise WebhookPayloadError("payload has no repository")
         run = _obj(p, "workflow_run")
         values = actions.run_values(full, run)
-        await actions.upsert_run(db, values)
+        stored = await actions.upsert_run(db, values)
+        if stored is not None:  # applied (not an older, out-of-order delivery)
+            await devops.on_workflow_run(db, settings, stored)
         if p.get("action") == "completed" and values["conclusion"] in actions.FAILED_CONCLUSIONS:
             return WorkflowFailure(
                 delivery_id=ev.delivery_id,
@@ -324,7 +350,22 @@ async def _handle(db: AsyncSession, ev: GitHubWebhookEvent) -> WorkflowFailure |
             .where(func.lower(GitHubRepository.full_name) == full.lower())
             .values(pushed_at=func.now())
         )
-    # pull_request, issues, ping: recorded only (the stored event is the record).
+    elif ev.event == "pull_request" and full:
+        pr = p.get("pull_request")
+        if isinstance(pr, dict):
+            action = p.get("action")
+            await devops.on_pull_request(
+                db, settings, full, pr, action if isinstance(action, str) else None,
+                delivery_id=ev.delivery_id,
+            )  # fmt: skip
+    elif ev.event in ("deployment", "deployment_status") and full:
+        dep = _obj(p, "deployment")
+        status = p.get("deployment_status") if ev.event == "deployment_status" else None
+        await devops.on_github_deployment(
+            db, settings, full, dep, status if isinstance(status, dict) else None,
+            delivery_id=ev.delivery_id,
+        )  # fmt: skip
+    # issues, ping: recorded only (the stored event is the record).
     return None
 
 
@@ -383,7 +424,7 @@ async def process_next(
         error: str | None = None
         try:
             async with db.begin_nested():
-                failure = await _handle(db, ev)
+                failure = await _handle(db, ev, settings)
         except Exception as exc:
             error = _error_text(exc)
             failure = None

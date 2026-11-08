@@ -1,0 +1,20 @@
+# Host runtime collector (docs/32-devops-monitoring.md): docker compose ps / inspect + the
+# API readiness -> devops.services. Read-only towards Docker. Triggered every minute.
+# Install: sudo cp deploy/systemd/aureon-runtime-collect.{service,timer} /etc/systemd/system/
+#          sudo systemctl daemon-reload && sudo systemctl enable --now aureon-runtime-collect.timer
+[Unit]
+Description=Aureon runtime collector (compose services -> DevOps dashboard)
+Documentation=file:///opt/private-ai/aureon/docs/32-devops-monitoring.md
+Requires=docker.service
+After=docker.service aureon.service
+RequiresMountsFor=/mnt/spasta-data
+
+[Service]
+Type=oneshot
+User=svskhd8
+Group=docker
+WorkingDirectory=/opt/private-ai/aureon
+Environment=HOME=/home/svskhd8
+ExecStart=/opt/private-ai/aureon/scripts/ops/runtime-collect.sh
+TimeoutStartSec=120
+Nice=10

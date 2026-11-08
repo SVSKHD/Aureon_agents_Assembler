@@ -41,6 +41,7 @@ from app.models.approvals import ApprovalRequest
 from app.models.github import GitHubRepository, GitHubWorkflowJob, GitHubWorkflowRun
 from app.schemas.github_actions import ActionOut, JobOut, RunOut, StepOut, WorkflowOut
 from app.schemas.github_ops import ListPage
+from app.services import devops
 from app.services import github as gh
 from app.services import github_ops as ops
 from app.services.approvals import (
@@ -638,21 +639,38 @@ def job_values(full: str | None, j: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def upsert_run(db: AsyncSession, values: dict[str, Any]) -> None:
-    """Insert or update; an older `updated_at` (an out-of-order event) never overwrites."""
+async def upsert_run(db: AsyncSession, values: dict[str, Any]) -> dict[str, Any] | None:
+    """Insert or update; an older `updated_at` (an out-of-order event) never overwrites.
+    Returns the stored row when this data was applied, None when it was older (DevOps feed
+    events are only derived from applied state)."""
     t = GitHubWorkflowRun
     ins = insert(t).values(**values, synced_at=func.now())
-    await db.execute(
-        ins.on_conflict_do_update(
-            index_elements=[t.id],
-            set_={k: ins.excluded[k] for k in values if k != "id"} | {"synced_at": func.now()},
-            where=or_(
-                t.updated_at.is_(None),
-                ins.excluded.updated_at.is_(None),
-                ins.excluded.updated_at >= t.updated_at,
-            ),
+    row = (
+        await db.execute(
+            ins.on_conflict_do_update(
+                index_elements=[t.id],
+                set_={k: ins.excluded[k] for k in values if k != "id"} | {"synced_at": func.now()},
+                where=or_(
+                    t.updated_at.is_(None),
+                    ins.excluded.updated_at.is_(None),
+                    ins.excluded.updated_at >= t.updated_at,
+                ),
+            ).returning(
+                t.id,
+                t.repo,
+                t.name,
+                t.branch,
+                t.head_sha,
+                t.status,
+                t.conclusion,
+                t.run_attempt,
+                t.html_url,
+                t.updated_at,
+                t.event,
+            )
         )
-    )
+    ).first()
+    return dict(row._mapping) if row is not None else None
 
 
 async def upsert_job(db: AsyncSession, values: dict[str, Any]) -> None:
@@ -710,7 +728,9 @@ async def sync_actions(
         runs = [r for r in data.get("workflow_runs") or [] if isinstance(r, dict) and "id" in r]
         async with maker() as db, db.begin():
             for r in runs:
-                await upsert_run(db, run_values(full, r))
+                stored = await upsert_run(db, run_values(full, r))
+                if stored is not None:  # gaps the webhooks missed reach the DevOps feed too
+                    await devops.on_workflow_run(db, settings, stored)
         upserted += len(runs)
     log.info("github_actions_sync", repos=len(repos), runs=upserted, errors=len(errors))
     return {"repos": len(repos), "runs_upserted": upserted, "skipped": skipped, "errors": errors}

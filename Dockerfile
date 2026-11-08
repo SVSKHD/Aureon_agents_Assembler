@@ -10,6 +10,10 @@ RUN pip install .
 
 FROM python:3.12-slim AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PATH=/opt/venv/bin:$PATH
+# The commit this image was built from (scripts/deploy.sh passes AUREON_GIT_SHA). The host
+# runtime collector reports it per service (docs/32-devops-monitoring.md). Empty = unknown.
+ARG GIT_SHA=""
+LABEL org.opencontainers.image.revision=$GIT_SHA
 # Proxies whose X-Forwarded-For uvicorn trusts (login rate limits key on client IP).
 # Override in .env with the Docker bridge gateway Nginx connects from (see deploy/README.md).
 ENV FORWARDED_ALLOW_IPS=127.0.0.1
