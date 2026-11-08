@@ -82,10 +82,11 @@ def test_ci_rows_and_status_mapping() -> None:
 
 
 class FakeDb:
-    """Answers the two list queries in order and the login lookup."""
+    """Answers the list queries in order (deploy runs, the recorded deployments
+    of those runs: none here, then CI runs) and the login lookup."""
 
     def __init__(self, deploys: list[AgentRun], runs: list[GitHubWorkflowRun]) -> None:
-        self.answers: list[list[Any]] = [deploys, runs]
+        self.answers: list[list[Any]] = [deploys, [], runs]
 
     async def scalars(self, _stmt: Any) -> Any:
         rows = self.answers.pop(0)
@@ -114,6 +115,6 @@ async def test_one_timeline_newest_first_and_allowlisted(settings: Settings) -> 
 async def test_limit_and_kind_filter(settings: Settings) -> None:
     s = settings.model_copy(update={"GITHUB_ALLOWED_OWNERS": ["svskhd"]})
     db = FakeDb([], [ci(n, T0 + timedelta(minutes=n)) for n in reversed(range(5))])  # DB order
-    db.answers = [db.answers[1]]  # kind=ci: only the runs query is made
+    db.answers = [db.answers[2]]  # kind=ci: only the runs query is made
     out = await mon.monitor(db, s, limit=2, kind="ci")  # type: ignore[arg-type]
     assert [i.id for i in out.items] == ["ci:4", "ci:3"]
