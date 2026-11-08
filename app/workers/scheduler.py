@@ -402,6 +402,60 @@ async def alerts_dispatch(ctx: TaskContext) -> dict[str, Any]:
     return await alerts.dispatch(ctx.maker, ctx.settings, ctx.redis)
 
 
+async def aureon_tick(ctx: TaskContext) -> dict[str, Any]:
+    """Aureon V1.6.3 scheduler + detector + signal queue, once (docs/34-aureon-v163.md). Never
+    touches MT5: it requests collector jobs and reads what the Windows box uploads."""
+    from app.aureon import scheduler as aureon_scheduler
+
+    out = await aureon_scheduler.tick(ctx.maker)
+    return {k: v for k, v in out.items() if k != "new_signals"} | {
+        "new_signals": len(out.get("new_signals") or [])
+    }
+
+
+async def aureon_alerts(ctx: TaskContext) -> dict[str, Any]:
+    """Deliver the Aureon alert queue (aureon.alerts) to DISCORD_WEBHOOK_URL."""
+    from app.aureon import alerter as aureon_alerter
+
+    http = ctx.http or httpx.AsyncClient(timeout=10)
+    try:
+        return await aureon_alerter.deliver_pending(ctx.maker, ctx.settings, http)
+    finally:
+        if ctx.http is None:
+            await http.aclose()
+
+
+async def aureon_weekend_review(ctx: TaskContext) -> dict[str, Any]:
+    """Advance RUNNING weekend reviews; on a closed weekend start last week's (read-only)."""
+    from app.aureon import weekend_review
+
+    out = await weekend_review.auto(ctx.maker)
+    return {"reviews": [{k: v for k, v in r.items() if k not in ("summary", "files")} for r in out]}
+
+
+async def aureon_weekly_review(ctx: TaskContext) -> dict[str, Any]:
+    """The Sunday review (aureon.weekly_review): verify job, hypothetical outcomes, decisions."""
+    from app.aureon import sunday_review
+
+    return await sunday_review.run(ctx.maker)
+
+
+async def aureon_verify(ctx: TaskContext) -> dict[str, Any]:
+    """Nightly: replay the last 7 days and list live signals the replay does not reproduce."""
+    from app.aureon import alerter as aureon_alerter
+    from app.aureon import detector as aureon_detector
+
+    async with ctx.maker() as s, s.begin():
+        bad = await aureon_detector.verify_last_days(s, 7)
+        if bad:
+            await aureon_alerter.post(
+                s,
+                f"⚠️ detector verify: {len(bad)} live signal(s) not reproduced by the replay",
+                key=f"verify-mismatch:{datetime.now(UTC):%Y%m%d}",
+            )
+    return {"mismatches": len(bad)}
+
+
 TASKS: dict[str, TaskFn] = {
     "purge_agent_history": purge_agent_history,
     "purge_expired_sessions": purge_expired_sessions,
@@ -424,6 +478,11 @@ TASKS: dict[str, TaskFn] = {
     "alerts_dispatch": alerts_dispatch,
     "devops_backfill": devops_backfill,
     "devops_purge": devops_purge,
+    "aureon_tick": aureon_tick,
+    "aureon_alerts": aureon_alerts,
+    "aureon_weekend_review": aureon_weekend_review,
+    "aureon_weekly_review": aureon_weekly_review,
+    "aureon_verify": aureon_verify,
 }
 
 # (id, task, cron) — created if missing; an admin's later edits (pause etc.) are kept.
@@ -470,6 +529,14 @@ def default_jobs(settings: Settings) -> list[tuple[str, str, str]]:
         jobs.append(("news-pull", "news_pull", settings.NEWS_PULL_CRON))
     if settings.DEVOPS_PURGE_CRON:
         jobs.append(("devops-purge", "devops_purge", settings.DEVOPS_PURGE_CRON))
+    if settings.AUREON_WORKERS_ENABLED:
+        jobs += [
+            ("aureon-tick", "aureon_tick", settings.AUREON_TICK_CRON),
+            ("aureon-alerts", "aureon_alerts", settings.AUREON_ALERTS_CRON),
+            ("aureon-weekend-review", "aureon_weekend_review", settings.AUREON_WEEKEND_REVIEW_CRON),
+            ("aureon-weekly-review", "aureon_weekly_review", settings.AUREON_WEEKLY_REVIEW_CRON),
+            ("aureon-verify", "aureon_verify", settings.AUREON_VERIFY_CRON),
+        ]
     if settings.github_configured:
         jobs.append(("github-sync", "github_sync", settings.GITHUB_SYNC_CRON))
         jobs.append(

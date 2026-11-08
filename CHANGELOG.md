@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased: Aureon V1.6.3 database API and workers
+
+The Assembler serves the V1.6.3 Windows box (`STORE_MODE=api`) and runs V1.6.3's Linux-side
+work itself ([docs/34-aureon-v163.md](docs/34-aureon-v163.md)). No MT5 access or order execution
+on the Assembler; no strategy change.
+
+### Added
+
+- Schema `aureon` (migration `0027`, additive, IF NOT EXISTS, grants mirrored, downgrade refuses
+  while it holds data): V1.6.3 tables 001-004 + resumable review phases, stored report files,
+  `mt5_deals.server`, queue/lookup indexes.
+- `/api/v1/ingest/*` (collector, guard, service), the V1.6.3 reads, decisions, admin risk clear,
+  admin review run, report files, `aureon/healthz|readyz` — exact V1.6.3 paths, bodies,
+  validation and status codes; role bearer tokens `AUREON_API_*_TOKEN` (constant-time, least
+  privilege, rate-limited, body-limited, audited in `aureon.api_audit`; admin actions also in
+  `audit.audit_events`); prod refuses weak or reused tokens; Cloudflare Access exempts exactly
+  these machine routes.
+- Scheduler tasks (`AUREON_WORKERS_ENABLED`): detector, scheduler state machine with durable
+  backfill ack and gap `backfill_range` jobs, watchdog, Discord delivery of `aureon.alerts`,
+  signal queue (fail closed on risk), nightly verify, Sunday review, weekend auto-replay with
+  coverage, recovery jobs, deal history, matching, JSON/HTML/CSV reports.
+- Strategy and matching code copied verbatim from V1.6.3 (`indicators`, `matcher`,
+  `build_positions`, R3.0 rules).
+
+### Fixed (vs V1.6.3's own server)
+
+- Accepts four requests the V1.6.3 client sends and V1.6.3's server rejected: trade event
+  `close_sent`, `status=open` with `exit_reason=null`, heartbeat `DEGRADED`/`FAILED`, bar source
+  `backfill`.
+
+### Tests
+
+- `tests/test_aureon_unit.py`, `tests/test_aureon_db.py`, and
+  `tests/test_aureon_client_compat.py`, which drives the unmodified V1.6.3 collector and guard
+  against the Assembler over HTTP (MetaTrader5 faked).
+
 ## Unreleased: live deploy progress
 
 Stage-by-stage progress of backend and frontend deploys on the Spasta Deploys and CI card

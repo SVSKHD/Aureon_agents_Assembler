@@ -55,7 +55,16 @@ include = ["app*"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-extend-exclude = ["alembic/versions"]
+# Aureon V1.6.3 code kept byte-for-byte as shipped (docs/34): the strategy modules the
+# Assembler runs, and the Windows client the compatibility test drives. Not reformatted, so a
+# diff against the V1.6.3 package stays empty.
+extend-exclude = [
+    "alembic/versions",
+    "app/aureon/indicators.py",
+    "app/aureon/matcher.py",
+    "app/aureon/positions.py",
+    "tests/fixtures/aureon_v163",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "S", "ASYNC", "RUF"]
@@ -63,12 +72,24 @@ ignore = ["S101"]  # asserts are fine in tests
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S", "B"]
+# Aureon V1.6.3 ports: operator messages, report text and SQL kept as V1.6.3 wrote them.
+"app/aureon/*.py" = ["E501", "RUF001", "RUF002", "RUF003", "UP031"]
+"tests/test_aureon_*.py" = ["S", "B", "E501", "RUF001"]
 
 [tool.mypy]
 python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy"]
-exclude = ["alembic/versions/"]
+exclude = ["alembic/versions/", "tests/fixtures/aureon_v163/"]
+
+[[tool.mypy.overrides]]
+# Aureon V1.6.3 strategy code, kept byte-for-byte as shipped (untyped, see docs/34).
+module = ["app.aureon.indicators", "app.aureon.matcher", "app.aureon.positions"]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = ["app.aureon.weekend_review", "app.aureon.sunday_review", "app.aureon.detector"]
+disallow_untyped_calls = false
 
 [[tool.mypy.overrides]]
 module = ["asyncpg.*"]

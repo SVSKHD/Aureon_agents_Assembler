@@ -9,6 +9,7 @@ from app.api.v1 import (
     app_settings,
     approvals,
     audit_events,
+    aureon_v163,
     auth,
     code,
     devops,
@@ -62,3 +63,5 @@ api_router.include_router(dhan_feed.router)  # /api/v1/dhan/feed (feed health, r
 api_router.include_router(ui_manifest.router)  # /api/v1/ui/manifest + /api/openapi.json (auth)
 api_router.include_router(devops.router)  # /api/v1/devops (DevOps dashboard, docs/32)
 api_router.include_router(system.router)  # /api/v1/system (Phase 22 integrations card)
+# /api/v1/ingest/* + the V1.6.3 reads (role bearer tokens, docs/34)
+api_router.include_router(aureon_v163.router)
