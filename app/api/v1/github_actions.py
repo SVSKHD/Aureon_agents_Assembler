@@ -10,6 +10,8 @@ outside the allowlist are 404 and GitHub is not called for them.
     POST …/{owner}/{repo}/actions/workflows/{workflow}/dispatch   {ref, inputs}
     POST …/{owner}/{repo}/actions/runs/{run_id}/rerun | /rerun-failed | /cancel
     GET  /api/v1/github/actions/monitor   ?limit&kind&repo   deploys + CI runs, one timeline
+    GET  /api/v1/github/actions/monitor/deploys/{run_id}/progress   stages of one deploy
+    GET  /api/v1/github/actions/monitor/deploys/{run_id}/logs       its log (scrubbed)
 
 Dispatch and re-run need GITHUB_DISPATCH_ALLOWLIST (else 403). Production workflows answer
 202 with an approval request (nothing sent to GitHub until approved); the others answer
@@ -31,6 +33,8 @@ from app.auth.deps import AdminRequired, DbSession, SettingsDep
 from app.integrations.github.logs import LogArchiveError, SanitizedLog
 from app.schemas.github_actions import (
     ActionOut,
+    DeployLogOut,
+    DeployProgressOut,
     DispatchRequest,
     JobOut,
     MonitorOut,
@@ -194,3 +198,29 @@ async def monitor(
     """Host deploys (`deployer` agent runs) and GitHub Actions CI runs, newest first. DB only:
     never calls GitHub (the webhook worker and the sync job keep the runs fresh)."""
     return await actions_monitor.monitor(db, settings, limit=limit, kind=kind, repo=repo)
+
+
+DeployRunId = Annotated[int, Path(ge=1, le=2**63 - 1)]
+
+
+@router.get("/actions/monitor/deploys/{run_id}/progress", response_model=DeployProgressOut)
+async def deploy_progress(
+    run_id: DeployRunId, _: AdminRequired, db: DbSession, settings: SettingsDep
+) -> DeployProgressOut:
+    """One host deploy (the monitor's `deploy:<run_id>`) stage by stage, as the deploy script
+    reported it: pending, running, succeeded, failed or skipped per stage, with timings, the
+    expected vs deployed commit and whether it was verified. Read-only, DB only."""
+    out = await actions_monitor.progress(db, settings, run_id)
+    if out is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no progress recorded for this deploy")
+    return out
+
+
+@router.get("/actions/monitor/deploys/{run_id}/logs", response_model=DeployLogOut)
+async def deploy_logs(run_id: DeployRunId, _: AdminRequired, db: DbSession) -> DeployLogOut:
+    """This deploy's own log lines (newest kept, scrubbed of secrets before they were
+    stored). Updated with every progress report while the deploy runs."""
+    out = await actions_monitor.deploy_log(db, run_id)
+    if out is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no log recorded for this deploy")
+    return out

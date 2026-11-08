@@ -20,8 +20,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.models.agents import AgentRun
+from app.models.devops import Deployment
 from app.models.github import GitHubConnection, GitHubWorkflowRun
-from app.schemas.github_actions import MonitorItemOut, MonitorOut
+from app.schemas.github_actions import (
+    DeployLogOut,
+    DeployProgressOut,
+    DeployStageOut,
+    MonitorItemOut,
+    MonitorOut,
+)
+from app.services import deploy_progress
 from app.services import github as gh
 
 DEPLOYER_ID = "deployer"
@@ -102,6 +110,108 @@ def ci_item(run: GitHubWorkflowRun) -> MonitorItemOut:
     )
 
 
+# devops.deployments.status -> the monitor's status words (a deploy is "success" only once it
+# was recorded as finished with a health verification).
+DEPLOY_STATUS = {
+    "running": "running",
+    "succeeded": "success",
+    "unverified": "unverified",
+    "failed": "failure",
+    "rolled_back": "failure",
+    "unknown": "unknown",
+}
+OUTCOME = {
+    "running": "running",
+    "succeeded": "completed",
+    "unverified": "unverified",
+    "failed": "failed",
+    "rolled_back": "rolled_back",
+}
+
+
+async def _deployments(db: AsyncSession, run_ids: list[int]) -> dict[int, Deployment]:
+    if not run_ids:
+        return {}
+    rows = (
+        await db.scalars(
+            select(Deployment).where(
+                Deployment.source == "server", Deployment.agent_run_id.in_(run_ids)
+            )
+        )
+    ).all()
+    return {r.agent_run_id: r for r in rows if r.agent_run_id is not None}
+
+
+async def _enrich(
+    db: AsyncSession, settings: Settings, it: MonitorItemOut, dep: Deployment
+) -> None:
+    v = await deploy_progress.view(db, settings, dep)
+    it.status = DEPLOY_STATUS.get(dep.status, it.status)
+    it.rolled_back = dep.rolled_back or dep.status == "rolled_back"
+    it.sha = dep.deployed_sha or it.sha
+    it.stage = v["current_stage"]
+    it.stale = v["stale"]
+    it.stages_completed, it.stages_total = v["completed"], v["total"]
+    if dep.failure_reason and dep.status != "running":
+        it.error = dep.failure_reason
+
+
+async def deploy_row(db: AsyncSession, run_id: int) -> tuple[AgentRun, Deployment] | None:
+    run = await db.get(AgentRun, run_id)
+    if run is None or run.agent_id != DEPLOYER_ID:
+        return None
+    dep = (await _deployments(db, [run_id])).get(run_id)
+    return (run, dep) if dep is not None else None
+
+
+async def progress(db: AsyncSession, settings: Settings, run_id: int) -> DeployProgressOut | None:
+    found = await deploy_row(db, run_id)
+    if found is None:
+        return None
+    _, dep = found
+    v = await deploy_progress.view(db, settings, dep)
+    return DeployProgressOut(
+        run_id=run_id,
+        deployment_id=dep.id,
+        target=dep.target,
+        repo=dep.repo,
+        branch=dep.branch,
+        environment=dep.environment,
+        expected_sha=dep.sha,
+        deployed_sha=dep.deployed_sha,
+        previous_sha=dep.previous_sha,
+        commit_verified=v["commit_verified"],
+        pr_number=dep.pr_number,
+        outcome=OUTCOME.get(dep.status, "unknown"),
+        health_verified_at=dep.health_verified_at,
+        rolled_back=dep.rolled_back or dep.status == "rolled_back",
+        failure_reason=dep.failure_reason,
+        started_at=dep.started_at,
+        finished_at=dep.finished_at,
+        updated_at=dep.progress_at,
+        stale=v["stale"],
+        current_stage=v["current_stage"],
+        stages_completed=v["completed"],
+        stages_total=v["total"],
+        stages=[DeployStageOut.model_validate(x) for x in v["stages"]],
+        log_available=bool(dep.log_tail),
+    )
+
+
+async def deploy_log(db: AsyncSession, run_id: int) -> DeployLogOut | None:
+    found = await deploy_row(db, run_id)
+    if found is None:
+        return None
+    _, dep = found
+    return DeployLogOut(
+        run_id=run_id,
+        text=dep.log_tail or "",
+        truncated=dep.log_truncated,
+        updated_at=dep.progress_at,
+        running=dep.status == "running",
+    )
+
+
 async def _login(db: AsyncSession) -> str | None:
     return await db.scalar(
         select(GitHubConnection.login)
@@ -130,8 +240,12 @@ async def monitor(
                 .limit(limit)
             )
         ).all()
+        deps = await _deployments(db, [r.id for r in runs])
         for r in runs:
             it = deploy_item(settings, r)
+            dep = deps.get(r.id)
+            if dep is not None:
+                await _enrich(db, settings, it, dep)
             if want is None or (it.repo or "").lower() == want:
                 items.append(it)
     if kind in (None, "ci"):

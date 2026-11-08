@@ -10,7 +10,11 @@
 # every check ok: a 2xx alone (a proxy page, a half-started app) never promotes a release.
 # On any failure the previous image and commit come back (`aureon-agentic:rollback` -> `:dev`,
 # git reset to the old SHA, up -d) and the last-good marker is left untouched.
-# Exit: 0 deployed | 1 failed, rolled back healthy | 2 failed AND the rollback is unhealthy.
+# Exit: 0 deployed | 1 failed, rolled back healthy | 2 failed AND the rollback is unhealthy |
+# 3 failed before anything changed (fetch / validation): the running release is untouched.
+# Stages (docs/33-deploy-progress.md): pulling, validating, building, migrating, restarting,
+# health_checking, verifying (the running api image carries the expected commit), and
+# rolling_back when a release had to be put back.
 # Phase timestamps (build, migrate, deploy, health_ok, rollback) and a one-line failure reason
 # go to $DEPLOY_LOG_DIR/.deploy-backend.phases; deploy-poll.sh hands them to the deploy record
 # (docs/32-devops-monitoring.md). The built images carry the commit as their OCI revision.
@@ -23,7 +27,9 @@ umask 027
 
 main() {
   local repo branch log_dir log_file lock state force=0
-  phases="" # global: phase() appends to it
+  phases="" # global: phase() and stage() append to it
+  check_error=""
+  last_ready=""
   repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
   branch="${DEPLOY_BRANCH:-main}"
   log_dir="${DEPLOY_LOG_DIR:-/mnt/spasta-data/logs}"
@@ -43,15 +49,30 @@ main() {
   done) 2>&1
 
   cd "$repo"
+  # Stages and phase timestamps for the deploy record (deploy-poll.sh reports them live to
+  # app.workers.deploy_progress and passes them to deploy_record at the end); a release is
+  # recorded as verified only when `health_ok` is written below.
+  : >"$phases"
+  stage pulling running
   local cur want
-  git fetch --quiet origin "$branch"
+  if ! git fetch --quiet origin "$branch"; then
+    stage pulling failed "git fetch origin/$branch failed"
+    phase failure "git fetch failed"
+    return 3
+  fi
   want="$(git rev-parse "origin/$branch")"
   cur="$(cat "$state" 2>/dev/null || git rev-parse HEAD)"
   if [[ "$force" == 0 && "$cur" == "$want" && -f "$state" ]]; then
+    stage pulling succeeded "already at ${want:0:12}"
     echo "up to date at ${want:0:12}"
     return 0
   fi
   echo "deploy ${cur:0:12} -> ${want:0:12} (force=$force)"
+  phase sha "$want"
+  # The PR a GitHub merge commit came from ("Merge pull request #46 from ...").
+  local pr
+  pr="$(git log -1 --format=%s "$want" | sed -nE 's/^Merge pull request #([0-9]+) .*/\1/p')"
+  [[ -n "$pr" ]] && phase pr "$pr"
 
   [[ "$(git rev-parse --abbrev-ref HEAD)" == "$branch" ]] || git checkout --quiet "$branch"
   if ! git diff --quiet || ! git diff --cached --quiet; then
@@ -69,44 +90,31 @@ main() {
   done
 
   git reset --quiet --hard "$want"
-  # Phase timestamps for the deploy record (deploy-poll.sh -> deploy_record --phases-json):
-  # a release is recorded as verified only when `health_ok` is written below.
-  : >"$phases"
-  local fail=""
+  stage pulling succeeded "${want:0:12}"
   export AUREON_GIT_SHA="$want" # the images' OCI revision label
-  phase build_started
-  if ! docker compose build --quiet; then
-    fail="docker compose build failed"
-  else
-    phase build_finished
-    if ! docker compose run --rm migrate; then
-      fail="migrate failed"
-    else
-      phase migrate_finished
-      if ! migrations_at_head; then
-        fail="migrations not at head after migrate"
-      else
-        phase deploy_started
-        if ! docker compose up -d; then
-          fail="docker compose up failed"
-        else
-          phase deploy_finished
-          if ! wait_ready "${DEPLOY_READY_SECONDS:-60}"; then
-            fail="readiness: $last_ready"
-          fi
-        fi
-      fi
-    fi
+
+  # Nothing has changed on the running stack yet: a failure here leaves it as it is (exit 3).
+  stage validating running
+  if ! validate_checkout "$want"; then
+    stage validating failed "$check_error"
+    phase failure "validation: $check_error"
+    echo "FAILED ${want:0:12}: $check_error (nothing deployed)"
+    git reset --quiet --hard "$cur"
+    return 3
   fi
-  if [[ -z "$fail" ]]; then
+  stage validating succeeded
+
+  local fail=""
+  if run_stages "$want"; then
     phase health_ok
     echo "$want" >"$state"
-    echo "OK ${want:0:12} healthy"
+    echo "OK ${want:0:12} healthy and verified"
     return 0
   fi
 
   phase failure "$fail"
   echo "FAILED ${want:0:12} ($fail): rolling back to ${cur:0:12}"
+  stage rolling_back running "to ${cur:0:12}"
   phase rollback_started
   git reset --quiet --hard "$cur"
   for img in aureon-agentic aureon-coding aureon-imaging; do
@@ -116,12 +124,109 @@ main() {
   done
   if docker compose up -d && wait_ready "${DEPLOY_ROLLBACK_READY_SECONDS:-90}"; then
     phase rollback_finished
+    stage rolling_back succeeded "${cur:0:12} is healthy again"
     echo "ROLLED BACK to ${cur:0:12} (healthy)"
     return 1
   fi
   phase rollback_finished
+  stage rolling_back failed "the previous release is not healthy either ($last_ready)"
   echo "ROLLBACK UNHEALTHY at ${cur:0:12}: needs a human (scripts/ops/healthcheck.sh)"
   return 2
+}
+
+# The stages that change the running stack; sets $fail (and marks the stage failed) on the
+# first failure. $1 = the commit being deployed.
+run_stages() {
+  local want="$1"
+  stage building running
+  phase build_started
+  if ! docker compose build --quiet; then
+    failed building "docker compose build failed"
+    return 1
+  fi
+  phase build_finished
+  stage building succeeded
+  stage migrating running
+  if ! docker compose run --rm migrate; then
+    failed migrating "migrate failed"
+    return 1
+  fi
+  phase migrate_finished
+  if ! migrations_at_head; then
+    failed migrating "migrations not at head after migrate"
+    return 1
+  fi
+  stage migrating succeeded
+  stage restarting running
+  phase deploy_started
+  if ! docker compose up -d; then
+    failed restarting "docker compose up failed"
+    return 1
+  fi
+  phase deploy_finished
+  stage restarting succeeded
+  stage health_checking running
+  if ! wait_ready "${DEPLOY_READY_SECONDS:-60}"; then
+    failed health_checking "readiness: $last_ready"
+    return 1
+  fi
+  stage health_checking succeeded
+  stage verifying running
+  if ! verify_release "$want"; then
+    failed verifying "$check_error"
+    return 1
+  fi
+  stage verifying succeeded "running ${want:0:12}"
+  return 0
+}
+
+failed() { # STAGE REASON
+  stage "$1" failed "$2"
+  fail="$2"
+}
+
+# Before anything changes: the checkout is the commit to deploy and the compose file is valid.
+validate_checkout() { # $1 = want; sets $check_error
+  local head
+  head="$(git rev-parse HEAD)"
+  if [[ "$head" != "$1" ]]; then
+    check_error="checkout is ${head:0:12}, expected ${1:0:12}"
+    return 1
+  fi
+  if ! docker compose config --quiet >/dev/null 2>&1; then
+    check_error="docker compose config is invalid"
+    return 1
+  fi
+}
+
+# After the health check: the release that answers is the expected commit. The running API
+# container's image must carry it as its OCI revision label (built with GIT_SHA=$want).
+verify_release() { # $1 = want; sets $check_error
+  local head cid rev
+  head="$(git rev-parse HEAD)"
+  if [[ "$head" != "$1" ]]; then
+    check_error="checkout moved to ${head:0:12} during the deploy"
+    return 1
+  fi
+  cid="$(docker compose ps --quiet api 2>/dev/null | head -n 1)"
+  if [[ -z "$cid" ]]; then
+    check_error="no running api container"
+    return 1
+  fi
+  rev="$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+    "$cid" 2>/dev/null || true)"
+  if [[ "$rev" != "$1" ]]; then
+    check_error="the running api image is ${rev:0:12}, expected ${1:0:12}"
+    [[ -n "$rev" ]] || check_error="the running api image has no revision label"
+    return 1
+  fi
+}
+
+# stage NAME STATUS [DETAIL]: one `stage=name|status|time|detail` line (docs/33).
+stage() {
+  local detail
+  detail="$(printf '%s' "${3:-}" | tr -d '\n\r|' | cut -c1-300)"
+  printf 'stage=%s|%s|%s|%s\n' "$1" "$2" "$(date -u +%FT%TZ)" "$detail" >>"$phases"
 }
 
 # phase NAME [VALUE]: one `name=value` line (default value: now, UTC) in the phases file.

@@ -13,6 +13,7 @@ from app.models.approvals import (
 from app.models.auth import AuditEvent, Role, User, UserSession
 from app.models.devops import (
     Deployment,
+    DeploymentStage,
     DevopsEvent,
     NotificationPrefs,
     NotificationRead,
@@ -48,6 +49,7 @@ __all__ = [
     "AuditEvent",
     "Conversation",
     "Deployment",
+    "DeploymentStage",
     "DevopsEvent",
     "FinanceAttachment",
     "FinanceIdentity",

@@ -126,6 +126,74 @@ class MonitorItemOut(BaseModel):
     url: str | None = None
     error: str | None = None
     rolled_back: bool | None = None
+    # Deploys only (docs/33-deploy-progress.md), additive: the stage running now, whether the
+    # host stopped reporting, and the stage counts (completed / planned) for a progress bar.
+    stage: str | None = None
+    stale: bool | None = None
+    stages_completed: int | None = None
+    stages_total: int | None = None
+
+
+DeployStageName = Literal[
+    "queued", "pulling", "validating", "building", "migrating", "restarting",
+    "health_checking", "verifying", "rolling_back",
+]  # fmt: skip
+DeployStageStatus = Literal["pending", "running", "succeeded", "failed", "skipped"]
+DeployOutcome = Literal["running", "completed", "unverified", "failed", "rolled_back", "unknown"]
+
+
+class DeployStageOut(BaseModel):
+    name: DeployStageName
+    label: str
+    # pending = not reported yet; skipped = the deploy ended before reaching it.
+    status: DeployStageStatus
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    # A running stage: elapsed so far.
+    duration_ms: int | None = None
+    # Sanitized, one line; failed stages only.
+    error: str | None = None
+
+
+class DeployProgressOut(BaseModel):
+    """One deploy as the host reported it, stage by stage. `outcome` is `completed` only after
+    the deploy script's health verification passed and the deploy was recorded as finished."""
+
+    run_id: int
+    deployment_id: int
+    target: str | None
+    repo: str | None
+    branch: str | None
+    environment: str
+    # What the poller expected to deploy, and what the script actually checked out + verified.
+    expected_sha: str | None
+    deployed_sha: str | None
+    previous_sha: str | None
+    commit_verified: bool | None = Field(
+        description="True: the running release is the expected commit. null: not verified yet"
+    )
+    pr_number: int | None
+    outcome: DeployOutcome
+    health_verified_at: datetime | None
+    rolled_back: bool
+    failure_reason: str | None
+    started_at: datetime
+    finished_at: datetime | None
+    updated_at: datetime | None = Field(description="The host's last progress report")
+    stale: bool = Field(description="Running, but the host has not reported recently")
+    current_stage: DeployStageName | None
+    stages_completed: int
+    stages_total: int
+    stages: list[DeployStageOut]
+    log_available: bool
+
+
+class DeployLogOut(BaseModel):
+    run_id: int
+    text: str
+    truncated: bool
+    updated_at: datetime | None
+    running: bool
 
 
 class MonitorOut(BaseModel):

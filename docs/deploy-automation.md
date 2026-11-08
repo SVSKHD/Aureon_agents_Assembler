@@ -53,6 +53,8 @@ GitHub (merge)                 server (pulls; nothing pushes to it)
    human). The last-good marker (`.deployed-backend`) is only written by a promoted release.
    The failed SHA is remembered (`.failed-backend`) and not retried until the next commit;
    the deployer run is recorded as rolled back only for exit 1.
+   Exit 3: the deploy failed before anything changed (fetch / validation); the running release
+   is untouched. Every stage is reported live to the Deploys dashboard (docs/33-deploy-progress.md).
 
 Every deploy is also recorded for the DevOps dashboard with its phase timestamps, health
 verification and rollback outcome (`.deploy-backend.phases`, docs/32-devops-monitoring.md).

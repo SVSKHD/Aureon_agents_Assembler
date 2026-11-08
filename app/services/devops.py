@@ -428,6 +428,9 @@ async def server_deploy_started(
     )  # fmt: skip
     db.add(row)
     await db.flush()
+    from app.services import deploy_progress  # import here: deploy_progress imports this module
+
+    await deploy_progress.start_queued(db, row, now)
     await emit(
         db, settings, type="deployment.started", severity="info",
         dedup_key=f"deployment.started:{row.external_id}", occurred_at=now, repo=repo,
@@ -472,6 +475,9 @@ async def server_deploy_finished(
     if row is None:
         return None
     now = _now()
+    from app.services import deploy_progress
+
+    await deploy_progress.close_open(db, row, now)
     status, rolled_back, rollback_status = server_outcome(exit_code, phases)
     row.status, row.rolled_back, row.rollback_status = status, rolled_back, rollback_status
     row.finished_at = now
