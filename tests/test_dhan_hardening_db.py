@@ -38,6 +38,7 @@ from tests.test_dhan_auth_db import (
     MANUAL,
     TOKEN_ID,
     FakeDhan,
+    dhan_returns,
 )
 from tests.test_finance_db import PASSWORD, Env, EnvFactory
 
@@ -76,7 +77,9 @@ def _install(env: Env, fake: FakeDhan) -> None:
 
 
 async def _login(env: Env) -> httpx.Response:
+    """The whole flow: start, Dhan's redirect back (the one-time login handoff), consume."""
     assert (await env.send("admin", "POST", f"{URL}/start")).status_code == 200
+    assert (await dhan_returns(env)).headers["location"].endswith("dhan_login=ready")
     r: httpx.Response = await env.send(
         "admin", "POST", f"{URL}/consume", json={"token_id": TOKEN_ID}
     )
