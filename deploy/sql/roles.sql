@@ -162,7 +162,7 @@ DECLARE
   r record;
   -- `audit` is handled separately below (append-only by default).
   dml_schemas text[] := ARRAY['core', 'ai', 'agents', 'trading', 'dhan', 'mt5', 'github', 'devops',
-                              'spasta'];
+                              'aureon', 'spasta'];
 BEGIN
   FOREACH s IN ARRAY dml_schemas || ARRAY['audit'] LOOP
     CONTINUE WHEN NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = s);
