@@ -55,6 +55,12 @@ SAFETY_RULES: tuple[tuple[str, str, Danger, str], ...] = (
     # Machine-to-machine and auth flows: never a UI button.
     ("*", r"^/api/v1/github/webhooks$", "hidden", "machine endpoint (HMAC)"),
     ("*", r"^/api/trading/mt5/ingest$", "hidden", "machine endpoint (bearer)"),
+    (
+        "*",
+        r"^/api/v1/(ingest|admin/risk|admin/review|aureon|status$|signals|decisions|trades$|chart$|review|risk$)",
+        "hidden",
+        "Aureon V1.6.3 machine API (role bearer tokens)",
+    ),
     ("*", r"^/api/auth/", "hidden", "authentication flow"),
     ("*", r"^/api/v1/dhan/auth/callback", "hidden", "OAuth-style callback"),
     # Secrets and settings: handcrafted pages only.

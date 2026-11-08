@@ -31,6 +31,48 @@ PUBLIC = {
     # exchange is POST /consume (admin + CSRF + a login started from that session).
     ("GET", "/api/v1/dhan/auth/callback"),
     ("GET", "/api/v1/dhan/auth/callback/"),
+    # Aureon V1.6.3 liveness for the Windows box / deploy checks: {"ok": true} or 503 only.
+    ("GET", "/api/v1/aureon/healthz"),
+}
+# Aureon V1.6.3 machine API (docs/34): no session and no CSRF; each route instead carries
+# the role bearer-token dependency `aureon_role` (app/aureon/auth.py), checked below.
+AUREON_MACHINE = {
+    ("GET", "/api/v1/aureon/readyz"),
+    ("GET", "/api/v1/chart"),
+    ("GET", "/api/v1/ingest/control"),
+    ("GET", "/api/v1/ingest/daily_pnl"),
+    ("GET", "/api/v1/ingest/last_bar"),
+    ("GET", "/api/v1/ingest/recent_signal"),
+    ("GET", "/api/v1/ingest/risk"),
+    ("GET", "/api/v1/ingest/state"),
+    ("GET", "/api/v1/ingest/trade_by_ticket"),
+    ("GET", "/api/v1/ingest/trades_open"),
+    ("GET", "/api/v1/review"),
+    ("GET", "/api/v1/review/latest"),
+    ("GET", "/api/v1/review/reports"),
+    ("GET", "/api/v1/review/reports/{rid}"),
+    ("GET", "/api/v1/review/reports/{rid}/files/{name}"),
+    ("GET", "/api/v1/risk"),
+    ("GET", "/api/v1/signals"),
+    ("GET", "/api/v1/signals/{sid}"),
+    ("GET", "/api/v1/status"),
+    ("GET", "/api/v1/trades"),
+    ("PATCH", "/api/v1/ingest/trade/{tid}"),
+    ("POST", "/api/v1/admin/review/run"),
+    ("POST", "/api/v1/admin/risk/clear"),
+    ("POST", "/api/v1/decisions"),
+    ("POST", "/api/v1/ingest/alert"),
+    ("POST", "/api/v1/ingest/bars"),
+    ("POST", "/api/v1/ingest/control"),
+    ("POST", "/api/v1/ingest/heartbeat"),
+    ("POST", "/api/v1/ingest/jobs/claim"),
+    ("POST", "/api/v1/ingest/jobs/{jid}/finish"),
+    ("POST", "/api/v1/ingest/jobs/{jid}/renew"),
+    ("POST", "/api/v1/ingest/mt5_deals"),
+    ("POST", "/api/v1/ingest/risk"),
+    ("POST", "/api/v1/ingest/risk_event"),
+    ("POST", "/api/v1/ingest/trade"),
+    ("POST", "/api/v1/ingest/trade_event"),
 }
 # Public routes that change state, each with its own authentication.
 PUBLIC_UNSAFE = {"/api/auth/login", "/api/v1/github/webhooks", "/api/trading/mt5/ingest"}
@@ -209,7 +251,9 @@ def test_every_route_requires_auth_except_the_public_allowlist(settings: Setting
     found = {(m, p) for m, p, _ in pairs}
     assert found >= PUBLIC, f"public routes missing: {PUBLIC - found}"
     unauthenticated = sorted(
-        (m, p) for m, p, deps in pairs if (m, p) not in PUBLIC and "get_current" not in deps
+        (m, p)
+        for m, p, deps in pairs
+        if (m, p) not in PUBLIC | AUREON_MACHINE and "get_current" not in deps
     )
     assert unauthenticated == [], unauthenticated
     # The allowlist itself stays unauthenticated (login must work signed out).
@@ -219,13 +263,19 @@ def test_every_route_requires_auth_except_the_public_allowlist(settings: Setting
             assert m in SAFE or p in PUBLIC_UNSAFE, (m, p)
         if p in PUBLIC_RATE_LIMITED:
             assert "rate_limited" in deps, (m, p)
+        if (m, p) in AUREON_MACHINE:
+            assert "aureon_role" in deps and "get_current" not in deps, (m, p)
+    assert found >= AUREON_MACHINE, f"aureon routes missing: {AUREON_MACHINE - found}"
 
 
 def test_every_unsafe_route_requires_csrf(settings: Settings) -> None:
     missing = sorted(
         (m, p)
         for m, p, deps in _pairs(settings)
-        if m not in SAFE and (m, p) not in PUBLIC and "require_csrf" not in deps
+        if m not in SAFE
+        and (m, p) not in PUBLIC
+        and not ((m, p) in AUREON_MACHINE and "aureon_role" in deps)
+        and "require_csrf" not in deps
     )
     assert missing == [], f"state-changing routes without CSRF: {missing}"
 

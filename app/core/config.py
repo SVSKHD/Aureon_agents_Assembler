@@ -332,6 +332,49 @@ class Settings(BaseSettings):
     def mt5_ingest_enabled(self) -> bool:
         return bool(self.MT5_INGEST_TOKEN and self.MT5_INGEST_TOKEN.get_secret_value())
 
+    # --- Aureon V1.6.3 database API (docs/34-aureon-v163.md) ---
+    # One bearer token per role, least privilege; unset = that role is off. The Windows box
+    # holds only COLLECTOR and/or GUARD; READ/WRITE are for reporting clients; ADMIN clears a
+    # risk lock and starts a manual review (keep it offline). SVC is V1.6's legacy single MT5
+    # token: it acts as collector + guard only while neither of those is set.
+    # Prod refuses to start when a set token is short, a placeholder, or reused.
+    AUREON_API_READ_TOKEN: SecretStr | None = None
+    AUREON_API_WRITE_TOKEN: SecretStr | None = None
+    AUREON_API_COLLECTOR_TOKEN: SecretStr | None = None
+    AUREON_API_GUARD_TOKEN: SecretStr | None = None
+    AUREON_API_SERVICE_TOKEN: SecretStr | None = None
+    AUREON_API_ADMIN_TOKEN: SecretStr | None = None
+    AUREON_API_SVC_TOKEN: SecretStr | None = None
+    # Requests per minute per (role, client), as V1.6.3 (600).
+    AUREON_API_RATE_PER_MINUTE: int = Field(default=600, ge=1, le=60_000)
+    AUREON_API_MAX_BODY_BYTES: int = Field(default=1024 * 1024, ge=1024, le=8 * 1024 * 1024)
+    # Background work (detector, scheduler, alerts, reviews) runs only when enabled.
+    AUREON_WORKERS_ENABLED: bool = False
+    AUREON_TICK_CRON: str = "* * * * *"
+    AUREON_ALERTS_CRON: str = "* * * * *"
+    # Advances any RUNNING review; starts last week's automatically only on a closed weekend.
+    AUREON_WEEKEND_REVIEW_CRON: str = "*/5 * * * *"
+    # The Sunday review waits for its verify job across runs (V1.6.3 ran it at 12:00).
+    AUREON_WEEKLY_REVIEW_CRON: str = "*/10 12-13 * * 0"
+    AUREON_VERIFY_CRON: str = "30 2 * * 2-6"
+    # Optional: also write weekly report files here (they are always stored in PostgreSQL).
+    AUREON_REVIEW_REPORTS_DIR: str = ""
+
+    @property
+    def aureon_api_enabled(self) -> bool:
+        return any(
+            t and t.get_secret_value()
+            for t in (
+                self.AUREON_API_READ_TOKEN,
+                self.AUREON_API_WRITE_TOKEN,
+                self.AUREON_API_COLLECTOR_TOKEN,
+                self.AUREON_API_GUARD_TOKEN,
+                self.AUREON_API_SERVICE_TOKEN,
+                self.AUREON_API_ADMIN_TOKEN,
+                self.AUREON_API_SVC_TOKEN,
+            )
+        )
+
     # --- research agents (Trading Phase D, docs/13-research-agents.md) ---
     RESEARCH_TICK_SECONDS: float = Field(default=60.0, ge=5)
     RESEARCH_QUEUE_MAX: int = Field(default=200, ge=1, le=10_000)

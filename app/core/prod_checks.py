@@ -73,6 +73,50 @@ def ingest_token_problems(settings: Settings) -> list[str]:
     ]
 
 
+AUREON_TOKENS = (
+    "AUREON_API_READ_TOKEN",
+    "AUREON_API_WRITE_TOKEN",
+    "AUREON_API_COLLECTOR_TOKEN",
+    "AUREON_API_GUARD_TOKEN",
+    "AUREON_API_SERVICE_TOKEN",
+    "AUREON_API_ADMIN_TOKEN",
+    "AUREON_API_SVC_TOKEN",
+)
+
+
+def aureon_token_problems(settings: Settings) -> list[str]:
+    """Aureon V1.6.3 role tokens (docs/34): each set token is strong, and no two credentials
+    share a value (a shared value would merge two roles). Names only, never values."""
+    out: list[str] = []
+    values: dict[str, str] = {}
+    for name in AUREON_TOKENS:
+        s = getattr(settings, name, None)
+        tok = s.get_secret_value() if isinstance(s, SecretStr) else ""
+        if not tok:
+            continue
+        if len(tok) < MIN_SECRET_LEN:
+            out.append(f"{name} is shorter than {MIN_SECRET_LEN} characters")
+        elif any(m in tok.lower() for m in PLACEHOLDER_MARKERS):
+            out.append(f"{name} is a placeholder")
+        values[name] = tok
+    others = (*INGEST_TOKEN_DISTINCT_FROM, "MT5_INGEST_TOKEN")
+    for name, tok in values.items():
+        for o in (*[n for n in values if n != name], *others):
+            raw = values.get(o)
+            if raw is None:
+                other = getattr(settings, o, None)
+                raw = other.get_secret_value() if isinstance(other, SecretStr) else other
+            if not isinstance(raw, str) or not raw:
+                continue
+            vals = raw.split(",") if o == "SETTINGS_MASTER_KEY" else [raw]
+            if any(v.strip() == tok for v in vals):
+                pair = sorted((name, o))
+                msg = f"{pair[0]} must not reuse the value of {pair[1]}"
+                if msg not in out:
+                    out.append(msg)
+    return out
+
+
 class ProductionConfigError(RuntimeError):
     """Raised at startup when ENV=prod and the configuration is unsafe."""
 
@@ -112,6 +156,7 @@ def production_problems(settings: Settings) -> list[str]:
     except RuntimeError as exc:
         problems.append(f"data root: {exc}")
     problems.extend(ingest_token_problems(settings))
+    problems.extend(aureon_token_problems(settings))
     if bool((settings.CF_ACCESS_TEAM_DOMAIN or "").strip()) != bool(settings.CF_ACCESS_AUD):
         problems.append("CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD must be set together")
     return problems

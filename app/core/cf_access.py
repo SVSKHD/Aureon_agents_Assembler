@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
@@ -58,10 +59,27 @@ def team_origin(team_domain: str) -> str:
 # Exact paths (no prefix match, no trailing slash) that authenticate themselves and never
 # carry an Access JWT: the MT5 bot's push (bearer MT5_INGEST_TOKEN, docs/12-mt5-adapter.md).
 MACHINE_PATHS: frozenset[str] = frozenset({"/api/trading/mt5/ingest"})
+# The Aureon V1.6.3 database API (docs/34-aureon-v163.md): every route under these patterns
+# authenticates itself with a role bearer token (app/aureon/auth.py) and is reached by the
+# Windows collector/guard over Tailscale, without an Access JWT. Full-path regexes, anchored.
+MACHINE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p)
+    for p in (
+        r"^/api/v1/ingest/[a-z_]+$",
+        r"^/api/v1/ingest/trade/\d+$",
+        r"^/api/v1/ingest/jobs/(claim|\d+/(renew|finish))$",
+        r"^/api/v1/(status|signals|decisions|trades|chart|review|risk)$",
+        r"^/api/v1/signals/\d+$",
+        r"^/api/v1/review/(latest|reports)$",
+        r"^/api/v1/review/reports/\d+(/files/[a-z_]+\.(csv|json|html))?$",
+        r"^/api/v1/admin/(risk/clear|review/run)$",
+        r"^/api/v1/aureon/(healthz|readyz)$",
+    )
+)
 
 
 def is_machine_path(path: str) -> bool:
-    return path in MACHINE_PATHS
+    return path in MACHINE_PATHS or any(p.match(path) for p in MACHINE_PATTERNS)
 
 
 def is_bypassed(path: str, prefixes: Sequence[str]) -> bool:
