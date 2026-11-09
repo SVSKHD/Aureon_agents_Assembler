@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased: admin password reset
+
+- `python -m app.auth.reset_password --email …` resets an existing, active admin's password in
+  place (same UUID, role, data): Argon2id hash, every open session revoked, an
+  `admin_password_reset` audit event, one transaction (nothing changes on error). Prompts
+  twice without echo, or `--stdin`; never logs the password. Operator action only, not run by
+  deploys ([docs/02-auth-and-finance.md](docs/02-auth-and-finance.md)).
+- The user row is locked with `FOR UPDATE OF users`: a plain `FOR UPDATE` on `User` (whose
+  `role` is a joined eager load) failed with "FOR UPDATE cannot be applied to the nullable side
+  of an outer join".
+
 ## Unreleased: V1.6.4 watchdog health summary
 
 - `GET /api/v1/ingest/health_summary` (collector, guard, service roles) for the Aureon V1.6.4
