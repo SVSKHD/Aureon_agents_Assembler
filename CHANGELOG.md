@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased: V1.6.4 watchdog health summary
+
+- `GET /api/v1/ingest/health_summary` (collector, guard, service roles) for the Aureon V1.6.4
+  Windows watchdog, with V1.6.4's exact response contract; missing records are `null` (never a
+  default healthy state), a database failure is 503, `?detail=true` adds diagnostics
+  ([docs/34-aureon-v163.md](docs/34-aureon-v163.md)). The watchdog answered "HTTP 404" before.
+- Tests: the unmodified V1.6.4 watchdog (`tests/fixtures/aureon_v164`) polls the endpoint
+  over HTTP and judges RUNNING / DEGRADED / PAUSED / FAILED from it.
+
 ## Unreleased: Aureon V1.6.3 database API and workers
 
 The Assembler serves the V1.6.3 Windows box (`STORE_MODE=api`) and runs V1.6.3's Linux-side
