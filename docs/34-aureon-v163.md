@@ -65,6 +65,7 @@ needs `Authorization: Bearer <role token>` (except `aureon/healthz`); no session
 | POST | `/api/v1/ingest/heartbeat` | collector, guard, service | `{service: collector\|guard, state: LIVE\|PAUSED\|RESUMING\|DEGRADED\|FAILED, note ≤200}` | 201 `{ok}` |
 | GET | `/api/v1/ingest/state` | collector, guard, service | — | `{state}` |
 | GET | `/api/v1/ingest/last_bar` | collector, guard, service | — | last closed M30 bar + `vwap_side, bar_of_day, atr14`, or `null` |
+| GET | `/api/v1/ingest/health_summary` | collector, guard, service | `detail` (optional) | V1.6.4 watchdog summary, see below |
 | POST | `/api/v1/ingest/jobs/claim` | collector | `{worker}` | the job row (`id, kind, payload, lease_token, attempts…`) or `null` |
 | POST | `/api/v1/ingest/jobs/{jid}/renew` | collector | `{worker, token}` | `{ok}` (false unless the caller holds the lease) |
 | POST | `/api/v1/ingest/jobs/{jid}/finish` | collector | `{ok, result ≤2000, worker, token}` | `{ok, ignored}` (fenced: wrong worker/token/expired → ignored) |
@@ -94,6 +95,44 @@ needs `Authorization: Bearer <role token>` (except `aureon/healthz`); no session
 | GET | `/api/v1/risk` | reader, writer, admin | — | last 14 risk rows (no clear reasons) |
 | GET | `/api/v1/aureon/readyz` | reader, writer, admin | — | 200 or 503 with problems (V1.6.3 `/readyz`) |
 | GET | `/api/v1/aureon/healthz` | none | — | `{ok}` / 503 |
+
+### V1.6.4 watchdog: `GET /api/v1/ingest/health_summary`
+
+The V1.6.4 Windows watchdog (`aureon/watchdog.py`) polls this every `WATCHDOG_TICK_S` through
+`ApiStore.health_summary()` and judges each service from it. Contract (V1.6.4's own
+`assembler/app.py`, field for field):
+
+```json
+{
+  "state": "LIVE",                       // scheduler heartbeat state, or null (no row)
+  "heartbeats": [{"service": "collector", "state": "LIVE", "last_beat": "2026-11-10T09:59:55+00:00", "note": ""}],
+  "bars": [{"tf": "H1", "t": "2026-11-10T09:00:00+00:00", "n24": 22}, {"tf": "M30", "t": "…", "n24": 44}],
+  "indicators_m30_latest": "2026-11-10T09:30:00+00:00",   // or null: the detector has not run
+  "signals": {"t": "…", "n24": 1},       // t null when no live signal yet
+  "risk": {"state": "UNLOCKED", "ref_source": "day_open"},   // or null
+  "control_desired": "RUN"               // RUN | PAUSE, or null (no row)
+}
+```
+
+How the watchdog reads it: collector RUNNING only when its heartbeat is < 180 s old **and** the
+newest M30 bar is < 90 min and H1 < 150 min old (both computed on the box from `last_beat` /
+`t`); DEGRADED otherwise after its 120 s start grace; PAUSED when `control_desired == "PAUSE"`;
+FAILED (never restarted) on 401/403; any other error is shown as `backend: …`.
+
+Truthfulness: V1.6.4's server filled in `"PAUSED"` / `"RUN"` when the scheduler or control row was
+missing; the Assembler answers `null` (no record, no claim). A heartbeat row that never beat
+is left out. A database failure is `503 database unavailable`, never a guessed summary.
+
+`?detail=true` (the watchdog never sends it) adds `diagnostics`: heartbeat ages and staleness,
+the last accepted upload per ingest endpoint (`aureon.api_audit`), open/failed collector jobs
+and failed alerts — for checking the pipeline by hand. Every query reads an index; a poll
+every 5 s is cheap.
+
+Reading an empty `last_bar`: it joins the newest M30 bar to its indicator row, so it is `null`
+(HTTP 200) both when no bar is stored and when bars are stored but the detector has not run
+(`AUREON_WORKERS_ENABLED=false`). A credential problem is a 401/403, never an empty 200.
+`health_summary` tells the cases apart: `bars` empty = nothing ingested; `bars` present and
+`indicators_m30_latest` null = the detector is not running.
 
 ### Differences from V1.6.3's server (deliberate)
 

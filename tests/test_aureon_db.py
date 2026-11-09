@@ -233,6 +233,7 @@ ROUTES: list[tuple[str, str, dict[str, Any], set[str]]] = [
     ("GET", "/api/v1/ingest/trades_open", {}, {"guard"}),
     ("GET", "/api/v1/ingest/trade_by_ticket", {"params": {"ticket": 1}}, {"guard"}),
     ("GET", "/api/v1/ingest/daily_pnl", {}, {"guard"}),
+    ("GET", "/api/v1/ingest/health_summary", {}, {"collector", "guard", "service"}),
     (
         "POST",
         "/api/v1/ingest/trade_event",
@@ -1431,3 +1432,185 @@ async def test_healthz_and_readyz(env: Env) -> None:
     r = await env.call("reader", "GET", "/api/v1/aureon/readyz")
     assert r.status_code == 503 and "collector stale" in r.json()["detail"]["problems"]
     assert (await env.call(None, "GET", "/api/v1/aureon/readyz")).status_code == 401
+
+
+# ---------------- V1.6.4 watchdog: GET /api/v1/ingest/health_summary ----------------
+V164_KEYS = {
+    "state",
+    "heartbeats",
+    "bars",
+    "indicators_m30_latest",
+    "signals",
+    "risk",
+    "control_desired",
+}
+
+
+async def test_health_summary_authorization(env: Env) -> None:
+    assert (await env.call(None, "GET", "/api/v1/ingest/health_summary")).status_code == 401
+    assert (
+        await env.c.get("/api/v1/ingest/health_summary", headers={"authorization": "Bearer nope"})
+    ).status_code == 401
+    assert (
+        await env.c.get(
+            "/api/v1/ingest/health_summary", headers={"authorization": f"Basic {TOK['collector']}"}
+        )
+    ).status_code == 401
+    for role in ("reader", "writer", "admin"):
+        assert (await env.call(role, "GET", "/api/v1/ingest/health_summary")).status_code == 403, (
+            role
+        )
+    for role in (
+        "collector",
+        "guard",
+        "service",
+    ):  # V1.6.4: auth_svc (+ the Assembler's service role)
+        assert (await env.call(role, "GET", "/api/v1/ingest/health_summary")).status_code == 200, (
+            role
+        )
+
+
+async def test_health_summary_empty_database_is_unknown_not_healthy(env: Env) -> None:
+    await env.sql("delete from aureon.control")
+    r = await env.call("collector", "GET", "/api/v1/ingest/health_summary")
+    assert r.status_code == 200
+    d = r.json()
+    assert set(d) == V164_KEYS  # exactly V1.6.4's contract
+    assert d["state"] is None  # no scheduler row: unknown (V1.6.4's server said "PAUSED")
+    assert d["control_desired"] is None  # no control row: unknown (V1.6.4's server said "RUN")
+    assert d["heartbeats"] == [] and d["bars"] == [] and d["indicators_m30_latest"] is None
+    assert d["signals"] == {"t": None, "n24": 0} and d["risk"] is None
+
+
+async def test_health_summary_reports_real_work(env: Env) -> None:
+    end = dt.datetime.now(dt.UTC).replace(tzinfo=None) - dt.timedelta(minutes=60)
+    m30 = session_times(end - dt.timedelta(days=2), end, "M30")
+    h1 = session_times(end - dt.timedelta(days=2), end, "H1")
+    await post_bars(env, "M30", bar_rows(m30))
+    await post_bars(env, "M30", bar_rows(m30))  # replayed upload: no duplicates
+    await post_bars(env, "H1", bar_rows(h1, seed=4))
+    await env.call(
+        "collector",
+        "POST",
+        "/api/v1/ingest/heartbeat",
+        json={"service": "collector", "state": "LIVE", "note": "ok"},
+    )
+    await env.sql(
+        "insert into aureon.service_heartbeats(service,state,last_beat) values('scheduler','LIVE',now())"
+    )
+    await env.sql(
+        "insert into aureon.indicators(symbol,tf,time_utc,rules_version,atr14) values('XAUUSD','M30',:t,'R3.0',10)",
+        {"t": m30[-1].replace(tzinfo=dt.UTC)},
+    )
+    await live_signal(env, minutes_ago=20)
+    await env.sql(
+        "insert into aureon.risk_state(broker_day,account_id,state,ref_source) values('2026-11-09','777','UNLOCKED','day_open')"
+    )
+    d = (await env.call("service", "GET", "/api/v1/ingest/health_summary")).json()
+    assert set(d) == V164_KEYS and d["state"] == "LIVE" and d["control_desired"] == "RUN"
+    bars = {b["tf"]: b for b in d["bars"]}
+    assert set(bars) == {"M30", "H1"} and set(bars["M30"]) == {"tf", "t", "n24"}
+    assert dt.datetime.fromisoformat(bars["M30"]["t"]) == m30[-1].replace(
+        tzinfo=dt.UTC
+    )  # UTC, offset included
+    assert dt.datetime.fromisoformat(bars["H1"]["t"]) == h1[-1].replace(tzinfo=dt.UTC)
+    in_24h = len(
+        [
+            t
+            for t in m30
+            if t.replace(tzinfo=dt.UTC) > dt.datetime.now(dt.UTC) - dt.timedelta(days=1)
+        ]
+    )
+    assert bars["M30"]["n24"] == in_24h  # counted once despite the replayed upload
+    assert dt.datetime.fromisoformat(d["indicators_m30_latest"]) == m30[-1].replace(tzinfo=dt.UTC)
+    assert d["signals"]["n24"] == 1 and d["signals"]["t"] is not None
+    assert d["risk"] == {"state": "UNLOCKED", "ref_source": "day_open"}
+    col = next(h for h in d["heartbeats"] if h["service"] == "collector")
+    assert col == {
+        "service": "collector",
+        "state": "LIVE",
+        "last_beat": col["last_beat"],
+        "note": "ok",
+    }
+    diag = (
+        await env.call(
+            "collector", "GET", "/api/v1/ingest/health_summary", params={"detail": "true"}
+        )
+    ).json()["diagnostics"]
+    assert (
+        diag["heartbeat_ages"]["collector"]["stale"] is False
+        and diag["heartbeat_ages"]["collector"]["age_s"] < 60
+    )
+    assert diag["last_ingest"]["bars"] is not None and diag["last_ingest"]["heartbeat"] is not None
+    assert diag["last_ingest"]["mt5_deals"] is None and diag["errors"] == []
+
+
+async def test_health_summary_stale_heartbeat_stopped_scheduler_and_errors(env: Env) -> None:
+    await env.sql(
+        "insert into aureon.service_heartbeats(service,state,last_beat,note) values('collector','LIVE',now()-interval '10 minutes','')"
+    )
+    await env.sql(
+        "insert into aureon.service_heartbeats(service,state,last_beat) values('scheduler','LIVE',now()-interval '2 hours')"
+    )  # stopped
+    await env.sql(
+        "insert into aureon.service_heartbeats(service,state,last_beat) values('guard',null,null)"
+    )  # never beat
+    async with env.maker() as s, s.begin():
+        jid = await db.request_job(s, "mt5_history", {"start": "a", "end": "b"})
+        await db.request_job(s, "backfill", {"n": 1})
+        await db.alert_enqueue(s, "k1", "adhoc", "x")
+    await env.sql(
+        "update aureon.jobs set state='dead', done_at=now(), ok=false, result='RuntimeError: MT5 init failed [dead: attempts exhausted]', attempts=3 where id=:i",
+        {"i": jid},
+    )
+    await env.sql(
+        "update aureon.alerts set state='FAILED', last_error='HTTP 400' where alert_key='k1'"
+    )
+    d = (
+        await env.call("guard", "GET", "/api/v1/ingest/health_summary", params={"detail": "true"})
+    ).json()
+    # the last recorded state is reported as recorded; its age shows it is not current
+    assert d["state"] == "LIVE" and d["diagnostics"]["heartbeat_ages"]["scheduler"]["stale"] is True
+    assert d["diagnostics"]["heartbeat_ages"]["collector"]["stale"] is True
+    assert d["diagnostics"]["heartbeat_ages"]["collector"]["age_s"] > 500
+    assert [h["service"] for h in d["heartbeats"]] == [
+        "collector",
+        "scheduler",
+    ]  # never-beat row is not a beat
+    jobs = d["diagnostics"]["jobs"]
+    assert jobs["pending"] == 1 and jobs["recent_failures"][0]["id"] == jid
+    assert {(e["source"], e["state"]) for e in d["diagnostics"]["errors"]} == {
+        ("job:mt5_history", "dead"),
+        ("alert", "FAILED"),
+    }
+
+
+async def test_health_summary_database_failure_is_503(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def down(*a: Any, **k: Any) -> Any:
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(db, "q", down)
+    r = await env.call("collector", "GET", "/api/v1/ingest/health_summary")
+    assert r.status_code == 503 and r.json() == {"detail": "database unavailable"}
+
+
+async def test_empty_last_bar_means_no_detector_output_not_bad_auth(env: Env) -> None:
+    """GET last_bar joins bars to M30 indicators: with bars stored but the detector not run
+    (AUREON_WORKERS_ENABLED=false) it is null with HTTP 200. health_summary tells the cases apart."""
+    r = await env.call("collector", "GET", "/api/v1/ingest/last_bar")
+    assert r.status_code == 200 and r.json() is None  # empty database
+    end = dt.datetime.now(dt.UTC).replace(tzinfo=None) - dt.timedelta(minutes=60)
+    await post_bars(env, "M30", bar_rows(session_times(end - dt.timedelta(days=1), end, "M30")))
+    r = await env.call("collector", "GET", "/api/v1/ingest/last_bar")
+    assert r.status_code == 200 and r.json() is None  # bars, but no indicators yet
+    d = (await env.call("collector", "GET", "/api/v1/ingest/health_summary")).json()
+    assert [b["tf"] for b in d["bars"]] == ["M30"] and d["indicators_m30_latest"] is None
+    async with env.maker() as s, s.begin():
+        await detector.live_once(s)  # what the aureon-tick task does
+    assert (await env.call("collector", "GET", "/api/v1/ingest/last_bar")).json()[
+        "atr14"
+    ] is not None
+    bad = await env.c.get("/api/v1/ingest/last_bar", headers={"authorization": "Bearer wrong"})
+    assert bad.status_code == 401  # a credential problem is a 401, never an empty 200

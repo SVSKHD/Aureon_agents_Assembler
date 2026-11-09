@@ -8,6 +8,7 @@ status codes and response shapes, on the Assembler's PostgreSQL (schema `aureon`
     guard      GET  /api/v1/ingest/recent_signal | trades_open | trade_by_ticket | daily_pnl | risk
                POST /api/v1/ingest/trade | trade_event | risk | risk_event;  PATCH /trade/{tid}
     service    POST /api/v1/ingest/heartbeat | alert | control;  GET state | last_bar | control
+               | health_summary (V1.6.4 watchdog)
     read       GET  /api/v1/status | signals | signals/{sid} | trades | chart | review |
                review/latest | risk | review/reports[/{rid}[/files/{name}]] | aureon/readyz
     write      POST /api/v1/decisions
@@ -31,6 +32,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field, field_validator
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.ui import ui_module
 from app.aureon import config, db
@@ -459,6 +461,172 @@ async def ingest_hb(h: HB, s: DbSession, _r: ServiceRole) -> dict[str, Any]:
 @router.get("/ingest/state")
 async def ingest_state(s: DbSession, _r: ServiceRole) -> dict[str, Any]:
     return {"state": await db.get_state(s)}
+
+
+@router.get("/ingest/health_summary")
+async def ingest_health_summary(
+    s: DbSession, _r: ServiceRole, detail: bool = False
+) -> dict[str, Any]:
+    """For the V1.6.4 Windows watchdog (aureon/watchdog.py, via ApiStore.health_summary()).
+
+    The response is V1.6.4's own contract (aureon_v1/assembler/app.py), field for field:
+    `state`, `heartbeats` [{service, state, last_beat, note}], `bars` [{tf, t, n24}],
+    `indicators_m30_latest`, `signals` {t, n24}, `risk` {state, ref_source} | null,
+    `control_desired`. One difference, on purpose: where V1.6.4's server filled in defaults
+    for missing rows (scheduler "PAUSED", desired "RUN"), this answers null — nothing is
+    reported that no record shows (the watchdog acts only on desired == "PAUSE").
+
+    `?detail=true` (never sent by the watchdog) adds `diagnostics`: heartbeat ages, the last
+    accepted upload per ingest endpoint, open/failed collector jobs and failed alerts.
+    Every query reads an index (latest row per key, last-24 h ranges), so a 5-second poll
+    stays cheap. A database failure answers 503, never a guessed state."""
+    try:
+        return await _health_summary(s, detail)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(503, "database unavailable") from None
+
+
+def _iso(t: dt.datetime | None) -> str | None:
+    """UTC as `+00:00` ISO text: the watchdog parses these with datetime.fromisoformat, which
+    rejects the JSON encoder's `Z` suffix on Python < 3.11."""
+    return t.astimezone(dt.UTC).isoformat() if t is not None else None
+
+
+async def _health_summary(s: AsyncSession, detail: bool) -> dict[str, Any]:
+    sym = {"sym": config.SYMBOL}
+    sched = await db.q(
+        s, "select state from aureon.service_heartbeats where service='scheduler'", one=True
+    )
+    hbs = await db.q(
+        s,
+        """select service,state,last_beat,note from aureon.service_heartbeats
+           where last_beat is not null order by service""",
+    )
+    bars = []
+    for tf in ("H1", "M30"):  # index: bars(symbol, tf, time_utc)
+        r = await db.q(
+            s,
+            """select max(time_utc) t from aureon.bars where symbol=:sym and tf=:tf""",
+            {**sym, "tf": tf},
+            one=True,
+        )
+        if r and r["t"] is not None:
+            n = await db.q(
+                s,
+                """select count(*) n from aureon.bars where symbol=:sym and tf=:tf
+                   and time_utc > now() - interval '1 day'""",
+                {**sym, "tf": tf},
+                one=True,
+            )
+            bars.append({"tf": tf, "t": _iso(r["t"]), "n24": int(n["n"])})
+    ind = await db.q(
+        s,
+        """select max(time_utc) t from aureon.indicators
+           where symbol=:sym and tf='M30' and rules_version=:rv""",
+        {**sym, "rv": config.RULES_VERSION},
+        one=True,
+    )
+    sig = await db.q(
+        s,
+        """select (select max(time_utc) from aureon.signals where source='live' and symbol=:sym) t,
+           (select count(*) from aureon.signals where source='live' and symbol=:sym
+            and time_utc > now() - interval '1 day') n24""",
+        sym,
+        one=True,
+    )
+    risk = await db.q(
+        s,
+        """select state, ref_source from aureon.risk_state
+           order by broker_day desc, updated_at desc limit 1""",
+        one=True,
+    )
+    desired = await db.q(s, "select value from aureon.control where key='desired'", one=True)
+    out: dict[str, Any] = {
+        "state": sched["state"] if sched else None,
+        "heartbeats": [{**h, "last_beat": _iso(h["last_beat"])} for h in hbs],
+        "bars": bars,
+        "indicators_m30_latest": _iso(ind["t"]) if ind else None,
+        "signals": {"t": _iso(sig["t"]), "n24": int(sig["n24"])},
+        "risk": risk,
+        "control_desired": desired["value"] if desired else None,
+    }
+    if detail:
+        out["diagnostics"] = await _health_diagnostics(s, hbs)
+    return out
+
+
+async def _health_diagnostics(s: AsyncSession, hbs: list[dict[str, Any]]) -> dict[str, Any]:
+    now = dt.datetime.now(dt.UTC)
+    stale_after = config.HEARTBEAT_SEC * config.HEARTBEAT_MISS_LIMIT
+    ages = {
+        h["service"]: {
+            "age_s": round((now - h["last_beat"]).total_seconds(), 1),
+            "stale": (now - h["last_beat"]).total_seconds() > stale_after,
+        }
+        for h in hbs
+    }
+    ingest = await db.q(
+        s,
+        """select path, max(time_utc) t from aureon.api_audit
+           where time_utc > now() - interval '2 days' and method='POST'
+           and status between 200 and 299
+           and path in ('/api/v1/ingest/bars','/api/v1/ingest/mt5_deals','/api/v1/ingest/heartbeat')
+           group by path""",
+    )
+    jobs_open = await db.q(
+        s,
+        """select state, count(*) n from aureon.jobs where done_at is null
+           and state in ('pending','running') group by state""",
+    )
+    failed = await db.q(
+        s,
+        """select id, kind, state, attempts, result, coalesce(done_at, claimed_at) at
+           from aureon.jobs where state in ('failed','dead')
+           or (state='pending' and attempts>0 and result is not null)
+           order by id desc limit 5""",
+    )
+    alerts_failed = await db.q(
+        s,
+        """select alert_key, last_error, created_at at from aureon.alerts
+           where state='FAILED' order by id desc limit 5""",
+    )
+    names = {"/api/v1/ingest/bars": "bars", "/api/v1/ingest/mt5_deals": "mt5_deals",
+             "/api/v1/ingest/heartbeat": "heartbeat"}  # fmt: skip
+    return {
+        "generated_at": now,
+        "heartbeat_stale_after_s": stale_after,
+        "heartbeat_ages": ages,
+        "last_ingest": {
+            n: next((r["t"] for r in ingest if r["path"] == p), None) for p, n in names.items()
+        },
+        "jobs": {
+            "pending": next((int(r["n"]) for r in jobs_open if r["state"] == "pending"), 0),
+            "running": next((int(r["n"]) for r in jobs_open if r["state"] == "running"), 0),
+            "recent_failures": failed,
+        },
+        "errors": [
+            {
+                "source": f"job:{j['kind']}",
+                "id": j["id"],
+                "state": j["state"],
+                "detail": j["result"],
+                "at": j["at"],
+            }
+            for j in failed
+        ]
+        + [
+            {
+                "source": "alert",
+                "id": a["alert_key"],
+                "state": "FAILED",
+                "detail": a["last_error"],
+                "at": a["at"],
+            }
+            for a in alerts_failed
+        ],
+    }
 
 
 @router.get("/ingest/last_bar")

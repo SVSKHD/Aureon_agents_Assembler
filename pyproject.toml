@@ -64,6 +64,7 @@ extend-exclude = [
     "app/aureon/matcher.py",
     "app/aureon/positions.py",
     "tests/fixtures/aureon_v163",
+    "tests/fixtures/aureon_v164",
 ]
 
 [tool.ruff.lint]
@@ -80,7 +81,7 @@ ignore = ["S101"]  # asserts are fine in tests
 python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy"]
-exclude = ["alembic/versions/", "tests/fixtures/aureon_v163/"]
+exclude = ["alembic/versions/", "tests/fixtures/aureon_v163/", "tests/fixtures/aureon_v164/"]
 
 [[tool.mypy.overrides]]
 # Aureon V1.6.3 strategy code, kept byte-for-byte as shipped (untyped, see docs/34).

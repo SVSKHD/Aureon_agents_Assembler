@@ -41,6 +41,7 @@ AUREON_MACHINE = {
     ("GET", "/api/v1/chart"),
     ("GET", "/api/v1/ingest/control"),
     ("GET", "/api/v1/ingest/daily_pnl"),
+    ("GET", "/api/v1/ingest/health_summary"),
     ("GET", "/api/v1/ingest/last_bar"),
     ("GET", "/api/v1/ingest/recent_signal"),
     ("GET", "/api/v1/ingest/risk"),

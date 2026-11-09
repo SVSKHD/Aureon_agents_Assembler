@@ -406,7 +406,7 @@ def test_prod_checks_on_aureon_tokens() -> None:
 
 
 def test_cloudflare_machine_paths_are_exact() -> None:
-    for p in ("/api/v1/ingest/bars", "/api/v1/ingest/trade/12", "/api/v1/ingest/jobs/claim", "/api/v1/ingest/jobs/3/finish",
+    for p in ("/api/v1/ingest/bars", "/api/v1/ingest/health_summary", "/api/v1/ingest/trade/12", "/api/v1/ingest/jobs/claim", "/api/v1/ingest/jobs/3/finish",
               "/api/v1/status", "/api/v1/signals/9", "/api/v1/review/latest", "/api/v1/review/reports/4/files/summary.html",
               "/api/v1/admin/risk/clear", "/api/v1/aureon/healthz", "/api/trading/mt5/ingest"):  # fmt: skip
         assert is_machine_path(p), p
