@@ -76,6 +76,7 @@ ignore = ["S101"]  # asserts are fine in tests
 # Aureon V1.6.3 ports: operator messages, report text and SQL kept as V1.6.3 wrote them.
 "app/aureon/*.py" = ["E501", "RUF001", "RUF002", "RUF003", "UP031"]
 "tests/test_aureon_*.py" = ["S", "B", "E501", "RUF001"]
+"tests/test_admin_password_reset_db.py" = ["S", "B", "E501"]
 
 [tool.mypy]
 python_version = "3.12"

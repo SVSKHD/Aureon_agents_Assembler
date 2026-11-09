@@ -69,7 +69,8 @@ the per-IP limit becomes global.
 - **Role changes** (`AuthService.change_role`) are audited (`role_changed`, from → to) and revoke
   the target's sessions, so the new permissions apply immediately. No HTTP endpoint exposes this yet.
 - **Audited events:** `login`, `login_failed`, `login_rate_limited`, `logout`,
-  `sessions_revoked_all`, `role_changed`, `admin_bootstrapped`. Passwords and tokens are never logged.
+  `sessions_revoked_all`, `role_changed`, `admin_bootstrapped`, `admin_password_reset`. Passwords
+  and tokens are never logged.
 
 ### Admin bootstrap
 
@@ -80,6 +81,26 @@ docker compose run --rm -it migrate python -m app.auth.bootstrap --email you@exa
 The password is read from stdin (asked twice on a terminal) and must be at least 12 characters.
 The script refuses to run if an admin already exists, and a Postgres advisory lock serializes
 concurrent runs. `scripts/bootstrap_admin.py` is the same tool for a dev checkout.
+
+### Admin password reset (operator action, never part of a deploy)
+
+```bash
+docker compose run --rm -it migrate python -m app.auth.reset_password --email you@example.com
+```
+
+Resets the password of an **existing, active admin** in place: same UUID, email, role and data.
+It asks for the new password twice without echo (≥ 12 characters, no leading/trailing spaces;
+`--stdin` reads one line instead, for scripted use from a password manager), stores an Argon2id
+hash, revokes every open session of that admin, and records `admin_password_reset` (session
+count only). It is one transaction: on any error nothing changes. It refuses unknown emails,
+non-admins and deactivated accounts, and never creates or deletes a user.
+
+The row is locked with `FOR UPDATE OF users`: `User.role` is a joined eager load, so a plain
+`FOR UPDATE` would lock through a `LEFT OUTER JOIN` and PostgreSQL rejects it ("FOR UPDATE cannot
+be applied to the nullable side of an outer join").
+
+After a reset, sign in again. Repeated failed logins before the reset may still be rate-limited
+for up to `LOGIN_WINDOW_SECONDS` (15 min); a successful login clears the per-email counter.
 
 ## Finance
 
