@@ -46,6 +46,7 @@ from app.integrations.github import build_github_client
 from app.integrations.github.client import GitHubClient, GitHubError
 from app.models.agents import Agent, AgentLog, AgentRun, ScheduledJob
 from app.models.auth import UserSession
+from app.models.brokers import DhanInstrumentSyncRun
 from app.models.finance import FinanceTombstone
 from app.models.trading import BrokerAccount
 from app.services import (
@@ -148,7 +149,15 @@ def _dhan(ctx: TaskContext) -> DhanAdapter:
 
 
 async def dhan_refresh_instruments(ctx: TaskContext) -> dict[str, Any]:
-    return await dhan_sync.sync_instruments(ctx.maker, _dhan(ctx))
+    """The instrument master is a public file: no Dhan session is needed, so the refresh runs
+    even while the token is expired or missing (docs/35-market-data.md)."""
+    s = ctx.settings
+    return await dhan_sync.sync_instruments(
+        ctx.maker,
+        ctx.dhan,
+        url=s.DHAN_INSTRUMENT_CSV_URL,
+        segments=s.DHAN_INSTRUMENT_SEGMENTS,
+    )
 
 
 async def dhan_reconcile(ctx: TaskContext) -> dict[str, Any]:
@@ -507,15 +516,12 @@ def default_jobs(settings: Settings) -> list[tuple[str, str, str]]:
         # Even without a usable token: an expired/rejected credential must stay visible.
         jobs.append(("dhan-session-check", "dhan_session_check", settings.DHAN_SESSION_CHECK_CRON))
         jobs.append(("dhan-monitor", "dhan_monitor", settings.DHAN_MONITOR_CRON))
+        # Public file, no token needed: registered with the client id, not the session.
+        jobs.append(
+            ("dhan-refresh-instruments", "dhan_refresh_instruments", settings.DHAN_INSTRUMENTS_CRON)
+        )
     if settings.dhan_configured:
-        jobs += [
-            (
-                "dhan-refresh-instruments",
-                "dhan_refresh_instruments",
-                settings.DHAN_INSTRUMENTS_CRON,
-            ),
-            ("dhan-reconcile", "dhan_reconcile", settings.DHAN_RECONCILE_CRON),
-        ]
+        jobs.append(("dhan-reconcile", "dhan_reconcile", settings.DHAN_RECONCILE_CRON))
         if settings.DHAN_BACKFILL_INSTRUMENTS:
             jobs.append(
                 ("dhan-backfill-candles", "dhan_backfill_candles", settings.DHAN_BACKFILL_CRON)
@@ -596,6 +602,39 @@ class Scheduler:
                     )
                     .on_conflict_do_nothing(index_elements=[ScheduledJob.id])
                 )
+            await self._prepare_instrument_refresh(db, now)
+
+    async def _prepare_instrument_refresh(self, db: Any, now: datetime) -> None:
+        """Give the instrument refresh enough time for the full master, and run it now (not at
+        the next 08:11 IST weekday) when no refresh has succeeded within
+        DHAN_INSTRUMENT_MAX_AGE_HOURS: a fresh install otherwise has no instruments for up to
+        three days."""
+        job_id = "dhan-refresh-instruments"
+        if job_id not in {j[0] for j in default_jobs(self.settings)}:
+            return
+        timeout = self.settings.DHAN_INSTRUMENT_SYNC_TIMEOUT_SECONDS
+        await db.execute(
+            update(ScheduledJob)
+            .where(ScheduledJob.id == job_id, ScheduledJob.timeout_seconds < timeout)
+            .values(timeout_seconds=timeout)
+        )
+        last_ok = await db.scalar(
+            select(func.max(DhanInstrumentSyncRun.finished_at)).where(
+                DhanInstrumentSyncRun.status == "succeeded"
+            )
+        )
+        max_age = timedelta(hours=self.settings.DHAN_INSTRUMENT_MAX_AGE_HOURS)
+        if last_ok is None or now - last_ok > max_age:
+            await db.execute(
+                update(ScheduledJob)
+                .where(
+                    ScheduledJob.id == job_id,
+                    ScheduledJob.paused.is_(False),
+                    ScheduledJob.next_run_at > now,
+                )
+                .values(next_run_at=now)
+            )
+            log.info("dhan_instruments_bootstrap", last_success=last_ok)
 
     async def _claim(self) -> ScheduledJob | None:
         async with self.maker() as db, db.begin():

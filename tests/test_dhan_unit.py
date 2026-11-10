@@ -171,7 +171,62 @@ def test_instrument_master_detailed_and_compact() -> None:
     assert eq.strike is None and eq.option_type is None and eq.expiry is None  # -0.01 / XX
     compact = {i.broker_instrument_id: i for i, _ in rows("master_compact.csv")}
     assert set(compact) == {"IDX_I:1", "BSE_CURRENCY:1026077"}
-    assert compact["BSE_CURRENCY:1026077"].tick_size == Decimal("0.25")
+    # TICK_SIZE is in paise in both master formats: 0.25 paise = ₹0.0025 (USDINR).
+    assert compact["BSE_CURRENCY:1026077"].tick_size == Decimal("0.0025")
+    assert compact["BSE_CURRENCY:1026077"].trading_symbol == "USDINR-28Aug2024-FUT"
+
+
+def test_instrument_master_real_rows() -> None:
+    """Rows copied verbatim from Dhan's published master (tests/fixtures/dhan/README.md)."""
+    import csv
+
+    with (FIX / "master_real_sample.csv").open(encoding="utf-8") as f:
+        parsed = [r for r in (parse.instrument_row(x) for x in csv.DictReader(f)) if r]
+    infos = {i.broker_instrument_id: i for i, _ in parsed}
+    # NSE,M (NSE commodity) has no API segment and is skipped; the duplicate collapses here.
+    assert not any(k.startswith("MCX_COMM:") and k.endswith(":121601") for k in infos)
+    rel = infos["NSE_EQ:2885"]
+    assert (rel.trading_symbol, rel.display_name, rel.name, rel.isin, rel.series) == (
+        "RELIANCE",
+        "Reliance Industries",
+        "RELIANCE INDUSTRIES LTD",
+        "INE002A01018",
+        "EQ",
+    )
+    assert rel.security_type == "ES" and rel.tick_size == Decimal("0.1")
+    assert infos["NSE_EQ:3499"].tick_size == Decimal("0.01")  # "1.0000" paise
+    assert infos["BSE_EQ:500325"].tick_size == Decimal("0.05")  # "5.0000" paise
+    assert infos["NSE_EQ:1000"].security_type == "DBT"  # a G-sec listed on NSE_EQ
+    assert infos["NSE_EQ:10176"].security_type == "ETF"
+    nifty = infos["IDX_I:13"]
+    assert nifty.trading_symbol == "NIFTY" and nifty.instrument_type == "INDEX"
+    assert nifty.expiry is None and nifty.option_type is None
+    opt = infos["NSE_FNO:45410"]
+    assert (opt.trading_symbol, opt.strike, opt.option_type, opt.lot_size, opt.expiry) == (
+        "NIFTY-Nov2026-25500-CE",
+        Decimal("25500.00000"),
+        "CE",
+        Decimal("65.0"),
+        date(2026, 11, 17),
+    )
+    # Index derivatives carry an exchange token, not the IDX_I id (13).
+    assert opt.underlying == "NIFTY" and opt.underlying_security_id == "26000"
+    fut = infos["NSE_FNO:61471"]
+    assert fut.strike is None and fut.option_type is None and fut.name is None
+    stk = infos["NSE_FNO:125967"]
+    assert stk.underlying == "RELIANCE" and stk.underlying_security_id == "2885"
+    # BSE derivative SYMBOL_NAME is a short code ("BSXOPT"): the display name is used.
+    assert infos["BSE_FNO:1100742"].trading_symbol == "SENSEX 26 NOV 70800 PUT"
+    assert infos["BSE_CURRENCY:1026077"].expiry == date(2024, 8, 28)  # listed, but expired
+
+
+def test_expiry_rule() -> None:
+    from app.services.dhan_sync import is_expired
+
+    today = date(2026, 11, 17)
+    assert not is_expired(None, today)
+    assert not is_expired(date(2026, 11, 17), today)  # tradable on its expiry day
+    assert is_expired(date(2026, 11, 16), today)
 
 
 def test_token_expiry_and_ref_parsing() -> None:

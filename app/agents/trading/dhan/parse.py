@@ -413,6 +413,7 @@ def instrument_row(row: dict[str, str]) -> tuple[InstrumentInfo, dict[str, Any]]
     underlying = _clean(row.get("UNDERLYING_SYMBOL", ""))
     compact_symbol = _clean(row.get("SEM_TRADING_SYMBOL", ""))
     is_derivative = instrument in DERIVATIVE_TYPES
+    trading_symbol: str | None
     if compact_symbol:
         trading_symbol = compact_symbol
     elif is_derivative:
