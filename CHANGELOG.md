@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased: Dhan instrument master fixes (market-data part 1)
+
+- **Instruments now load without waiting for 08:11 IST.** At startup the scheduler runs
+  `dhan-refresh-instruments` at once when no refresh succeeded within
+  `DHAN_INSTRUMENT_MAX_AGE_HOURS` (80). The job is registered whenever `DHAN_CLIENT_ID` is set:
+  the master is a public file and needs no Dhan session. Its timeout is raised to
+  `DHAN_INSTRUMENT_SYNC_TIMEOUT_SECONDS` (1800).
+- **Tick sizes were 100x too large:** the master's `TICK_SIZE` is in paise (`5.0000` = ₹0.05).
+  Every Dhan instrument's `tick_size` is corrected on the next refresh.
+- Normalized master fields on `trading.instruments` (migration 0028): `trading_symbol`
+  (`INFY`, `NIFTY-Nov2026-25500-CE`), `display_name`, `name`, `isin`, `series`,
+  `security_type`, `underlying_security_id`, `inactive_reason`, plus search/derivative indexes.
+- Only `DHAN_INSTRUMENT_SEGMENTS` are kept (default NSE_EQ, BSE_EQ, IDX_I, NSE_FNO, BSE_FNO).
+  Contracts past expiry are stored inactive (`expired`); rows missing from the master are
+  deactivated (`missing_from_master` / `segment_disabled`), never deleted.
+- Every refresh is recorded in `dhan.instrument_sync_runs` (rows read, skipped, duplicates,
+  upserted, expired, deactivated, per segment, error); one refresh at a time (advisory lock).
+- Migration 0028 also creates the (still unused) watchlist, candle-backfill and screener
+  tables for the follow-up parts. `DHAN_UNIVERSE_BACKFILL*` settings are accepted but no job
+  reads them yet.
+
 ## Unreleased: admin password reset
 
 - `python -m app.auth.reset_password --email …` resets an existing, active admin's password in

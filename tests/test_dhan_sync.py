@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -28,7 +29,12 @@ from app.auth.bootstrap import bootstrap_admin
 from app.core.config import Settings
 from app.main import create_app
 from app.models.agents import AgentLog, ScheduledJob
-from app.models.brokers import DhanAccountProfile, DhanFundSnapshot, DhanInstrument
+from app.models.brokers import (
+    DhanAccountProfile,
+    DhanFundSnapshot,
+    DhanInstrument,
+    DhanInstrumentSyncRun,
+)
 from app.models.trading import (
     BrokerAccount,
     BrokerOrderRow,
@@ -97,6 +103,7 @@ async def env(db_clean: str) -> AsyncIterator[Env]:
             "dhan.instruments",
             "dhan.account_profiles",
             "dhan.fund_snapshots",
+            "dhan.instrument_sync_runs",
             "trading.instruments",
         ):
             await conn.exec_driver_sql(f"DELETE FROM {t}")
@@ -132,9 +139,12 @@ async def test_instrument_sync_upserts_links_and_deactivates(env: Env) -> None:
                 updated_at=datetime.now(UTC) - timedelta(days=1),
             )
         )
-    out = await dhan_sync.sync_instruments(env.maker, env.adapter)
-    assert out == {"instruments": 3, "deactivated": 1}
-    out2 = await dhan_sync.sync_instruments(env.maker, env.adapter)  # idempotent
+    # Fixed "today" so the fixture's 2026-11-26 option is not treated as expired later.
+    day = date(2026, 11, 10)
+    out = await dhan_sync.sync_instruments(env.maker, env.adapter, today=day)
+    assert (out["instruments"], out["deactivated"], out["expired"]) == (3, 1, 0)
+    assert out["rows_unparsed"] == 1  # the NSE,M row has no API segment
+    out2 = await dhan_sync.sync_instruments(env.maker, env.adapter, today=day)  # idempotent
     assert out2["instruments"] == 3 and await env.count(DhanInstrument) == 3
     async with env.maker() as db:
         opt = await db.scalar(
@@ -146,7 +156,13 @@ async def test_instrument_sync_upserts_links_and_deactivates(env: Env) -> None:
         )
     assert opt and opt.lot_size == Decimal(75) and opt.underlying == "NIFTY" and opt.is_active
     assert d and d.trading_instrument_id == opt.id and d.instrument == "OPTIDX"
-    assert old and old.is_active is False
+    assert old and old.is_active is False and old.inactive_reason == "missing_from_master"
+    async with env.maker() as db:
+        runs = (
+            await db.scalars(select(DhanInstrumentSyncRun).order_by(DhanInstrumentSyncRun.id))
+        ).all()
+    assert [r.status for r in runs] == ["succeeded", "succeeded"]
+    assert runs[0].upserted == 3 and runs[0].source_host == urlsplit(CSV_URL).hostname
     # The DB resolver now knows the instrument type needed for chart APIs.
     ref = await DbInstrumentResolver(env.maker).resolve("NSE_FNO:52175")
     assert ref and ref.instrument == "OPTIDX"

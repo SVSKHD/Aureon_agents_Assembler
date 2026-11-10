@@ -289,13 +289,13 @@ async def iter_master(
     *,
     transport: httpx.AsyncBaseTransport | None = None,
     stats: MasterStats | None = None,
-    timeout: float = 120.0,
+    read_timeout: float = 120.0,
 ) -> AsyncIterator[tuple[InstrumentInfo, dict[str, Any]]]:
     """Stream Dhan's public instrument master CSV. Needs no Dhan credential, so the instrument
     refresh does not depend on a valid session."""
     stats = stats if stats is not None else MasterStats()
     async with (
-        httpx.AsyncClient(timeout=timeout, transport=transport) as http,
+        httpx.AsyncClient(timeout=read_timeout, transport=transport) as http,
         http.stream("GET", url) as resp,
     ):
         if resp.status_code >= 400:
