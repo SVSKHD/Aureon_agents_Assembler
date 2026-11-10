@@ -180,6 +180,15 @@ class InstrumentInfo(_Checked):
     strike: Decimal | None = None
     option_type: str | None = None
     underlying: str | None = None
+    # Exchange trading symbol ("RELIANCE", "NIFTY-Dec2026-24000-CE"); `symbol` stays the
+    # broker's display name for backwards compatibility.
+    trading_symbol: str | None = None
+    display_name: str | None = None
+    name: str | None = None  # company / long name (equities)
+    isin: str | None = None
+    series: str | None = None  # NSE series (EQ, BE, ...) / BSE group (A, B, ...)
+    security_type: str | None = None  # Dhan INSTRUMENT_TYPE: ES (equity share), ETF, DBT, ...
+    underlying_security_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +199,14 @@ class Quote(_Checked):
     bid: Decimal | None = None
     ask: Decimal | None = None
     volume: Decimal | None = None
+    # Session values as the broker reports them; None when the broker did not send them.
+    open: Decimal | None = None
+    high: Decimal | None = None
+    low: Decimal | None = None
+    close: Decimal | None = None  # Dhan: previous session's close while the market is open
+    oi: Decimal | None = None
+    average_price: Decimal | None = None
+    net_change: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)

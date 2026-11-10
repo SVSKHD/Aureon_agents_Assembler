@@ -262,23 +262,8 @@ class DhanAdapter(BrokerAdapter):
 
     async def iter_master(self) -> AsyncIterator[tuple[InstrumentInfo, dict[str, Any]]]:
         """Stream Dhan's instrument master CSV (public file, no credentials)."""
-        async with (
-            httpx.AsyncClient(timeout=120, transport=self._csv_transport) as http,
-            http.stream("GET", self.csv_url) as resp,
-        ):
-            if resp.status_code >= 400:
-                raise BrokerError(f"instrument master download failed: HTTP {resp.status_code}")
-            header: list[str] | None = None
-            async for line in resp.aiter_lines():
-                if not line.strip():
-                    continue
-                cells = next(csv.reader([line]))
-                if header is None:
-                    header = [h.lstrip("﻿").strip() for h in cells]
-                    continue
-                parsed = parse.instrument_row(dict(zip(header, cells, strict=False)))
-                if parsed is not None:
-                    yield parsed
+        async for parsed in iter_master(self.csv_url, transport=self._csv_transport):
+            yield parsed
 
     def subscribe_ticks(self, symbols: Sequence[str]) -> AsyncIterator[Tick]:
         raise NotSupported(
@@ -286,6 +271,49 @@ class DhanAdapter(BrokerAdapter):
             "subscribe_ticks",
             "live ticks come from the dhan-feed worker (app/workers/dhan_feed.py)",
         )
+
+
+class MasterStats:
+    """Row accounting for one master download (kept by `iter_master`)."""
+
+    def __init__(self) -> None:
+        self.lines = 0
+        self.unparsed = 0  # unknown segment / no security id
+
+    def as_dict(self) -> dict[str, int]:
+        return {"lines": self.lines, "unparsed": self.unparsed}
+
+
+async def iter_master(
+    url: str,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+    stats: MasterStats | None = None,
+    timeout: float = 120.0,
+) -> AsyncIterator[tuple[InstrumentInfo, dict[str, Any]]]:
+    """Stream Dhan's public instrument master CSV. Needs no Dhan credential, so the instrument
+    refresh does not depend on a valid session."""
+    stats = stats if stats is not None else MasterStats()
+    async with (
+        httpx.AsyncClient(timeout=timeout, transport=transport) as http,
+        http.stream("GET", url) as resp,
+    ):
+        if resp.status_code >= 400:
+            raise BrokerError(f"instrument master download failed: HTTP {resp.status_code}")
+        header: list[str] | None = None
+        async for line in resp.aiter_lines():
+            if not line.strip():
+                continue
+            cells = next(csv.reader([line]))
+            if header is None:
+                header = [h.lstrip("﻿").strip() for h in cells]
+                continue
+            stats.lines += 1
+            parsed = parse.instrument_row(dict(zip(header, cells, strict=False)))
+            if parsed is None:
+                stats.unparsed += 1
+                continue
+            yield parsed
 
 
 def market_day_bounds(day: date) -> tuple[datetime, datetime]:

@@ -115,6 +115,16 @@ class Instrument(Base):
     underlying: Mapped[str | None] = mapped_column(String(100))
     is_active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
     updated_at: Mapped[datetime] = _created()
+    # Migration 0028 (docs/35-market-data.md): normalized master fields for search/screening.
+    trading_symbol: Mapped[str | None] = mapped_column(String(100))
+    display_name: Mapped[str | None] = mapped_column(String(200))
+    name: Mapped[str | None] = mapped_column(String(200))
+    isin: Mapped[str | None] = mapped_column(String(16))
+    series: Mapped[str | None] = mapped_column(String(16))
+    security_type: Mapped[str | None] = mapped_column(String(16))
+    underlying_security_id: Mapped[str | None] = mapped_column(String(32))
+    # Why is_active is false: missing_from_master | expired | segment_disabled.
+    inactive_reason: Mapped[str | None] = mapped_column(String(24))
 
 
 class Strategy(Base):
@@ -639,3 +649,145 @@ class Reconciliation(Base):
     drift: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, server_default=text("'[]'::jsonb"))
     summary: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
     created_at: Mapped[datetime] = _created()
+
+
+# --- market data, watchlists and screener (migration 0028, docs/35-market-data.md) ---------
+
+JOB_STATES = "('queued','running','done','failed','cancelled')"
+SCREENER_OUTCOMES = "('match','stale','insufficient_data','no_data','unsupported')"
+
+
+class Watchlist(Base):
+    """A user's named list of instruments. Owner-only (admins included): a watchlist is
+    personal, and membership never starts a market-data subscription by itself."""
+
+    __tablename__ = "watchlists"
+    __table_args__ = (
+        UniqueConstraint("owner_user_id", "name", name="uq_watchlists_owner_name"),
+        S,
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("core.users.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(100))
+    description: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _created()
+
+
+class WatchlistItem(Base):
+    __tablename__ = "watchlist_items"
+    __table_args__ = (
+        PrimaryKeyConstraint("watchlist_id", "instrument_id", name="pk_watchlist_items"),
+        Index("ix_trading_watchlist_items_instrument_id", "instrument_id"),
+        S,
+    )
+
+    watchlist_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("trading.watchlists.id", ondelete="CASCADE")
+    )
+    instrument_id: Mapped[int] = mapped_column(
+        ForeignKey("trading.instruments.id", ondelete="CASCADE")
+    )
+    position: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    added_at: Mapped[datetime] = _created()
+
+
+class CandleBackfillRequest(Base):
+    """One instrument x timeframe history request, worked by the research worker's
+    `candle-backfill` lane under the shared Dhan data rate limit. At most one open request
+    (queued/running) per instrument and timeframe."""
+
+    __tablename__ = "candle_backfill_requests"
+    __table_args__ = (
+        CheckConstraint(f"status IN {JOB_STATES}", name="status"),
+        CheckConstraint(f"timeframe IN {TIMEFRAMES}", name="timeframe"),
+        CheckConstraint("days >= 1", name="days"),
+        CheckConstraint("source IN ('user','universe','system')", name="source"),
+        Index(
+            "uq_candle_backfill_open",
+            "instrument_id",
+            "timeframe",
+            unique=True,
+            postgresql_where=text("status IN ('queued','running')"),
+        ),
+        Index("ix_trading_candle_backfill_requests_status_created", "status", "created_at"),
+        S,
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    instrument_id: Mapped[int] = mapped_column(
+        ForeignKey("trading.instruments.id", ondelete="CASCADE")
+    )
+    timeframe: Mapped[str] = mapped_column(String(4))
+    days: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(12), server_default=text("'queued'"))
+    source: Mapped[str] = mapped_column(String(16), server_default=text("'user'"))
+    requested_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("core.users.id", ondelete="SET NULL")
+    )
+    attempts: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    candles: Mapped[int | None] = mapped_column(Integer)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created()
+    started_at: Mapped[datetime | None] = mapped_column(TS)
+    finished_at: Mapped[datetime | None] = mapped_column(TS)
+
+
+class ScreenerRun(Base):
+    """A screener scan: the validated request, progress and summary. Results live in
+    trading.screener_results (matches, plus instruments that could not be evaluated)."""
+
+    __tablename__ = "screener_runs"
+    __table_args__ = (
+        CheckConstraint(f"status IN {JOB_STATES}", name="status"),
+        CheckConstraint(f"timeframe IN {TIMEFRAMES}", name="timeframe"),
+        Index("ix_trading_screener_runs_owner_created", "owner_user_id", "created_at"),
+        Index("ix_trading_screener_runs_status_created", "status", "created_at"),
+        Index("ix_trading_screener_runs_owner_hash", "owner_user_id", "request_hash"),
+        S,
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("core.users.id", ondelete="CASCADE")
+    )
+    name: Mapped[str | None] = mapped_column(String(100))
+    timeframe: Mapped[str] = mapped_column(String(4))
+    request: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    request_hash: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(12), server_default=text("'queued'"))
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    universe_size: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    scanned: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    matched: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    skipped: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
+    data_as_of: Mapped[datetime | None] = mapped_column(TS)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created()
+    started_at: Mapped[datetime | None] = mapped_column(TS)
+    finished_at: Mapped[datetime | None] = mapped_column(TS)
+
+
+class ScreenerResult(Base):
+    __tablename__ = "screener_results"
+    __table_args__ = (
+        PrimaryKeyConstraint("run_id", "instrument_id", name="pk_screener_results"),
+        CheckConstraint(f"outcome IN {SCREENER_OUTCOMES}", name="outcome"),
+        Index("ix_trading_screener_results_run_outcome", "run_id", "outcome"),
+        S,
+    )
+
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("trading.screener_runs.id", ondelete="CASCADE")
+    )
+    instrument_id: Mapped[int] = mapped_column(
+        ForeignKey("trading.instruments.id", ondelete="CASCADE")
+    )
+    outcome: Mapped[str] = mapped_column(String(20))
+    candle_ts: Mapped[datetime | None] = mapped_column(TS)
+    # Decimal strings: close, volume, change_pct and every indicator the conditions used.
+    metrics: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
+    detail: Mapped[str | None] = mapped_column(String(200))

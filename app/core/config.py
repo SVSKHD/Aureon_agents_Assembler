@@ -231,6 +231,44 @@ class Settings(BaseSettings):
         default_factory=lambda: ["1d", "15m"]
     )
     DHAN_BACKFILL_DAYS: int = Field(default=30, ge=1, le=3650)
+    # --- instrument master, market data, screener (docs/35-market-data.md) ---
+    # Exchange segments the instrument refresh keeps active. Currency and commodity segments
+    # only when listed here explicitly.
+    DHAN_INSTRUMENT_SEGMENTS: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["NSE_EQ", "BSE_EQ", "IDX_I", "NSE_FNO", "BSE_FNO"]
+    )
+    # Readiness: the instrument master is stale after this long without a successful refresh.
+    DHAN_INSTRUMENT_MAX_AGE_HOURS: float = Field(default=80.0, gt=0)
+    DHAN_INSTRUMENT_SYNC_TIMEOUT_SECONDS: int = Field(default=1800, ge=60, le=7200)
+    # Universes whose daily candles the `dhan-universe-backfill` job keeps current (opt-in:
+    # each instrument is one Dhan data-API call). Names: nse_equities, bse_equities, indices,
+    # fno_stocks, watchlists (every instrument in any watchlist).
+    DHAN_UNIVERSE_BACKFILL: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    DHAN_UNIVERSE_BACKFILL_CRON: str = "55 16 * * 1-5"
+    DHAN_UNIVERSE_BACKFILL_DAYS: int = Field(default=400, ge=30, le=3650)
+    # Short-lived caches in front of rate-limited Dhan endpoints (quote 1/s, chain 1/3 s).
+    MARKET_QUOTE_CACHE_SECONDS: float = Field(default=3.0, ge=0, le=300)
+    OPTION_CHAIN_CACHE_SECONDS: float = Field(default=5.0, ge=0, le=300)
+    OPTION_EXPIRY_CACHE_SECONDS: float = Field(default=900.0, ge=0, le=86_400)
+    INDICATOR_CACHE_SECONDS: float = Field(default=60.0, ge=0, le=3600)
+    # Per-user request budgets for endpoints that can reach Dhan or do heavy work.
+    MARKET_USER_REQUESTS_PER_MINUTE: int = Field(default=120, ge=1, le=10_000)
+    # History requests: depth caps and how many one user may have open at once.
+    CANDLE_BACKFILL_MAX_DAYS_INTRADAY: int = Field(default=90, ge=1, le=365)
+    CANDLE_BACKFILL_MAX_DAYS_DAILY: int = Field(default=3650, ge=30, le=7300)
+    CANDLE_BACKFILL_USER_OPEN_MAX: int = Field(default=50, ge=1, le=5000)
+    CANDLE_BACKFILL_MAX_ATTEMPTS: int = Field(default=3, ge=1, le=10)
+    # Screener bounds.
+    SCREENER_MAX_UNIVERSE: int = Field(default=6000, ge=10, le=50_000)
+    SCREENER_INLINE_MAX: int = Field(default=100, ge=0, le=1000)
+    SCREENER_CHUNK: int = Field(default=200, ge=10, le=2000)
+    SCREENER_LOOKBACK_BARS: int = Field(default=300, ge=50, le=2000)
+    SCREENER_STALE_BARS: float = Field(default=4.0, gt=0)
+    SCREENER_CACHE_SECONDS: float = Field(default=300.0, ge=0, le=86_400)
+    SCREENER_USER_ACTIVE_MAX: int = Field(default=3, ge=1, le=100)
+    SCREENER_RETENTION_DAYS: int = Field(default=14, ge=1, le=365)
+    WATCHLIST_MAX_PER_USER: int = Field(default=50, ge=1, le=1000)
+    WATCHLIST_MAX_ITEMS: int = Field(default=500, ge=1, le=5000)
     # The static IP you whitelisted on Dhan (only scripts/dhan_preflight.py reads it).
     DHAN_STATIC_IP: str | None = None
     # API key login (docs/11-dhan.md, "Log in with the API key"): the key + secret from
@@ -381,7 +419,9 @@ class Settings(BaseSettings):
     # Candles read per (instrument, timeframe) for indicators and signals.
     RESEARCH_LOOKBACK_BARS: int = Field(default=500, ge=50, le=20_000)
     # Extra EMA periods always computed (strategies add their own).
-    RESEARCH_EMA_PERIODS: Annotated[list[int], NoDecode] = Field(default_factory=lambda: [9, 21])
+    RESEARCH_EMA_PERIODS: Annotated[list[int], NoDecode] = Field(
+        default_factory=lambda: [8, 9, 20, 21, 32, 50, 200]
+    )
     # Days of history the market-data agent asks the adapter for on an empty series.
     RESEARCH_BACKFILL_DAYS: int = Field(default=10, ge=1, le=365)
     # Data is stale when the newest candle is older than this many bars (in market hours).
@@ -951,6 +991,29 @@ class Settings(BaseSettings):
                 raise ValueError(f"IMAGE_MODELS[{name}]: bad sampler")
         return v
 
+    @field_validator("DHAN_INSTRUMENT_SEGMENTS")
+    @classmethod
+    def _check_segments(cls, v: list[str]) -> list[str]:
+        known = {
+            "IDX_I", "NSE_EQ", "NSE_FNO", "NSE_CURRENCY", "BSE_EQ", "MCX_COMM",
+            "BSE_CURRENCY", "BSE_FNO",
+        }  # fmt: skip
+        out = [s.strip().upper() for s in v if s.strip()]
+        bad = [s for s in out if s not in known]
+        if bad:
+            raise ValueError(f"DHAN_INSTRUMENT_SEGMENTS: unknown segment(s) {bad}")
+        return list(dict.fromkeys(out))
+
+    @field_validator("DHAN_UNIVERSE_BACKFILL")
+    @classmethod
+    def _check_universes(cls, v: list[str]) -> list[str]:
+        known = {"nse_equities", "bse_equities", "indices", "fno_stocks", "watchlists"}
+        out = [s.strip().lower() for s in v if s.strip()]
+        bad = [s for s in out if s not in known]
+        if bad:
+            raise ValueError(f"DHAN_UNIVERSE_BACKFILL: unknown universe(s) {bad}")
+        return list(dict.fromkeys(out))
+
     @field_validator("IMAGE_PAUSE_WINDOWS")
     @classmethod
     def _check_windows(cls, v: list[str]) -> list[str]:
@@ -968,6 +1031,8 @@ class Settings(BaseSettings):
         "DHAN_BACKFILL_INSTRUMENTS",
         "DHAN_BACKFILL_TIMEFRAMES",
         "DHAN_MARKET_HOLIDAYS",
+        "DHAN_INSTRUMENT_SEGMENTS",
+        "DHAN_UNIVERSE_BACKFILL",
         "RESEARCH_EMA_PERIODS",
         "CODE_PROTECTED_BRANCHES",
         "CODE_PUSH_BRANCH_PREFIXES",

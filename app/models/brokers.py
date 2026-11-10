@@ -70,6 +70,36 @@ class DhanInstrument(Base):
     fetched_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
 
 
+class DhanInstrumentSyncRun(Base):
+    """One instrument-master refresh: when, what it read and what it changed (migration 0028).
+    Makes the sync verifiable on its own, independent of the broker session."""
+
+    __tablename__ = "instrument_sync_runs"
+    __table_args__ = (
+        CheckConstraint("status IN ('running','succeeded','failed')", name="status"),
+        Index("ix_dhan_instrument_sync_runs_started_at", "started_at"),
+        {"schema": "dhan"},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    trigger: Mapped[str] = mapped_column(String(16))  # scheduled | bootstrap | manual
+    status: Mapped[str] = mapped_column(String(12))
+    source_host: Mapped[str | None] = mapped_column(String(200))
+    segments: Mapped[list[str]] = mapped_column(JSONB, server_default=text("'[]'::jsonb"))
+    rows_read: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    rows_unparsed: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    rows_skipped_segment: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    duplicates: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    upserted: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    active: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    expired: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    deactivated: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    by_segment: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
+    error: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(TS)
+
+
 class DhanAccountProfile(Base):
     __tablename__ = "account_profiles"
     __table_args__ = ({"schema": "dhan"},)

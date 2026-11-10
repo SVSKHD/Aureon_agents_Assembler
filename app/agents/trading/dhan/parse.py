@@ -250,17 +250,31 @@ def quotes(payload: dict[str, Any], as_of: datetime) -> list[Quote]:
             buy = (depth.get("buy") or [{}])[0]
             sell = (depth.get("sell") or [{}])[0]
             ts = ist_to_utc(q.get("last_trade_time"), "%d/%m/%Y %H:%M:%S") or as_of
+            ohlc = q.get("ohlc") or {}
             out.append(
                 Quote(
                     f"{seg}:{sid}",
                     ts,
                     last=dec(q.get("last_price")),
-                    bid=dec(buy.get("price")),
-                    ask=dec(sell.get("price")),
+                    # An empty depth level is reported as price 0: that is "no bid", not 0.
+                    bid=_positive(buy.get("price")),
+                    ask=_positive(sell.get("price")),
                     volume=dec(q.get("volume")),
+                    open=_positive(ohlc.get("open")),
+                    high=_positive(ohlc.get("high")),
+                    low=_positive(ohlc.get("low")),
+                    close=_positive(ohlc.get("close")),
+                    oi=dec(q.get("oi")),
+                    average_price=_positive(q.get("average_price")),
+                    net_change=dec(q.get("net_change")),
                 )
             )
     return out
+
+
+def _positive(v: Any) -> Decimal | None:
+    d = dec(v)
+    return d if d is not None and d > 0 else None
 
 
 def candles(payload: dict[str, Any]) -> list[Candle]:
@@ -355,20 +369,59 @@ def _col(row: dict[str, str], name: str) -> str:
     return (v or "").strip()
 
 
+DERIVATIVE_TYPES = frozenset(
+    {"FUTIDX", "OPTIDX", "FUTSTK", "OPTSTK", "FUTCUR", "OPTCUR", "FUTCOM", "OPTFUT"}
+)
+_NA = ("", "NA", "XX")
+
+
+def _clean(v: str) -> str | None:
+    v = (v or "").strip()
+    return None if v in _NA else v
+
+
+def tick_from_paise(v: str) -> Decimal | None:
+    """The master's TICK_SIZE is in paise: "5.0000" is ₹0.05, "1.0000" is ₹0.01, "0.2500"
+    (USDINR) is ₹0.0025. Checked against the published file (2026-11-10)."""
+    d = dec(v)
+    if d is None or d <= 0:
+        return None
+    return (d / 100).normalize()
+
+
 def instrument_row(row: dict[str, str]) -> tuple[InstrumentInfo, dict[str, Any]] | None:
-    """One master row → (normalized instrument, dhan.instruments values), or None to skip."""
+    """One master row → (normalized instrument, dhan.instruments values), or None to skip.
+
+    Columns (detailed CSV): EXCH_ID, SEGMENT, SECURITY_ID, ISIN, INSTRUMENT,
+    UNDERLYING_SECURITY_ID, UNDERLYING_SYMBOL, SYMBOL_NAME, DISPLAY_NAME, INSTRUMENT_TYPE,
+    SERIES, LOT_SIZE, SM_EXPIRY_DATE, STRIKE_PRICE, OPTION_TYPE, TICK_SIZE, ... The compact
+    CSV's SEM_* names are accepted too.
+
+    - Equities / indices: the exchange symbol is UNDERLYING_SYMBOL ("RELIANCE"); SYMBOL_NAME is
+      the company name ("RELIANCE INDUSTRIES LTD").
+    - Derivatives: SYMBOL_NAME is the exchange symbol on NSE ("NIFTY-Dec2026-24000-CE"); BSE
+      uses a short code ("BSXOPT"), so the display name is used there instead.
+    """
     row = {k.lstrip("﻿").strip(): v for k, v in row.items() if k}
     segment = CSV_SEGMENTS.get((_col(row, "EXCH_ID"), _col(row, "SEGMENT")))
     sid = _col(row, "SECURITY_ID")
-    if not segment or not sid:
+    if not segment or not sid or not sid.isdigit():
         return None
     instrument = _col(row, "INSTRUMENT") or "UNKNOWN"
-    symbol = (
-        _col(row, "DISPLAY_NAME")
-        or row.get("SEM_TRADING_SYMBOL", "").strip()
-        or _col(row, "SYMBOL_NAME")
-        or sid
-    )
+    display = _clean(_col(row, "DISPLAY_NAME"))
+    symbol_name = _clean(_col(row, "SYMBOL_NAME"))
+    underlying = _clean(row.get("UNDERLYING_SYMBOL", ""))
+    compact_symbol = _clean(row.get("SEM_TRADING_SYMBOL", ""))
+    is_derivative = instrument in DERIVATIVE_TYPES
+    if compact_symbol:
+        trading_symbol = compact_symbol
+    elif is_derivative:
+        trading_symbol = (
+            symbol_name if symbol_name and "-" in symbol_name else display or symbol_name
+        )
+    else:
+        trading_symbol = underlying or symbol_name
+    symbol = display or trading_symbol or symbol_name or sid
     expiry_txt = _col(row, "SM_EXPIRY_DATE")
     expiry = None
     if expiry_txt and not expiry_txt.startswith("0001"):
@@ -380,9 +433,14 @@ def instrument_row(row: dict[str, str]) -> tuple[InstrumentInfo, dict[str, Any]]
     strike = strike if strike is not None and strike > 0 else None
     opt_raw = _col(row, "OPTION_TYPE")
     opt = opt_raw if opt_raw in ("CE", "PE") else None
-    lot = dec(_col(row, "LOT_SIZE")) or Decimal(1)
-    tick = dec(_col(row, "TICK_SIZE")) or Decimal("0.05")
-    underlying = row.get("UNDERLYING_SYMBOL", "").strip() or None
+    lot = dec(_col(row, "LOT_SIZE"))
+    lot = lot if lot is not None and lot > 0 else Decimal(1)
+    tick = tick_from_paise(_col(row, "TICK_SIZE")) or Decimal("0.05")
+    isin = _clean(row.get("ISIN", ""))
+    series = _clean(row.get("SERIES", "") or row.get("SEM_SERIES", ""))
+    sec_type = _clean(row.get("INSTRUMENT_TYPE", "") or row.get("SEM_EXCH_INSTRUMENT_TYPE", ""))
+    underlying_sid = _clean(row.get("UNDERLYING_SECURITY_ID", ""))
+    name = symbol_name if not is_derivative else None
     info = InstrumentInfo(
         broker=BROKER,
         broker_instrument_id=f"{segment}:{sid}",
@@ -396,19 +454,26 @@ def instrument_row(row: dict[str, str]) -> tuple[InstrumentInfo, dict[str, Any]]
         expiry=expiry,
         strike=strike,
         option_type=opt,
-        underlying=underlying,
+        underlying=(underlying or (trading_symbol if not is_derivative else None) or None),
+        trading_symbol=(trading_symbol or symbol)[:100],
+        display_name=(display or symbol)[:200],
+        name=name[:200] if name else None,
+        isin=isin[:16] if isin else None,
+        series=series[:16] if series else None,
+        security_type=sec_type[:16] if sec_type else None,
+        underlying_security_id=underlying_sid[:32] if underlying_sid else None,
     )
     dhan_row = {
         "exchange_segment": segment,
         "security_id": sid,
-        "trading_symbol": symbol[:100],
+        "trading_symbol": (trading_symbol or symbol)[:100],
         "instrument": instrument[:32],
         "lot_size": lot,
         "tick_size": tick,
         "expiry_date": expiry,
         "strike_price": strike,
         "option_type": opt,
-        "underlying_security_id": (row.get("UNDERLYING_SECURITY_ID") or "").strip()[:32] or None,
+        "underlying_security_id": info.underlying_security_id,
         "raw": {k: v for k, v in row.items() if v not in (None, "")},
     }
     return info, dhan_row

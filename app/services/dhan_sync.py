@@ -20,19 +20,27 @@ from __future__ import annotations
 
 import secrets
 import uuid
-from datetime import UTC, datetime, timedelta
+from collections.abc import Sequence
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
+from urllib.parse import urlsplit
 
-from sqlalchemy import and_, select, text, update
+import httpx
+from sqlalchemy import and_, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.trading.dhan import parse
-from app.agents.trading.dhan.adapter import DhanAdapter
+from app.agents.trading.dhan.adapter import DhanAdapter, MasterStats, iter_master
 from app.agents.trading.types import Timeframe, session_for
 from app.core.logging import get_logger
-from app.models.brokers import DhanAccountProfile, DhanFundSnapshot, DhanInstrument
+from app.models.brokers import (
+    DhanAccountProfile,
+    DhanFundSnapshot,
+    DhanInstrument,
+    DhanInstrumentSyncRun,
+)
 from app.models.trading import (
     BrokerAccount,
     BrokerOrderRow,
@@ -102,77 +110,213 @@ async def _flush(
                 "strike": i.strike,
                 "option_type": i.option_type,
                 "underlying": i.underlying,
-                "is_active": True,
+                "trading_symbol": i.trading_symbol,
+                "display_name": i.display_name,
+                "name": i.name,
+                "isin": i.isin,
+                "series": i.series,
+                "security_type": i.security_type,
+                "underlying_security_id": i.underlying_security_id,
+                "is_active": active,
+                "inactive_reason": None if active else "expired",
                 "updated_at": now,
             }
-            for i in infos
+            for i, active in infos
         ]
     )
     await db.execute(
         t_ins.on_conflict_do_update(
             index_elements=[Instrument.broker, Instrument.broker_instrument_id],
-            set_={
-                c: t_ins.excluded[c]
-                for c in (
-                    "symbol",
-                    "exchange",
-                    "segment",
-                    "instrument_type",
-                    "currency",
-                    "lot_size",
-                    "tick_size",
-                    "expiry",
-                    "strike",
-                    "option_type",
-                    "underlying",
-                    "is_active",
-                    "updated_at",
-                )
-            },
+            set_={c: t_ins.excluded[c] for c in INSTRUMENT_UPDATE_COLUMNS},
         )
     )
 
 
+INSTRUMENT_UPDATE_COLUMNS = (
+    "symbol",
+    "exchange",
+    "segment",
+    "instrument_type",
+    "currency",
+    "lot_size",
+    "tick_size",
+    "expiry",
+    "strike",
+    "option_type",
+    "underlying",
+    "trading_symbol",
+    "display_name",
+    "name",
+    "isin",
+    "series",
+    "security_type",
+    "underlying_security_id",
+    "is_active",
+    "inactive_reason",
+    "updated_at",
+)
+DEFAULT_SEGMENTS = ("NSE_EQ", "BSE_EQ", "IDX_I", "NSE_FNO", "BSE_FNO")
+SYNC_LOCK = "dhan_instrument_sync"
+
+
+class SyncBusy(RuntimeError):
+    """Another instrument refresh holds the lock."""
+
+
+def is_expired(expiry: date | None, today: date) -> bool:
+    """A contract is tradable through its expiry day (IST)."""
+    return expiry is not None and expiry < today
+
+
+def today_ist(now: datetime | None = None) -> date:
+    return (now or datetime.now(UTC)).astimezone(parse.IST).date()
+
+
 async def sync_instruments(
-    maker: async_sessionmaker[AsyncSession], adapter: DhanAdapter
+    maker: async_sessionmaker[AsyncSession],
+    adapter: DhanAdapter | None = None,
+    *,
+    url: str | None = None,
+    segments: Sequence[str] | None = None,
+    trigger: str = "scheduled",
+    transport: httpx.AsyncBaseTransport | None = None,
+    today: date | None = None,
 ) -> dict[str, Any]:
+    """Instrument master → dhan.instruments + trading.instruments, recorded in
+    dhan.instrument_sync_runs.
+
+    - Only `segments` are kept (others are skipped and, if previously synced, deactivated with
+      reason `segment_disabled`).
+    - (exchange_segment, security_id) is the identity; a repeated row is counted and skipped.
+    - Contracts whose expiry is before today (IST) are stored inactive (`expired`): the
+      published master still lists some long-expired contracts.
+    - An instrument missing from today's master is deactivated (`missing_from_master`); it is
+      never deleted, so watchlists, signals and candles that reference it keep working.
+    - An empty master raises before anything is deactivated. One refresh at a time
+      (advisory lock); a second concurrent one raises SyncBusy.
+    The master is a public file, so no Dhan credential is needed (`adapter` is optional)."""
+    if adapter is None and url is None:
+        raise ValueError("pass the adapter or the master URL")
+    src = url or (adapter.csv_url if adapter is not None else "")
+    enabled = tuple(segments or DEFAULT_SEGMENTS)
+    today = today or today_ist()
     now = datetime.now(UTC)
-    seen = 0
-    infos: list[Any] = []
-    rows: list[dict[str, Any]] = []
-    keys: set[str] = set()
     async with maker() as db, db.begin():
-        async for info, row in adapter.iter_master():
-            if info.broker_instrument_id in keys:  # master sometimes repeats rows
-                continue
-            keys.add(info.broker_instrument_id)
-            infos.append(info)
-            rows.append(row)
-            seen += 1
-            if len(rows) >= BATCH:
-                await _flush(db, infos, rows, now)
-                infos, rows = [], []
-        await _flush(db, infos, rows, now)
-        if seen == 0:
-            raise RuntimeError("instrument master was empty; refusing to deactivate everything")
-        deactivated = await db.execute(
-            update(Instrument)
-            .where(
-                Instrument.broker == "dhan",
-                Instrument.updated_at < now,
-                Instrument.is_active.is_(True),
+        run_id = await db.scalar(
+            insert(DhanInstrumentSyncRun)
+            .values(
+                trigger=trigger[:16],
+                status="running",
+                source_host=(urlsplit(src).hostname or "")[:200] or None,
+                segments=list(enabled),
+                started_at=now,
             )
-            .values(is_active=False)
+            .returning(DhanInstrumentSyncRun.id)
         )
+    counts: dict[str, Any] = {
+        "rows_read": 0,
+        "rows_unparsed": 0,
+        "rows_skipped_segment": 0,
+        "duplicates": 0,
+        "upserted": 0,
+        "active": 0,
+        "expired": 0,
+        "deactivated": 0,
+    }
+    by_segment: dict[str, dict[str, int]] = {}
+    try:
+        async with maker() as db, db.begin():
+            got = await db.scalar(
+                text("SELECT pg_try_advisory_xact_lock(hashtext(:k))"), {"k": SYNC_LOCK}
+            )
+            if not got:
+                raise SyncBusy("another instrument refresh is running")
+            stats = MasterStats()
+            if transport is None and adapter is not None:
+                transport = adapter._csv_transport
+            source = iter_master(src, transport=transport, stats=stats)
+            infos: list[tuple[Any, bool]] = []
+            rows: list[dict[str, Any]] = []
+            keys: set[str] = set()
+            async for info, row in source:
+                seg = info.segment or ""
+                if seg not in enabled:
+                    counts["rows_skipped_segment"] += 1
+                    continue
+                if info.broker_instrument_id in keys:  # the master sometimes repeats rows
+                    counts["duplicates"] += 1
+                    continue
+                keys.add(info.broker_instrument_id)
+                active = not is_expired(info.expiry, today)
+                s = by_segment.setdefault(seg, {"rows": 0, "active": 0, "expired": 0})
+                s["rows"] += 1
+                s["active" if active else "expired"] += 1
+                counts["active" if active else "expired"] += 1
+                infos.append((info, active))
+                rows.append(row)
+                if len(rows) >= BATCH:
+                    await _flush(db, infos, rows, now)
+                    counts["upserted"] += len(rows)
+                    infos, rows = [], []
+            await _flush(db, infos, rows, now)
+            counts["upserted"] += len(rows)
+            counts["rows_read"] = (
+                stats.lines
+                if stats.lines
+                else counts["upserted"] + counts["duplicates"] + counts["rows_skipped_segment"]
+            )
+            counts["rows_unparsed"] = stats.unparsed
+            if counts["upserted"] == 0:
+                raise RuntimeError(
+                    "instrument master was empty (or had no rows for the enabled segments); "
+                    "refusing to deactivate everything"
+                )
+            res = await db.execute(
+                text(
+                    "UPDATE trading.instruments SET is_active = false, inactive_reason = "
+                    "CASE WHEN segment = ANY(:enabled) THEN 'missing_from_master' "
+                    "ELSE 'segment_disabled' END "
+                    "WHERE broker = 'dhan' AND updated_at < :now AND is_active"
+                ),
+                {"enabled": list(enabled), "now": now},
+            )
+            counts["deactivated"] = res.rowcount  # type: ignore[attr-defined]
+            await db.execute(
+                text(
+                    "UPDATE dhan.instruments d SET trading_instrument_id = t.id "
+                    "FROM trading.instruments t WHERE t.broker = 'dhan' "
+                    "AND t.broker_instrument_id = d.exchange_segment || ':' || d.security_id "
+                    "AND d.trading_instrument_id IS DISTINCT FROM t.id"
+                )
+            )
+    except Exception as exc:
+        async with maker() as db, db.begin():
+            await db.execute(
+                update(DhanInstrumentSyncRun)
+                .where(DhanInstrumentSyncRun.id == run_id)
+                .values(
+                    status="failed",
+                    error=f"{type(exc).__name__}: {exc}"[:1000],
+                    finished_at=func.now(),
+                    by_segment=by_segment,
+                    **{k: v for k, v in counts.items() if k != "deactivated"},
+                )
+            )
+        raise
+    async with maker() as db, db.begin():
         await db.execute(
-            text(
-                "UPDATE dhan.instruments d SET trading_instrument_id = t.id "
-                "FROM trading.instruments t WHERE t.broker = 'dhan' "
-                "AND t.broker_instrument_id = d.exchange_segment || ':' || d.security_id "
-                "AND d.trading_instrument_id IS DISTINCT FROM t.id"
-            )
+            update(DhanInstrumentSyncRun)
+            .where(DhanInstrumentSyncRun.id == run_id)
+            .values(status="succeeded", finished_at=func.now(), by_segment=by_segment, **counts)
         )
-    return {"instruments": seen, "deactivated": deactivated.rowcount}  # type: ignore[attr-defined]
+    log.info("dhan_instruments_synced", run_id=run_id, **counts)
+    # "instruments" / "deactivated" kept for the scheduler log and older callers.
+    return {
+        "run_id": run_id,
+        "instruments": counts["upserted"],
+        **counts,
+        "by_segment": by_segment,
+    }
 
 
 # --- account reconciliation ---------------------------------------------------------------
