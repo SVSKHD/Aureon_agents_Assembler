@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased: Gemini 3.5 Flash-Lite as the primary external model
+
+- Defaults ([docs/26-ai-providers.md](docs/26-ai-providers.md)): `AI_DEFAULT_EXTERNAL_PROVIDER`
+  `gemini`, `GEMINI_DEFAULT_MODEL` / `GEMINI_ALLOWED_MODELS` `gemini-3.5-flash-lite` (a blank
+  model means it too), `AGENT_NEWS/VOICE/RESEARCH_PROVIDER` `gemini`. A verified built-in price
+  (0.30 / 2.50 USD per million tokens, output incl. thinking) applies when the operator has not
+  priced the model; an operator price wins. Enable flags, keys, daily/global caps and
+  `AI_RESEARCH_EXTERNAL_ALLOWED` are unchanged. Saved settings and `.env` still take precedence.
+- Voice is unchanged (grammar, then optional local Ollama): its module may not import
+  services/DB code (approval-safety invariant), so it is not routed to Gemini.
+- Trading research explanations follow `AGENT_RESEARCH_PROVIDER`/`_MODEL` (Gemini first where
+  `AI_RESEARCH_EXTERNAL_ALLOWED`), record every attempt in `ai.model_calls` (agent
+  `trading-research`), and no longer require a local `RESEARCH_AI_MODEL` when external research
+  is permitted; without any model they fail visibly.
+- `ModelRouter.complete(..., allow_local=False)`: no Qwen call at all when the caller had no
+  local model. A successful external answer never triggers a local inference (tested).
+- `POST /api/v1/ai/route-check` (admin, CSRF): one fixed public prompt through an agent's real
+  route, returning the `ai.model_calls` rows it produced, to verify runtime routing.
+- The news job makes no model call (RSS ingest only), so there is nothing to route for News.
+
 ## Unreleased: market terminal backend (market-data part 2)
 
 - **Stock screener** ([docs/35-market-data.md](docs/35-market-data.md)): `POST

@@ -205,9 +205,12 @@ class ResearchWorker:
         lane.extra[status] = int(lane.extra.get(status, 0)) + 1
 
     async def do_ai(self, req: dict[str, Any]) -> None:
+        why = ai.unavailable_reason(self.settings)
+        if why is not None or self.ollama is None:
+            raise RuntimeError(why or "no Ollama client")
+        # The local model is the fallback only: an external answer (Gemini first, where
+        # permitted) is never followed by a local call.
         model = self.settings.RESEARCH_AI_MODEL
-        if not model or self.ollama is None:
-            raise RuntimeError("RESEARCH_AI_MODEL is not set")
         await ai.explain(
             self.maker,
             self.ollama,

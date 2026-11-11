@@ -76,6 +76,12 @@ def _settings(settings: Settings, **kw: Any) -> Settings:
         "OPENROUTER_DEFAULT_MODEL": "openai/gpt-4o-mini",
         "OPENROUTER_DAILY_LIMIT_USD": Decimal("1"),
         "MODEL_ROUTER_EXTERNAL_TIMEOUT_SECONDS": 0.2,
+        # These tests exercise the OpenRouter route ("auto" -> OpenRouter); the shipped
+        # defaults prefer Gemini (tests/test_gemini_routing.py).
+        "AI_DEFAULT_EXTERNAL_PROVIDER": "openrouter",
+        "AGENT_NEWS_PROVIDER": "auto",
+        "AGENT_VOICE_PROVIDER": "auto",
+        "AGENT_RESEARCH_PROVIDER": "auto",
     }
     return settings.model_copy(update={**base, **kw})
 

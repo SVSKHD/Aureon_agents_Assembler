@@ -1086,10 +1086,11 @@ async def risk_decisions(
 async def _explain(
     request: Request, settings: SettingsDep, kind: research_ai.Kind, subject: uuid.UUID
 ) -> ExplainQueued:
-    if not settings.RESEARCH_AI_MODEL:
+    why = research_ai.unavailable_reason(settings)
+    if why is not None:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"code": "ai_not_configured", "detail": "RESEARCH_AI_MODEL is not set"},
+            detail={"code": "ai_not_configured", "detail": why},
         )
     try:
         pos = await research_ai.enqueue(
