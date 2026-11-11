@@ -267,6 +267,13 @@ class Settings(BaseSettings):
     SCREENER_CACHE_SECONDS: float = Field(default=300.0, ge=0, le=86_400)
     SCREENER_USER_ACTIVE_MAX: int = Field(default=3, ge=1, le=100)
     SCREENER_RETENTION_DAYS: int = Field(default=14, ge=1, le=365)
+    # Hard wall-clock budget for one screener run (inline or in the research worker).
+    SCREENER_RUN_TIMEOUT_SECONDS: int = Field(default=300, ge=10, le=3600)
+    # Timeframes the dhan-universe-backfill job keeps current (1d by default; intraday for a
+    # whole exchange is one Dhan data call per instrument per refresh, so opt in knowingly).
+    DHAN_UNIVERSE_BACKFILL_TIMEFRAMES: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["1d"]
+    )
     WATCHLIST_MAX_PER_USER: int = Field(default=50, ge=1, le=1000)
     WATCHLIST_MAX_ITEMS: int = Field(default=500, ge=1, le=5000)
     # The static IP you whitelisted on Dhan (only scripts/dhan_preflight.py reads it).
@@ -1014,6 +1021,16 @@ class Settings(BaseSettings):
             raise ValueError(f"DHAN_UNIVERSE_BACKFILL: unknown universe(s) {bad}")
         return list(dict.fromkeys(out))
 
+    @field_validator("DHAN_UNIVERSE_BACKFILL_TIMEFRAMES")
+    @classmethod
+    def _check_universe_timeframes(cls, v: list[str]) -> list[str]:
+        ok = {"1m", "5m", "15m", "1h", "1d"}  # what Dhan's chart APIs serve
+        out = [s.strip().lower() for s in v if s.strip()]
+        bad = [s for s in out if s not in ok]
+        if bad:
+            raise ValueError(f"DHAN_UNIVERSE_BACKFILL_TIMEFRAMES: Dhan has no {bad} candles")
+        return list(dict.fromkeys(out))
+
     @field_validator("IMAGE_PAUSE_WINDOWS")
     @classmethod
     def _check_windows(cls, v: list[str]) -> list[str]:
@@ -1033,6 +1050,7 @@ class Settings(BaseSettings):
         "DHAN_MARKET_HOLIDAYS",
         "DHAN_INSTRUMENT_SEGMENTS",
         "DHAN_UNIVERSE_BACKFILL",
+        "DHAN_UNIVERSE_BACKFILL_TIMEFRAMES",
         "RESEARCH_EMA_PERIODS",
         "CODE_PROTECTED_BRANCHES",
         "CODE_PUSH_BRANCH_PREFIXES",

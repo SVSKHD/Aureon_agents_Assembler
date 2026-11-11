@@ -170,6 +170,13 @@ class MarketCandle(Base):
         CheckConstraint(f"timeframe IN {TIMEFRAMES}", name="timeframe"),
         CheckConstraint(f"session IN {SESSIONS}", name="session"),
         CheckConstraint("high >= low", name="high_low"),
+        # Migration 0029: newest real candle per timeframe (screener status).
+        Index(
+            "ix_trading_market_candles_timeframe_ts",
+            "timeframe",
+            text("ts DESC"),
+            postgresql_where=text("is_gap = false"),
+        ),
         S,
     )
 

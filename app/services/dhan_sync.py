@@ -274,7 +274,8 @@ async def sync_instruments(
             res = await db.execute(
                 text(
                     "UPDATE trading.instruments SET is_active = false, inactive_reason = "
-                    "CASE WHEN segment = ANY(:enabled) THEN 'missing_from_master' "
+                    "CASE WHEN coalesce(segment, split_part(broker_instrument_id, ':', 1)) "
+                    "= ANY(:enabled) THEN 'missing_from_master' "
                     "ELSE 'segment_disabled' END "
                     "WHERE broker = 'dhan' AND updated_at < :now AND is_active"
                 ),

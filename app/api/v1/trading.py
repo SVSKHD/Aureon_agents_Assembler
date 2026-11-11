@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, date, datetime
-from typing import Annotated
+from decimal import Decimal
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Header, HTTPException, Path, Query, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 
@@ -501,20 +502,79 @@ async def instruments(
     _: Current,
     broker: Broker | None = None,
     q: Annotated[str | None, Query(max_length=64)] = None,
-    instrument_type: Annotated[str | None, Query(max_length=32)] = None,
+    instrument_type: Annotated[
+        list[str] | None, Query(max_length=10, description="repeatable: FUTIDX, FUTSTK, …")
+    ] = None,
+    exchange: Annotated[list[Literal["NSE", "BSE", "MCX"]] | None, Query(max_length=3)] = None,
+    segment: Annotated[
+        list[str] | None, Query(max_length=8, description="repeatable: NSE_EQ, NSE_FNO, IDX_I…")
+    ] = None,
+    underlying: Annotated[str | None, Query(max_length=100)] = None,
+    expiry: date | None = None,
+    expiry_from: date | None = None,
+    expiry_to: date | None = None,
+    option_type: Literal["CE", "PE"] | None = None,
+    strike_min: Annotated[Decimal | None, Query(ge=0)] = None,
+    strike_max: Annotated[Decimal | None, Query(ge=0)] = None,
+    include_inactive: bool = False,
     limit: Limit = 50,
     offset: Offset = 0,
 ) -> Page[InstrumentOut]:
-    stmt = select(Instrument).where(Instrument.is_active.is_(True))
+    """Server-side search and filtering, applied before pagination. `q` matches the symbol,
+    trading symbol, display name or company name (case-insensitive substring; prefix matches
+    sort first). Futures: instrument_type=FUTIDX&instrument_type=FUTSTK; options: OPTIDX /
+    OPTSTK with expiry, option_type and a strike range."""
+    stmt = select(Instrument)
+    if not include_inactive:
+        stmt = stmt.where(Instrument.is_active.is_(True))
     if broker:
         stmt = stmt.where(Instrument.broker == broker.value)
+    order: list[Any] = []
     if q:
-        stmt = stmt.where(Instrument.symbol.ilike(f"%{q.replace('%', '').replace('_', '')}%"))
+        term = q.replace("%", "").replace("_", "").replace("\\", "").strip().lower()
+        if term:
+            like = f"%{term}%"
+            sym = func.lower(func.coalesce(Instrument.trading_symbol, Instrument.symbol))
+            stmt = stmt.where(
+                or_(
+                    func.lower(Instrument.symbol).like(like),
+                    func.lower(Instrument.trading_symbol).like(like),
+                    func.lower(Instrument.display_name).like(like),
+                    func.lower(Instrument.name).like(like),
+                )
+            )
+            order.append(case((sym == term, 0), (sym.like(f"{term}%"), 1), else_=2))
     if instrument_type:
-        stmt = stmt.where(Instrument.instrument_type == instrument_type)
+        stmt = stmt.where(Instrument.instrument_type.in_(instrument_type))
+    if exchange:
+        stmt = stmt.where(Instrument.exchange.in_(exchange))
+    if segment:
+        stmt = stmt.where(Instrument.segment.in_(segment))
+    if underlying:
+        stmt = stmt.where(func.upper(Instrument.underlying) == underlying.strip().upper())
+    if expiry:
+        stmt = stmt.where(Instrument.expiry == expiry)
+    if expiry_from:
+        stmt = stmt.where(Instrument.expiry >= expiry_from)
+    if expiry_to:
+        stmt = stmt.where(Instrument.expiry <= expiry_to)
+    if option_type:
+        stmt = stmt.where(Instrument.option_type == option_type)
+    if strike_min is not None:
+        stmt = stmt.where(Instrument.strike >= strike_min)
+    if strike_max is not None:
+        stmt = stmt.where(Instrument.strike <= strike_max)
     rows = (
         await db.scalars(
-            stmt.order_by(Instrument.symbol, Instrument.id).limit(limit).offset(offset)
+            stmt.order_by(
+                *order,
+                Instrument.expiry.asc().nulls_first(),
+                Instrument.strike.asc().nulls_first(),
+                Instrument.symbol,
+                Instrument.id,
+            )
+            .limit(limit)
+            .offset(offset)
         )
     ).all()
     return Page[InstrumentOut](
@@ -547,7 +607,13 @@ async def candles(
         stmt = stmt.where(MarketCandle.ts < end)
     # Latest `limit` candles in the range, returned oldest → newest.
     rows = (await db.scalars(stmt.order_by(MarketCandle.ts.desc()).limit(limit))).all()
-    return [CandleOut.model_validate(r) for r in reversed(rows)]
+    now = datetime.now(UTC)
+    step = research.tf_delta(timeframe)
+    # The newest row may be the live, still-forming candle: is_closed says which.
+    return [
+        CandleOut.model_validate(r).model_copy(update={"is_closed": r.ts + step <= now})
+        for r in reversed(rows)
+    ]
 
 
 @router.get("/strategies", response_model=list[StrategyOut])
