@@ -44,6 +44,8 @@ OR_ENV: dict[str, Any] = {
     "OPENROUTER_DEFAULT_MODEL": OR_MODEL,
     "OPENROUTER_ALLOWED_MODELS": "openai/gpt-4.1-nano",
     "OPENROUTER_DAILY_LIMIT_USD": "0.25",
+    # These tests cover the OpenRouter chat route; the shipped default provider is Gemini.
+    "AI_DEFAULT_EXTERNAL_PROVIDER": "openrouter",
     "CHAT_DEFAULT_MODEL": MODEL,
     "CHAT_WARMUP": False,
 }
