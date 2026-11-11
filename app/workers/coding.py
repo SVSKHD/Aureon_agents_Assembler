@@ -155,7 +155,7 @@ async def main() -> int:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
     # A change to its keys from Spasta re-execs this worker (docs/settings.md).
-    app_settings.start_worker_watch(settings, maker, stop, ("GITHUB_",), None)
+    app_settings.start_worker_watch(settings, maker, stop, ("GITHUB_", "AI_LOCAL_"), None)
     state: dict[str, Any] = {"paused": False, "running": None}
 
     def report() -> tuple[str, dict[str, Any]]:

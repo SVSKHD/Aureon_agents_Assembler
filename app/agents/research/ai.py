@@ -113,18 +113,24 @@ def unavailable_reason(settings: Any) -> str | None:
     (RESEARCH_AI_MODEL), or without one when external research is permitted
     (AI_RESEARCH_EXTERNAL_ALLOWED, provider not "ollama") and a provider in the chain is
     usable (enabled, key, model, budget). The content filter still decides per request."""
-    if settings.RESEARCH_AI_MODEL:
+    local = bool(settings.RESEARCH_AI_MODEL) and settings.AI_LOCAL_ENABLED
+    if local:
         return None
+    no_local = (
+        "RESEARCH_AI_MODEL is not set"
+        if settings.AI_LOCAL_ENABLED
+        else "local models are disabled (AI_LOCAL_ENABLED)"
+    )
     if not settings.AI_RESEARCH_EXTERNAL_ALLOWED:
-        return "RESEARCH_AI_MODEL is not set and AI_RESEARCH_EXTERNAL_ALLOWED is false"
+        return f"{no_local} and AI_RESEARCH_EXTERNAL_ALLOWED is false"
     provider = str(settings.AGENT_RESEARCH_PROVIDER)
     if provider == "ollama":
-        return "RESEARCH_AI_MODEL is not set and AGENT_RESEARCH_PROVIDER is ollama"
+        return f"{no_local} and AGENT_RESEARCH_PROVIDER is ollama"
     first = provider if provider in _PROVIDERS else str(settings.AI_DEFAULT_EXTERNAL_PROVIDER)
     reasons = {p: settings.external_unusable_reason(p) for p in settings.external_chain(first)}
     if all(reasons.values()):
         detail = ", ".join(f"{p}: {r}" for p, r in reasons.items())
-        return f"RESEARCH_AI_MODEL is not set and no external provider is usable ({detail})"
+        return f"{no_local} and no external provider is usable ({detail})"
     return None
 
 
@@ -142,7 +148,8 @@ async def explain(
     limit_s: float,
     external: Mapping[str, ExternalGate] | ExternalGate | None = None,
 ) -> uuid.UUID | None:
-    """`model` is the local Ollama model (RESEARCH_AI_MODEL); None/"" = no local fallback."""
+    """`model` is the local Ollama model (RESEARCH_AI_MODEL); None/"" = no local fallback
+    (the worker passes None when AI_LOCAL_ENABLED is off)."""
     async with maker() as db:
         ctx = await _context(db, kind, subject_id)
     if ctx is None:

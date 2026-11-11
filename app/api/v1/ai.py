@@ -58,6 +58,9 @@ UI_MODULE = ui_module("chat", label="AI chat", group="ai", icon="message-square"
 router = APIRouter(tags=["ai"])
 
 
+LOCAL_DISABLED = "local models are disabled (AI_LOCAL_ENABLED is off)"
+
+
 def _ollama(request: Request) -> OllamaClient:
     client: OllamaClient = request.app.state.ollama
     return client
@@ -101,7 +104,10 @@ def _provider_status(settings: Settings, gate: ExternalGate) -> ProviderStatus:
 
 
 async def _models_synced(request: Request, db: DbSession) -> list[Any]:
-    """Installed models (cached); upsert ai.model_inventory once per cache refresh."""
+    """Installed models (cached); upsert ai.model_inventory once per cache refresh.
+    OllamaUnavailable without calling Ollama when AI_LOCAL_ENABLED is off."""
+    if not request.app.state.settings.AI_LOCAL_ENABLED:
+        raise OllamaUnavailable(LOCAL_DISABLED)
     client = _ollama(request)
     models = await client.list_models()
     if getattr(request.app.state, "inventory_generation", None) != client.generation:
@@ -176,7 +182,11 @@ async def model_catalog(
     except OllamaUnavailable:
         installed, reachable = [], False
     gates = _gates(request, settings)
-    local = local_fallback_model(settings, installed if reachable else None)
+    local = (
+        local_fallback_model(settings, installed if reachable else None)
+        if settings.AI_LOCAL_ENABLED
+        else None
+    )
     models = [CatalogModel(provider="ollama", id=m, label=m) for m in installed]
     for p, g in gates.items():
         if not g.usable:
@@ -202,13 +212,14 @@ async def model_catalog(
         if default_gate is not None
         else CatalogTarget(provider="ollama", model=local)
     )
+    local_on = settings.AI_LOCAL_ENABLED
     local_status = ProviderStatus(
         provider="ollama",
         label=PROVIDER_LABELS["ollama"],
-        enabled=True,
+        enabled=local_on,
         configured=True,
         usable=reachable,
-        unavailable_reason=None if reachable else "unreachable",
+        unavailable_reason=None if reachable else ("unreachable" if local_on else "disabled"),
         default_model=local,
         allowed_models=installed,
         daily_limit_usd=None,
@@ -358,7 +369,8 @@ async def chat(
             installed: list[str] | None = [m.name for m in await _models_synced(request, db)]
         except OllamaUnavailable:
             installed = None
-        fallback = None if paused else local_fallback_model(settings, installed)
+        local_off = paused or not settings.AI_LOCAL_ENABLED
+        fallback = None if local_off else local_fallback_model(settings, installed)
         pick = await choose(
             gates,
             settings.external_chain(provider),
@@ -395,7 +407,11 @@ async def chat(
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 f"{PROVIDER_LABELS[provider]} is not used for this turn ({decision.reason}) "
-                "and no local model is available",
+                + (
+                    "and local models are disabled"
+                    if not settings.AI_LOCAL_ENABLED
+                    else "and no local model is available"
+                ),
             )
         first_provider, first_model = "ollama", fallback
 

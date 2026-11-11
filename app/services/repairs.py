@@ -148,7 +148,7 @@ class RepairConfig:
     def from_settings(cls, s: Settings) -> RepairConfig:
         return cls(
             coding=coding.CodingConfig.from_settings(s),
-            model=(s.REPAIR_MODEL or "").strip() or None,
+            model=((s.REPAIR_MODEL or "").strip() or None) if s.AI_LOCAL_ENABLED else None,
             repo=(s.REPAIR_REPO or "").strip() or None,
             github_repo=(s.REPAIR_GITHUB_REPO or "").strip() or None,
             model_timeout=s.REPAIR_MODEL_TIMEOUT_SECONDS,
@@ -158,6 +158,8 @@ class RepairConfig:
 
 def disabled_reason(settings: Settings) -> str | None:
     """Why repairs cannot run right now (they stay queued), or None."""
+    if not settings.AI_LOCAL_ENABLED:
+        return "repairs are disabled: local models are off (AI_LOCAL_ENABLED)"
     if not (settings.REPAIR_MODEL or "").strip():
         return "repairs are disabled: REPAIR_MODEL is not set"
     repo = (settings.REPAIR_REPO or "").strip()

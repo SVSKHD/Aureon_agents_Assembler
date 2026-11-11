@@ -133,6 +133,8 @@ async def purge_expired_sessions(ctx: TaskContext) -> dict[str, Any]:
 async def refresh_model_inventory(ctx: TaskContext) -> dict[str, Any]:
     from app.services.chat import sync_inventory
 
+    if not ctx.settings.AI_LOCAL_ENABLED:
+        return {"skipped": "local models are disabled"}
     if ctx.ollama is None:
         raise RuntimeError("Ollama client not configured")
     models = await ctx.ollama.list_models(force=True)
@@ -787,7 +789,7 @@ async def main() -> int:
         loop.add_signal_handler(sig, stopping.set)
     # A change to its keys from Spasta re-execs this worker (docs/settings.md).
     app_settings.start_worker_watch(
-        settings, maker, stopping, ("DHAN_", "GITHUB_", "DISCORD_", "MT5_"), redis
+        settings, maker, stopping, ("DHAN_", "GITHUB_", "DISCORD_", "MT5_", "AI_LOCAL_"), redis
     )
 
     def state() -> tuple[str, dict[str, Any]]:

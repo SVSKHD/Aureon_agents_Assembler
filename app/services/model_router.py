@@ -173,6 +173,8 @@ class ModelRouter:
             cfg = AgentConfig(cfg.enabled, cfg.provider, cfg.model, local_model.strip())
         if not cfg.enabled:
             raise AgentDisabled(f"the {agent} agent is disabled")
+        if not self.settings.AI_LOCAL_ENABLED:
+            allow_local = False  # external only: no Ollama call, the caller degrades
         msgs = [{"role": m["role"], "content": m["content"]} for m in messages]
         provider = cfg.external_provider(self.settings)
         external_model = cfg.model or self.settings.external(provider).default_model
@@ -180,6 +182,7 @@ class ModelRouter:
         local_only = False
         fallback = False
         if force_local or cfg.provider == "ollama":
+            # Never sent out instead; with AI_LOCAL_ENABLED off this is refused below.
             reason = "forced_local"
         else:
             # The chain (docs/30): the agent's provider, then AI_EXTERNAL_FALLBACK_PROVIDERS.
@@ -214,13 +217,13 @@ class ModelRouter:
                 if chain:
                     external_model = gates[chain[0]].default_model
         if not allow_local:
+            local_off = not self.settings.AI_LOCAL_ENABLED
+            reason = reason or ("local_disabled" if local_off else "no_local_fallback")
             await self._record(
-                _Call(
-                    agent, "ollama", "-", "skipped", reason or "no_local_fallback",
-                    fallback, local_only,
-                )
+                _Call(agent, "ollama", "-", "skipped", reason, fallback, local_only)
             )  # fmt: skip
-            raise ModelUnavailable(f"no external answer ({reason}) and no local fallback")
+            why = "local models are disabled" if local_off else "no local fallback"
+            raise ModelUnavailable(f"no external answer ({reason}) and {why}")
         return await self._local(
             agent, cfg, msgs, max_tokens, temperature, reason=reason,
             fallback=fallback, local_only=local_only,

@@ -14,7 +14,7 @@ from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 
 
 @dataclass(slots=True)
@@ -89,12 +89,14 @@ class HealthService:
         return await asyncio.to_thread(check_data_root, self.settings)
 
     async def readiness(self) -> list[CheckResult]:
+        """Ollama is checked only while local models are enabled (the live setting: an admin
+        may switch AI_LOCAL_ENABLED off from /settings and stop the Ollama container)."""
         t = self.settings.HEALTH_CHECK_TIMEOUT
-        return list(
-            await asyncio.gather(
-                _timed("postgres", self._postgres, t),
-                _timed("redis", self._redis, t),
-                _timed("ollama", self._ollama, t),
-                _timed("data_root", self._data_root, t),
-            )
-        )
+        checks = [
+            _timed("postgres", self._postgres, t),
+            _timed("redis", self._redis, t),
+            _timed("data_root", self._data_root, t),
+        ]
+        if get_settings().AI_LOCAL_ENABLED:
+            checks.insert(2, _timed("ollama", self._ollama, t))
+        return list(await asyncio.gather(*checks))

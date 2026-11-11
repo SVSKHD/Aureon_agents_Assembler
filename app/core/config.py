@@ -746,6 +746,10 @@ class Settings(BaseSettings):
     # Research / AI trading explanations stay on local Ollama unless this is true (and even
     # then the content filter still applies).
     AI_RESEARCH_EXTERNAL_ALLOWED: bool = False
+    # Local Ollama models (chat, agents, research, voice, coding, repairs). False = external
+    # providers only: Ollama is never called, the readiness check skips it, and a request the
+    # classification filter keeps local is refused (it is never sent out instead).
+    AI_LOCAL_ENABLED: bool = True
 
     # --- Direct Anthropic and Gemini APIs (docs/26-ai-providers.md). Same rules as OpenRouter:
     # off by default, server-side keys, a model allowlist, a daily USD cap (0 = no budget), and

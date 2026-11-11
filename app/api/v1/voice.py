@@ -41,7 +41,9 @@ async def voice_intent(
     _admin: AdminRequired, request: Request, settings: SettingsDep, body: VoiceIn
 ) -> VoiceOut:
     ollama: Any = (
-        getattr(request.app.state, "ollama", None) if settings.VOICE_OLLAMA_MODEL else None
+        getattr(request.app.state, "ollama", None)
+        if settings.VOICE_OLLAMA_MODEL and settings.AI_LOCAL_ENABLED
+        else None
     )
     result = await voice.resolve(body.transcript, ollama=ollama, model=settings.VOICE_OLLAMA_MODEL)
     log.info("voice_intent", intent=result.intent, source=result.source)  # never the text

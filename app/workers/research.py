@@ -210,7 +210,8 @@ class ResearchWorker:
             raise RuntimeError(why or "no Ollama client")
         # The local model is the fallback only: an external answer (Gemini first, where
         # permitted) is never followed by a local call.
-        model = self.settings.RESEARCH_AI_MODEL
+        # AI_LOCAL_ENABLED off: external only, never a local fallback.
+        model = self.settings.RESEARCH_AI_MODEL if self.settings.AI_LOCAL_ENABLED else None
         await ai.explain(
             self.maker,
             self.ollama,
