@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased: AI_LOCAL_ENABLED switch (external models only)
+
+- New setting `AI_LOCAL_ENABLED` (default `true`, editable in /settings → AI). When `false`
+  the backend never calls Ollama: chat and the agents use only the external chain
+  (`AI_DEFAULT_EXTERNAL_PROVIDER` + `AI_EXTERNAL_FALLBACK_PROVIDERS`, e.g. OpenRouter); an
+  external failure is an error instead of a local fallback; the startup warm-up and the
+  `refresh-model-inventory` job are skipped; `/api/health/ready` drops the Ollama check, so
+  the Ollama container can be stopped without failing deploys.
+- The classification filter is unchanged. A prompt it keeps local (secrets, personal finance,
+  broker, positions, logs, trading/finance conversations) and an agent set to provider
+  `ollama` are refused with "local models are disabled", never sent to an external model.
+- Local-only features report themselves unavailable: research explanations without an
+  external route, the coding agent (`CODE_MODEL`), self-repair (`REPAIR_MODEL`) and the voice
+  model fallback (the grammar still works).
+
 ## Unreleased: Gemini 3.5 Flash-Lite as the primary external model
 
 - Defaults ([docs/26-ai-providers.md](docs/26-ai-providers.md)): `AI_DEFAULT_EXTERNAL_PROVIDER`

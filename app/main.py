@@ -107,7 +107,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.gemini = build_external(live, "gemini")
         app.state.ai_usage = UsageTracker(redis)
         warmup: asyncio.Task[None] | None = None
-        if settings.CHAT_WARMUP and settings.CHAT_DEFAULT_MODEL:
+        if live.AI_LOCAL_ENABLED and settings.CHAT_WARMUP and settings.CHAT_DEFAULT_MODEL:
             # In the background: startup and /api/health never wait for a CPU model load.
             warmup = asyncio.create_task(warm_up_chat_model(ollama, settings))
         app.state.chat_limiter = GenerationLimiter(

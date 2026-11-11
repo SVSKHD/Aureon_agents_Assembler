@@ -80,7 +80,7 @@ class CodingConfig:
             allowed=allowed,
             protected=frozenset(s.CODE_PROTECTED_BRANCHES),
             worktree_root=s.CODE_WORKTREE_ROOT,
-            model=s.CODE_MODEL,
+            model=s.CODE_MODEL if s.AI_LOCAL_ENABLED else None,  # local Ollama only
             model_timeout=s.CODE_MODEL_TIMEOUT_SECONDS,
             test_timeout=s.CODE_TEST_TIMEOUT_SECONDS,
             max_context=s.CODE_MAX_CONTEXT_BYTES,
@@ -278,7 +278,9 @@ async def run_task(
     git: Git | None = None
     try:
         if not cfg.model:
-            raise CodingError("CODE_MODEL is not set (the local Ollama coding model)")
+            raise CodingError(
+                "CODE_MODEL is not set or local models are off (the local Ollama coding model)"
+            )
         repo = get_repo(cfg.repos, task.repo)
         git = Git(repo.path)
         base_sha = await git.head(check_ref(task.base_ref))

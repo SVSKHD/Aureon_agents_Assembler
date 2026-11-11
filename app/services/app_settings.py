@@ -192,6 +192,12 @@ REGISTRY: dict[str, Spec] = {
             "External providers tried next, in order, before local (e.g. openrouter)",
         ),
         _s(
+            "AI_LOCAL_ENABLED",
+            "ai",
+            "bool",
+            "Use local Ollama models (off = external only; local-only prompts are refused)",
+        ),
+        _s(
             "AI_EXTERNAL_DAILY_LIMIT_USD",
             "ai",
             "decimal",
