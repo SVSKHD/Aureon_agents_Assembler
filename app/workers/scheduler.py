@@ -60,6 +60,7 @@ from app.services import (
     github,
     github_actions,
     incidents,
+    market_data,
     mt5_ingest,
     mt5_sync,
     news,
@@ -217,6 +218,13 @@ async def dhan_backfill_candles(ctx: TaskContext) -> dict[str, Any]:
     return await dhan_sync.backfill_candles(
         ctx.maker, _dhan(ctx), s.DHAN_BACKFILL_INSTRUMENTS, tfs, s.DHAN_BACKFILL_DAYS
     )
+
+
+async def dhan_universe_backfill(ctx: TaskContext) -> dict[str, Any]:
+    """Queue history for DHAN_UNIVERSE_BACKFILL universes (docs/35-market-data.md). Only
+    enqueues: the research worker's candle-backfill lane does the rate-limited Dhan calls,
+    and each request fetches only bars newer than the newest stored one."""
+    return await market_data.enqueue_universes(ctx.maker, ctx.settings)
 
 
 async def mt5_sync_status(ctx: TaskContext) -> dict[str, Any]:
@@ -472,6 +480,7 @@ TASKS: dict[str, TaskFn] = {
     "dhan_refresh_instruments": dhan_refresh_instruments,
     "dhan_reconcile": dhan_reconcile,
     "dhan_backfill_candles": dhan_backfill_candles,
+    "dhan_universe_backfill": dhan_universe_backfill,
     "dhan_session_check": dhan_session_check,
     "dhan_monitor": dhan_monitor_job,
     "mt5_sync_status": mt5_sync_status,
@@ -522,6 +531,14 @@ def default_jobs(settings: Settings) -> list[tuple[str, str, str]]:
         )
     if settings.dhan_configured:
         jobs.append(("dhan-reconcile", "dhan_reconcile", settings.DHAN_RECONCILE_CRON))
+        if settings.DHAN_UNIVERSE_BACKFILL:
+            jobs.append(
+                (
+                    "dhan-universe-backfill",
+                    "dhan_universe_backfill",
+                    settings.DHAN_UNIVERSE_BACKFILL_CRON,
+                )
+            )
         if settings.DHAN_BACKFILL_INSTRUMENTS:
             jobs.append(
                 ("dhan-backfill-candles", "dhan_backfill_candles", settings.DHAN_BACKFILL_CRON)

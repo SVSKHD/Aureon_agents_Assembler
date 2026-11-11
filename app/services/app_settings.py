@@ -274,6 +274,12 @@ REGISTRY: dict[str, Spec] = {
         ),
         _s("DHAN_UNIVERSE_BACKFILL_CRON", "dhan", "str", "Universe backfill schedule (cron)"),
         _s("DHAN_UNIVERSE_BACKFILL_DAYS", "dhan", "int", "Universe backfill depth (days)"),
+        _s(
+            "DHAN_UNIVERSE_BACKFILL_TIMEFRAMES",
+            "dhan",
+            "csv",
+            "Universe backfill timeframes (1d default; 1m 5m 15m 1h = one Dhan call each)",
+        ),
         _s("DHAN_STATIC_IP", "dhan", "str", "Static IP registered with Dhan"),
         _s("DHAN_SESSION_CHECK_CRON", "dhan", "str", "Credential verification schedule (cron)"),
         _s("DHAN_MONITOR_CRON", "dhan", "str", "Dhan monitoring schedule (cron)"),

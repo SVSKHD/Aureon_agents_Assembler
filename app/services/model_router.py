@@ -162,8 +162,15 @@ class ModelRouter:
         max_tokens: int | None = 400,
         temperature: float = 0.2,
         force_local: bool = False,
+        allow_local: bool = True,
+        local_model: str | None = None,
     ) -> Answer:
+        """`allow_local=False`: no local fallback at all (the caller degrades instead), so
+        Qwen is never started for a caller that had no local model before. `local_model`
+        overrides the agent's local model for this call."""
         cfg = agent_config(self.settings, agent)
+        if local_model:
+            cfg = AgentConfig(cfg.enabled, cfg.provider, cfg.model, local_model.strip())
         if not cfg.enabled:
             raise AgentDisabled(f"the {agent} agent is disabled")
         msgs = [{"role": m["role"], "content": m["content"]} for m in messages]
@@ -206,6 +213,14 @@ class ModelRouter:
                 chain = list(pick.remaining)
                 if chain:
                     external_model = gates[chain[0]].default_model
+        if not allow_local:
+            await self._record(
+                _Call(
+                    agent, "ollama", "-", "skipped", reason or "no_local_fallback",
+                    fallback, local_only,
+                )
+            )  # fmt: skip
+            raise ModelUnavailable(f"no external answer ({reason}) and no local fallback")
         return await self._local(
             agent, cfg, msgs, max_tokens, temperature, reason=reason,
             fallback=fallback, local_only=local_only,

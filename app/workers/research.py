@@ -2,6 +2,8 @@
 
     market-data ─▶ technical-analysis ─▶ signal ─▶ risk
     backtest   (queued trading.backtest_runs)
+    screener   (queued trading.screener_runs; stored candles only, never a Dhan call)
+    candle-backfill (trading.candle_backfill_requests → Dhan history, shared rate limit)
     ai-research (Redis list research:ai:queue → Ollama → trading.ai_analyses)
 
 Each agent has its own bounded asyncio queue (RESEARCH_QUEUE_MAX). A full queue drops the
@@ -41,7 +43,7 @@ from app.core.config import Settings
 from app.core.logging import configure_logging, get_logger
 from app.db.session import build_engine, build_sessionmaker
 from app.models.trading import Instrument
-from app.services import app_settings, research
+from app.services import app_settings, market_data, research, screener
 from app.services.ai_usage import UsageTracker
 from app.services.inference import ExternalGate, build_external, gate_for
 
@@ -53,7 +55,9 @@ SIGNAL = AgentSpec("signal", "Signal agent", "trading")
 RISK = AgentSpec("risk", "Risk agent", "trading")
 BACKTEST = AgentSpec("backtest", "Research / backtesting agent", "trading")
 AI_RESEARCH = AgentSpec("ai-research", "AI research agent (Ollama, explanations only)", "trading")
-SPECS = (MARKET_DATA, TECHNICAL, SIGNAL, RISK, BACKTEST, AI_RESEARCH)
+SCREENER = AgentSpec("screener", "Screener agent (stored candles, no broker calls)", "trading")
+BACKFILL = AgentSpec("candle-backfill", "Candle history agent (Dhan, rate limited)", "trading")
+SPECS = (MARKET_DATA, TECHNICAL, SIGNAL, RISK, BACKTEST, AI_RESEARCH, SCREENER, BACKFILL)
 SPECS_BY_ID = {s.id: s for s in SPECS}
 TICK_CHANNEL = "dhan:ticks"
 
@@ -188,10 +192,25 @@ class ResearchWorker:
     async def do_backtest(self, run_id: uuid.UUID) -> None:
         await research.run_backtest(self.maker, run_id, self.settings)
 
+    async def do_screener(self, run_id: uuid.UUID) -> None:
+        status = await screener.execute_run(self.maker, run_id, self.settings)
+        lane = self.lane(SCREENER)
+        lane.extra[status] = int(lane.extra.get(status, 0)) + 1
+
+    async def do_backfill(self, request_id: uuid.UUID) -> None:
+        status = await market_data.run_backfill(
+            self.maker, self.adapters.get("dhan"), request_id, self.settings
+        )
+        lane = self.lane(BACKFILL)
+        lane.extra[status] = int(lane.extra.get(status, 0)) + 1
+
     async def do_ai(self, req: dict[str, Any]) -> None:
+        why = ai.unavailable_reason(self.settings)
+        if why is not None or self.ollama is None:
+            raise RuntimeError(why or "no Ollama client")
+        # The local model is the fallback only: an external answer (Gemini first, where
+        # permitted) is never followed by a local call.
         model = self.settings.RESEARCH_AI_MODEL
-        if not model or self.ollama is None:
-            raise RuntimeError("RESEARCH_AI_MODEL is not set")
         await ai.explain(
             self.maker,
             self.ollama,
@@ -242,6 +261,48 @@ class ResearchWorker:
                 run_id = await research.claim_backtest(self.maker)
             if run_id is not None:
                 lane.offer(run_id)
+                continue
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), 5)
+
+    async def screener_loop(self, stop: asyncio.Event) -> None:
+        """Claim queued scans one at a time; purge runs past SCREENER_RETENTION_DAYS hourly."""
+        lane = self.lane(SCREENER)
+        last_purge = 0.0
+        while not stop.is_set():
+            if time.monotonic() - last_purge > 3600:
+                last_purge = time.monotonic()
+                with contextlib.suppress(Exception):
+                    lane.extra["purged"] = await screener.purge_old(self.maker, self.settings)
+            run_id = None
+            if not lane.paused and lane.queue.empty() and not lane.busy:
+                try:
+                    run_id = await screener.claim_run(self.maker, self.settings)
+                except Exception as exc:
+                    log.warning("screener_claim_failed", error=type(exc).__name__)
+            if run_id is not None:
+                lane.offer(run_id)
+                continue
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), 2)
+
+    async def backfill_loop(self, stop: asyncio.Event) -> None:
+        """One history request at a time: the Dhan data bucket (5/s, shared across processes
+        through Redis) is the real throttle; this lane never runs requests in parallel."""
+        lane = self.lane(BACKFILL)
+        if "dhan" not in self.adapters:
+            lane.extra["disabled"] = "Dhan is not configured: history requests stay queued"
+            return
+        while not stop.is_set():
+            req_id = None
+            if not lane.paused and lane.queue.empty() and not lane.busy:
+                try:
+                    req_id = await market_data.claim_backfill(self.maker)
+                except Exception as exc:
+                    log.warning("backfill_claim_failed", error=type(exc).__name__)
+            if req_id is not None:
+                lane.offer(req_id)
+                await asyncio.sleep(0.2)
                 continue
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), 5)
@@ -328,6 +389,8 @@ class ResearchWorker:
             RISK.id: self.do_risk,
             BACKTEST.id: self.do_backtest,
             AI_RESEARCH.id: self.do_ai,
+            SCREENER.id: self.do_screener,
+            BACKFILL.id: self.do_backfill,
         }
 
 
@@ -392,6 +455,8 @@ async def main() -> int:
         asyncio.create_task(worker.tick_loop(stop)),
         asyncio.create_task(worker.backtest_loop(stop)),
         asyncio.create_task(worker.ai_loop(stop)),
+        asyncio.create_task(worker.screener_loop(stop)),
+        asyncio.create_task(worker.backfill_loop(stop)),
     ]
     if dhan is not None:
         tasks.append(asyncio.create_task(worker.tick_bars_loop(stop)))

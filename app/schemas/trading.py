@@ -232,6 +232,13 @@ class InstrumentOut(_FromAttrs):
     strike: Decimal | None
     option_type: str | None
     underlying: str | None
+    # Additive (migration 0028): normalized instrument-master fields.
+    trading_symbol: str | None = None
+    display_name: str | None = None
+    name: str | None = None
+    isin: str | None = None
+    series: str | None = None
+    is_active: bool = True
 
 
 class CandleOut(_FromAttrs):
@@ -245,6 +252,9 @@ class CandleOut(_FromAttrs):
     session: str
     source: str
     is_gap: bool
+    # False when the candle's period has not ended by the server clock (a live, still-forming
+    # bar whose values can change). Computed at request time.
+    is_closed: bool = True
 
 
 class StrategyVersionOut(_FromAttrs):

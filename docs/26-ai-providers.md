@@ -232,6 +232,91 @@ New section, `ai_providers`:
   unpriced) or `disabled`.
 - Built from settings only; it never calls a provider.
 
+## Gemini 3.5 Flash-Lite: the primary external model
+
+Model id `gemini-3.5-flash-lite` (Gemini Developer API). Verified standard paid-tier price,
+USD per million tokens: **input 0.30** (text, image, video, audio), **output 2.50** (includes
+thinking tokens), no free tier (ai.google.dev/gemini-api/docs/pricing, checked 2026-11-11).
+
+Shipped defaults (code and `.env.example`):
+
+| Setting | Default |
+| --- | --- |
+| `AI_DEFAULT_EXTERNAL_PROVIDER` | `gemini` (was `openrouter`) |
+| `GEMINI_DEFAULT_MODEL` | `gemini-3.5-flash-lite`; blank also means this model |
+| `GEMINI_ALLOWED_MODELS` | `gemini-3.5-flash-lite` (the default model is always allowed) |
+| `GEMINI_MODEL_PRICES` | `{}`; `BUILTIN_MODEL_PRICES` supplies 0.30 / 2.50 for this model only. An operator entry for the same model wins |
+| `AGENT_NEWS/VOICE/RESEARCH_PROVIDER` | `gemini` (was `auto`) |
+| `GEMINI_ENABLED`, `GEMINI_DAILY_LIMIT_USD`, `AI_EXTERNAL_DAILY_LIMIT_USD`, `AI_RESEARCH_EXTERNAL_ALLOWED` | **unchanged** (off / 0 / unset / false): spending limits and privacy switches are never raised by this change |
+
+**Precedence** (highest first): a value saved in Settings (`core.app_settings`) → the
+environment / `.env` → the code default. A saved or `.env` value such as
+`AI_DEFAULT_EXTERNAL_PROVIDER=openrouter` or `AGENT_NEWS_PROVIDER=auto` therefore keeps the old
+routing until it is changed; the code defaults only apply where nothing is set.
+
+**When Qwen/Ollama runs** (nothing else starts it):
+
+1. the agent's provider is `ollama` (explicitly local), or the caller forces local;
+2. the content filter or the context keeps the request local (`local_only`: personal, finance,
+   broker or secret data; research without `AI_RESEARCH_EXTERNAL_ALLOWED`);
+3. Gemini (and every provider in `AI_EXTERNAL_FALLBACK_PROVIDERS`) refused (disabled, no key,
+   model not allowed or unpriced, daily/global cap, rate limit) or failed (error, timeout).
+
+A successful external answer returns at once: no second (local) inference.
+`ModelRouter.complete(..., allow_local=False)` lets a caller with no local model never start
+Qwen; research explanations without `RESEARCH_AI_MODEL` fail visibly instead of inventing text.
+
+**Per agent** (when Gemini is enabled, keyed and budgeted, and the gate allows the payload):
+
+| Agent | Model call | Provider / model | Local fallback |
+| --- | --- | --- | --- |
+| News | none: the news job only ingests RSS (`app/services/news.py`); no LLM call exists to route | n/a | n/a |
+| Voice | only when the deterministic grammar finds no intent; **local Ollama only** (`VOICE_OLLAMA_MODEL`), not routed: the voice module is barred from importing services/DB code (`tests/test_approval_engine_unit.py::test_voice_module_cannot_reach_state`) so it can never reach approval state. Routing it to Gemini needs that boundary redesigned first (decision pending) | n/a (local) | `VOICE_OLLAMA_MODEL` if set, else grammar only |
+| Research (router agent) | `ModelRouter("research")`, context `research` | gemini / gemini-3.5-flash-lite (needs `AI_RESEARCH_EXTERNAL_ALLOWED=true`) | `AGENT_RESEARCH_LOCAL_MODEL` (qwen2.5:3b) |
+| Trading research explanations (research worker) | `app/agents/research/ai.py`, provider from `AGENT_RESEARCH_PROVIDER`/`_MODEL` | gemini / gemini-3.5-flash-lite (needs `AI_RESEARCH_EXTERNAL_ALLOWED=true`) | `RESEARCH_AI_MODEL` if set; explanations no longer require it when external research is permitted |
+| Dhan market data, screener, indicators, signals, risk, execution | **never**: deterministic code with no model client (enforced by `tests/test_gemini_routing.py`) | n/a | n/a |
+
+Every attempt is a row in `ai.model_calls` (agent, provider, model, outcome, route reason,
+fallback, local_only, tokens, latency, cost; never content). Trading explanations use agent
+`trading-research` and still write the metadata-only `ai.external_call` audit event.
+
+### Verifying the routing (after deploy; changes nothing but a few tokens of spend)
+
+`POST /api/v1/ai/route-check` (admin, CSRF; agent `news`, `voice` or `research`: the router
+agents' settings, even where no feature calls them yet) sends a fixed public prompt ("Reply with the single
+word OK.") through the agent's real route and returns the answer's provider/model/fallback/
+reason plus the `ai.model_calls` rows it wrote, which is the evidence.
+
+```bash
+# as an admin session (cookie + x-csrf-token), for agent in voice research news:
+curl -sS -X POST https://<host>/api/v1/ai/route-check \
+  -H "content-type: application/json" -H "x-csrf-token: $CSRF" -b "$COOKIE" \
+  -d '{"agent": "voice"}'
+# then the audit trail:
+psql "$READONLY_DSN" -c "SELECT at, agent, provider, model, outcome, route_reason, fallback, local_only, cost_usd FROM ai.model_calls ORDER BY id DESC LIMIT 20"
+```
+
+Expected for a correctly configured Gemini: one row per check with `provider=gemini`,
+`model=gemini-3.5-flash-lite`, `outcome=ok`, `fallback=false`, and **no** `ollama` row after
+it. For trading explanations, queue one with `POST /api/trading/backtests/{id}/explain` and
+look for agent `trading-research` rows.
+
+### Switching an existing deployment (admin, Settings; no restart, no secret touched)
+
+`PUT /api/v1/settings/{key}` with `{"value": ...}` (or the Settings page), only for keys that
+are saved with old values:
+
+| Key | Value |
+| --- | --- |
+| `AI_DEFAULT_EXTERNAL_PROVIDER` | `gemini` |
+| `GEMINI_DEFAULT_MODEL` | `gemini-3.5-flash-lite` |
+| `GEMINI_ALLOWED_MODELS` | add `gemini-3.5-flash-lite` to the existing list |
+| `AGENT_NEWS_PROVIDER`, `AGENT_VOICE_PROVIDER`, `AGENT_RESEARCH_PROVIDER` | `gemini` |
+
+`GEMINI_API_KEY`, `GEMINI_ENABLED`, the daily limits and `AI_RESEARCH_EXTERNAL_ALLOWED` are left
+as they are. `POST /api/v1/settings/GEMINI_API_KEY/test` checks that the key sees the model
+and that it is priced, without spending tokens.
+
 ## Manual setup (on the server, after merge)
 
 1. Create keys: an Anthropic Console API key and/or a Google AI Studio API key. Use

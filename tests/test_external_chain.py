@@ -269,7 +269,10 @@ async def test_research_walks_the_chain(settings: Settings) -> None:
     )
     assert got == ("External answer.", f"openrouter:{OR_MODEL}")
     assert gem.calls == 1 and orc.calls == 1
-    outcomes = [(r.details["provider"], r.details["outcome"]) for r in db.rows]
+    audit_rows = [r for r in db.rows if hasattr(r, "details")]
+    outcomes = [(r.details["provider"], r.details["outcome"]) for r in audit_rows]
+    calls = [(r.provider, r.outcome) for r in db.rows if not hasattr(r, "details")]
+    assert calls == [("gemini", "error"), ("openrouter", "ok")]  # ai.model_calls rows
     assert outcomes == [("gemini", "error:upstream_error"), ("openrouter", "ok")]
 
 

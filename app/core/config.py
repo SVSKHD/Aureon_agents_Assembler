@@ -41,6 +41,16 @@ def _secret_text(value: SecretStr | str | None) -> str:
 
 
 _PROVIDER_PREFIX = {"openrouter": "OPENROUTER", "anthropic": "ANTHROPIC", "gemini": "GEMINI"}
+# Aureon's default external model (docs/26-ai-providers.md).
+GEMINI_PRIMARY_MODEL = "gemini-3.5-flash-lite"
+# Verified list prices, USD per million tokens (input, output), standard paid tier, from the
+# Gemini Developer API pricing page (ai.google.dev/gemini-api/docs/pricing, checked
+# 2026-11-11): gemini-3.5-flash-lite input $0.30 (text/image/video/audio), output $2.50
+# including thinking tokens; no free tier. Used only when the operator has not priced the
+# model in *_MODEL_PRICES: an operator price always wins. Caps are unaffected.
+BUILTIN_MODEL_PRICES: dict[str, dict[str, tuple[Decimal, Decimal]]] = {
+    "gemini": {GEMINI_PRIMARY_MODEL: (Decimal("0.30"), Decimal("2.50"))},
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +277,13 @@ class Settings(BaseSettings):
     SCREENER_CACHE_SECONDS: float = Field(default=300.0, ge=0, le=86_400)
     SCREENER_USER_ACTIVE_MAX: int = Field(default=3, ge=1, le=100)
     SCREENER_RETENTION_DAYS: int = Field(default=14, ge=1, le=365)
+    # Hard wall-clock budget for one screener run (inline or in the research worker).
+    SCREENER_RUN_TIMEOUT_SECONDS: int = Field(default=300, ge=10, le=3600)
+    # Timeframes the dhan-universe-backfill job keeps current (1d by default; intraday for a
+    # whole exchange is one Dhan data call per instrument per refresh, so opt in knowingly).
+    DHAN_UNIVERSE_BACKFILL_TIMEFRAMES: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["1d"]
+    )
     WATCHLIST_MAX_PER_USER: int = Field(default=50, ge=1, le=1000)
     WATCHLIST_MAX_ITEMS: int = Field(default=500, ge=1, le=5000)
     # The static IP you whitelisted on Dhan (only scripts/dhan_preflight.py reads it).
@@ -732,8 +749,9 @@ class Settings(BaseSettings):
 
     # --- Direct Anthropic and Gemini APIs (docs/26-ai-providers.md). Same rules as OpenRouter:
     # off by default, server-side keys, a model allowlist, a daily USD cap (0 = no budget), and
-    # the same classification gate. Neither reports a cost, so a model is usable only when the
-    # operator has priced it in *_MODEL_PRICES (USD per million tokens; nothing is built in):
+    # the same classification gate. Neither reports a cost, so a model is usable only when it is
+    # priced: in *_MODEL_PRICES (USD per million tokens), or in BUILTIN_MODEL_PRICES above
+    # (only gemini-3.5-flash-lite, verified; an operator price wins):
     #   {"<model id>": {"input": "<usd>", "output": "<usd>"}}
     ANTHROPIC_ENABLED: bool = False
     ANTHROPIC_API_KEY: SecretStr | None = None
@@ -748,8 +766,12 @@ class Settings(BaseSettings):
     GEMINI_ENABLED: bool = False
     GEMINI_API_KEY: SecretStr | None = None
     GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com"
-    GEMINI_DEFAULT_MODEL: str = ""
-    GEMINI_ALLOWED_MODELS: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # Gemini 3.5 Flash-Lite is Aureon's primary external model. Still off until GEMINI_ENABLED,
+    # a key and a GEMINI_DAILY_LIMIT_USD above 0 are set.
+    GEMINI_DEFAULT_MODEL: str = GEMINI_PRIMARY_MODEL
+    GEMINI_ALLOWED_MODELS: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: [GEMINI_PRIMARY_MODEL]
+    )
     GEMINI_DAILY_LIMIT_USD: Decimal = Field(default=Decimal("0"), ge=0, le=Decimal("10000"))
     GEMINI_TIMEOUT_SECONDS: float = Field(default=60.0, gt=0, le=600)
     GEMINI_MODEL_PRICES: Annotated[dict[str, dict[str, Decimal]], NoDecode] = Field(
@@ -757,7 +779,7 @@ class Settings(BaseSettings):
     )
     # Shared by every external provider:
     # - the provider new conversations and "auto" agents use when it is usable;
-    AI_DEFAULT_EXTERNAL_PROVIDER: Literal["openrouter", "anthropic", "gemini"] = "openrouter"
+    AI_DEFAULT_EXTERNAL_PROVIDER: Literal["openrouter", "anthropic", "gemini"] = "gemini"
     # - the external providers tried next, in order, when the first one refuses (not usable,
     #   unpriced, capped, rate-limited) or fails; local Ollama only after all of them
     #   (e.g. "openrouter"). Empty = no second external provider. The classification filter
@@ -774,20 +796,23 @@ class Settings(BaseSettings):
     AI_EXTERNAL_REQUESTS_PER_MINUTE: int = Field(default=30, ge=0, le=10000)
 
     # --- Model routing for the agents (docs/model-routing.md, app/services/model_router.py) ---
-    # Per agent: enabled, provider ("auto" = AI_DEFAULT_EXTERNAL_PROVIDER when the gate allows,
+    # Per agent (default provider "gemini": Gemini 3.5 Flash-Lite first): enabled, provider
+    # ("auto" = AI_DEFAULT_EXTERNAL_PROVIDER when the gate allows,
     # else local; "ollama" = always local; "openrouter" | "anthropic" | "gemini" = prefer that
     # provider, still gated and with local fallback), the external model ("" = that
     # provider's default model) and the local Ollama model.
     AGENT_NEWS_ENABLED: bool = True
-    AGENT_NEWS_PROVIDER: Literal["auto", "ollama", "openrouter", "anthropic", "gemini"] = "auto"
+    AGENT_NEWS_PROVIDER: Literal["auto", "ollama", "openrouter", "anthropic", "gemini"] = "gemini"
     AGENT_NEWS_MODEL: str = ""
     AGENT_NEWS_LOCAL_MODEL: str = "qwen2.5:3b"
     AGENT_VOICE_ENABLED: bool = True
-    AGENT_VOICE_PROVIDER: Literal["auto", "ollama", "openrouter", "anthropic", "gemini"] = "auto"
+    AGENT_VOICE_PROVIDER: Literal["auto", "ollama", "openrouter", "anthropic", "gemini"] = "gemini"
     AGENT_VOICE_MODEL: str = ""
     AGENT_VOICE_LOCAL_MODEL: str = "qwen2.5:3b"
     AGENT_RESEARCH_ENABLED: bool = True
-    AGENT_RESEARCH_PROVIDER: Literal["auto", "ollama", "openrouter", "anthropic", "gemini"] = "auto"
+    AGENT_RESEARCH_PROVIDER: Literal["auto", "ollama", "openrouter", "anthropic", "gemini"] = (
+        "gemini"
+    )
     AGENT_RESEARCH_MODEL: str = ""
     AGENT_RESEARCH_LOCAL_MODEL: str = "qwen2.5:3b"
     AGENT_IMAGE_ENABLED: bool = True
@@ -868,6 +893,7 @@ class Settings(BaseSettings):
         models = tuple(dict.fromkeys(m for m in (default, *extra) if m))
         prices: dict[str, tuple[Decimal, Decimal]] = {}
         if provider != "openrouter":  # OpenRouter reports the cost itself
+            prices.update(BUILTIN_MODEL_PRICES.get(provider, {}))
             for model, p in (get("MODEL_PRICES") or {}).items():
                 prices[model.removeprefix("models/")] = (p["input"], p["output"])
         return ExternalConfig(
@@ -895,6 +921,12 @@ class Settings(BaseSettings):
         if self.AI_EXTERNAL_DAILY_LIMIT_USD is not None and self.AI_EXTERNAL_DAILY_LIMIT_USD <= 0:
             return "no_budget"
         return None
+
+    @field_validator("GEMINI_DEFAULT_MODEL")
+    @classmethod
+    def _gemini_default(cls, v: str) -> str:
+        """Blank (an .env copied from an older template) = the primary model."""
+        return v.strip() or GEMINI_PRIMARY_MODEL
 
     @field_validator("ANTHROPIC_MODEL_PRICES", "GEMINI_MODEL_PRICES", mode="before")
     @classmethod
@@ -1014,6 +1046,16 @@ class Settings(BaseSettings):
             raise ValueError(f"DHAN_UNIVERSE_BACKFILL: unknown universe(s) {bad}")
         return list(dict.fromkeys(out))
 
+    @field_validator("DHAN_UNIVERSE_BACKFILL_TIMEFRAMES")
+    @classmethod
+    def _check_universe_timeframes(cls, v: list[str]) -> list[str]:
+        ok = {"1m", "5m", "15m", "1h", "1d"}  # what Dhan's chart APIs serve
+        out = [s.strip().lower() for s in v if s.strip()]
+        bad = [s for s in out if s not in ok]
+        if bad:
+            raise ValueError(f"DHAN_UNIVERSE_BACKFILL_TIMEFRAMES: Dhan has no {bad} candles")
+        return list(dict.fromkeys(out))
+
     @field_validator("IMAGE_PAUSE_WINDOWS")
     @classmethod
     def _check_windows(cls, v: list[str]) -> list[str]:
@@ -1033,6 +1075,7 @@ class Settings(BaseSettings):
         "DHAN_MARKET_HOLIDAYS",
         "DHAN_INSTRUMENT_SEGMENTS",
         "DHAN_UNIVERSE_BACKFILL",
+        "DHAN_UNIVERSE_BACKFILL_TIMEFRAMES",
         "RESEARCH_EMA_PERIODS",
         "CODE_PROTECTED_BRANCHES",
         "CODE_PUSH_BRANCH_PREFIXES",

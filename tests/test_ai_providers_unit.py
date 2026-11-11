@@ -456,7 +456,9 @@ def test_defaults_keep_every_external_provider_off(settings: Settings) -> None:
     for p in ("openrouter", "anthropic", "gemini"):
         assert settings.external_unusable_reason(p) == "disabled"
         assert build_external(settings, p) is None
-    assert settings.AI_DEFAULT_EXTERNAL_PROVIDER == "openrouter"
+    # Gemini 3.5 Flash-Lite is the default external provider/model, still off until enabled.
+    assert settings.AI_DEFAULT_EXTERNAL_PROVIDER == "gemini"
+    assert settings.GEMINI_DEFAULT_MODEL == "gemini-3.5-flash-lite"
     assert settings.AI_EXTERNAL_DAILY_LIMIT_USD is None
 
 
@@ -484,8 +486,12 @@ def test_unusable_reasons(settings: Settings) -> None:
         prov_settings(settings, ANTHROPIC_API_KEY=None).external_unusable_reason("anthropic")
         == "not_configured"
     )
+    # A blank Gemini model is the primary model (gemini-3.5-flash-lite), not "not configured".
+    blank = prov_settings(settings, GEMINI_DEFAULT_MODEL="")
+    assert blank.external("gemini").default_model == "gemini-3.5-flash-lite"
+    assert blank.external_unusable_reason("gemini") is None
     assert (
-        prov_settings(settings, GEMINI_DEFAULT_MODEL="").external_unusable_reason("gemini")
+        prov_settings(settings, GEMINI_API_KEY=None).external_unusable_reason("gemini")
         == "not_configured"
     )
     assert (
@@ -516,7 +522,11 @@ def test_settings_registry_secrets_reauth_and_overlay(settings: Settings) -> Non
         settings,
         {"GEMINI_API_KEY": GEM_KEY, "GEMINI_MODEL_PRICES": prices, "AGENT_NEWS_PROVIDER": "gemini"},
     )
-    assert s.external("gemini").prices == {"g": (Decimal(1), Decimal(2))}
+    # The operator's map, on top of the one built-in verified price.
+    assert s.external("gemini").prices == {
+        "g": (Decimal(1), Decimal(2)),
+        "gemini-3.5-flash-lite": (Decimal("0.30"), Decimal("2.50")),
+    }
     assert json.loads(svc.current_value(s, "GEMINI_MODEL_PRICES") or "{}")["g"]["output"] == "2"
     assert GEM_KEY in svc.secret_values(s)  # registered with the log scrubber
     masked = svc.mask(svc.current_value(s, "GEMINI_API_KEY"), True)
@@ -785,6 +795,7 @@ async def test_router_charges_real_openrouter_cost_regression(settings: Settings
         OPENROUTER_API_KEY="sk-or-v1-" + "b" * 40,
         OPENROUTER_DEFAULT_MODEL="google/gemini-2.5-flash-lite",
         OPENROUTER_DAILY_LIMIT_USD="1",
+        AGENT_NEWS_PROVIDER="openrouter",
     )
     r, _ = router(s, {"openrouter": FakeExternal("openrouter", cost="0.0042")}, redis)
     a = await r.complete("news", PUBLIC, context="news")

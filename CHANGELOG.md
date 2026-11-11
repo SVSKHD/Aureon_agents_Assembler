@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased: Gemini 3.5 Flash-Lite as the primary external model
+
+- Defaults ([docs/26-ai-providers.md](docs/26-ai-providers.md)): `AI_DEFAULT_EXTERNAL_PROVIDER`
+  `gemini`, `GEMINI_DEFAULT_MODEL` / `GEMINI_ALLOWED_MODELS` `gemini-3.5-flash-lite` (a blank
+  model means it too), `AGENT_NEWS/VOICE/RESEARCH_PROVIDER` `gemini`. A verified built-in price
+  (0.30 / 2.50 USD per million tokens, output incl. thinking) applies when the operator has not
+  priced the model; an operator price wins. Enable flags, keys, daily/global caps and
+  `AI_RESEARCH_EXTERNAL_ALLOWED` are unchanged. Saved settings and `.env` still take precedence.
+- Voice is unchanged (grammar, then optional local Ollama): its module may not import
+  services/DB code (approval-safety invariant), so it is not routed to Gemini.
+- Trading research explanations follow `AGENT_RESEARCH_PROVIDER`/`_MODEL` (Gemini first where
+  `AI_RESEARCH_EXTERNAL_ALLOWED`), record every attempt in `ai.model_calls` (agent
+  `trading-research`), and no longer require a local `RESEARCH_AI_MODEL` when external research
+  is permitted; without any model they fail visibly.
+- `ModelRouter.complete(..., allow_local=False)`: no Qwen call at all when the caller had no
+  local model. A successful external answer never triggers a local inference (tested).
+- `POST /api/v1/ai/route-check` (admin, CSRF): one fixed public prompt through an agent's real
+  route, returning the `ai.model_calls` rows it produced, to verify runtime routing.
+- The news job makes no model call (RSS ingest only), so there is nothing to route for News.
+
+## Unreleased: market terminal backend (market-data part 2)
+
+- **Stock screener** ([docs/35-market-data.md](docs/35-market-data.md)): `POST
+  /api/trading/screener/run` with the ASTRA-FRONTEND §6 contract (EMA cross incl. 8/32, EMA
+  position, price vs EMA, RSI, MACD cross, volume vs average, ADX, VWAP position) over
+  NSE/BSE equities, indices, futures or a server watchlist. Reads stored Dhan candles only (no
+  Dhan call per scan); confirmed vs live candles; no lookahead; missing, short and stale
+  history is counted in `coverage`, never reported as a match. Small universes answer inline
+  (200); larger ones are queued for the research worker's new `screener` lane (202 + `run_id`,
+  poll `GET /screener/runs/{id}`), persisted, cached per bar period, cancellable. `GET
+  /screener/status`. 30m/4h are refused (Dhan has no such interval).
+- **Watchlists**: owner-only CRUD under `/api/trading/watchlists` (CSRF on writes).
+- **Indicators**: RSI, ADX (+DI/−DI), SMA, Bollinger, matching the frontend's formulas; `GET
+  /api/trading/indicators/compute` (any EMA period, same window as the screener).
+- **Instruments**: exchange/segment/multi-type/underlying/expiry/strike/option filters and
+  name search server-side; `GET /api/trading/instruments/status`. Fix: an instrument row
+  without a segment that disappears from the master is `missing_from_master`, not
+  `segment_disabled`.
+- **Candles**: `is_closed` on `GET /api/trading/candles`.
+- **History queue**: `POST/GET /api/trading/candles/backfill` (validated against Dhan's
+  intervals and segments), worked by the research worker's new `candle-backfill` lane one
+  request at a time under the shared Dhan rate limit, fetching only missing bars. The
+  `dhan-universe-backfill` job now reads `DHAN_UNIVERSE_BACKFILL*` (new
+  `DHAN_UNIVERSE_BACKFILL_TIMEFRAMES`, default `1d`).
+- Migration 0029: index `(timeframe, ts DESC) WHERE NOT is_gap` on `trading.market_candles`,
+  built CONCURRENTLY. New setting `SCREENER_RUN_TIMEOUT_SECONDS` (300).
+
 ## Unreleased: Dhan instrument master fixes (market-data part 1)
 
 - **Instruments now load without waiting for 08:11 IST.** At startup the scheduler runs
