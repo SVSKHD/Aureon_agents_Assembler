@@ -54,6 +54,17 @@ from app.models.trading import (
 
 log = get_logger(__name__)
 BATCH = 2000
+# Postgres accepts at most 32767 bind parameters in one statement. A multi-row INSERT uses
+# one per column per row, so wide tables are written in smaller pieces than BATCH.
+PG_MAX_PARAMS = 32767
+
+
+def _pieces(values: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Split rows so no INSERT goes over PG_MAX_PARAMS (2000 x 23 columns would be 46000)."""
+    if not values:
+        return []
+    size = max(1, PG_MAX_PARAMS // max(len(v) for v in values))
+    return [values[i : i + size] for i in range(0, len(values), size)]
 
 
 def _num(d: Decimal) -> str:
@@ -73,7 +84,20 @@ async def _flush(
 ) -> None:
     if not rows:
         return
-    d_ins = insert(DhanInstrument).values([{**r, "fetched_at": now} for r in rows])
+    for piece in _pieces([{**r, "fetched_at": now} for r in rows]):
+        await _upsert_dhan_instruments(db, piece)
+    for piece in _pieces([_instrument_row(i, active, now) for i, active in infos]):
+        t_ins = insert(Instrument).values(piece)
+        await db.execute(
+            t_ins.on_conflict_do_update(
+                index_elements=[Instrument.broker, Instrument.broker_instrument_id],
+                set_={c: t_ins.excluded[c] for c in INSTRUMENT_UPDATE_COLUMNS},
+            )
+        )
+
+
+async def _upsert_dhan_instruments(db: AsyncSession, values: list[dict[str, Any]]) -> None:
+    d_ins = insert(DhanInstrument).values(values)
     await db.execute(
         d_ins.on_conflict_do_update(
             index_elements=[DhanInstrument.exchange_segment, DhanInstrument.security_id],
@@ -94,42 +118,34 @@ async def _flush(
             },
         )
     )
-    t_ins = insert(Instrument).values(
-        [
-            {
-                "broker": "dhan",
-                "broker_instrument_id": i.broker_instrument_id,
-                "symbol": i.symbol,
-                "exchange": i.exchange,
-                "segment": i.segment,
-                "instrument_type": i.instrument_type,
-                "currency": i.currency,
-                "lot_size": i.lot_size,
-                "tick_size": i.tick_size,
-                "expiry": i.expiry,
-                "strike": i.strike,
-                "option_type": i.option_type,
-                "underlying": i.underlying,
-                "trading_symbol": i.trading_symbol,
-                "display_name": i.display_name,
-                "name": i.name,
-                "isin": i.isin,
-                "series": i.series,
-                "security_type": i.security_type,
-                "underlying_security_id": i.underlying_security_id,
-                "is_active": active,
-                "inactive_reason": None if active else "expired",
-                "updated_at": now,
-            }
-            for i, active in infos
-        ]
-    )
-    await db.execute(
-        t_ins.on_conflict_do_update(
-            index_elements=[Instrument.broker, Instrument.broker_instrument_id],
-            set_={c: t_ins.excluded[c] for c in INSTRUMENT_UPDATE_COLUMNS},
-        )
-    )
+
+
+def _instrument_row(i: Any, active: bool, now: datetime) -> dict[str, Any]:
+    return {
+        "broker": "dhan",
+        "broker_instrument_id": i.broker_instrument_id,
+        "symbol": i.symbol,
+        "exchange": i.exchange,
+        "segment": i.segment,
+        "instrument_type": i.instrument_type,
+        "currency": i.currency,
+        "lot_size": i.lot_size,
+        "tick_size": i.tick_size,
+        "expiry": i.expiry,
+        "strike": i.strike,
+        "option_type": i.option_type,
+        "underlying": i.underlying,
+        "trading_symbol": i.trading_symbol,
+        "display_name": i.display_name,
+        "name": i.name,
+        "isin": i.isin,
+        "series": i.series,
+        "security_type": i.security_type,
+        "underlying_security_id": i.underlying_security_id,
+        "is_active": active,
+        "inactive_reason": None if active else "expired",
+        "updated_at": now,
+    }
 
 
 INSTRUMENT_UPDATE_COLUMNS = (
