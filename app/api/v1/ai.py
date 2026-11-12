@@ -33,10 +33,12 @@ from sqlalchemy import func, select
 from app.agents.registry import CLAUDE
 from app.ai import approvals, chat
 from app.ai.agents import CHAT_AGENTS, AgentName
-from app.ai.budget import month_start, next_month_start
+from app.ai.budget import IST, month_start, next_month_start
 from app.ai.gateway import ClaudeGateway, GatewayError
 from app.ai.tools import default_registry
 from app.ai.tools.registry import ToolContext
+from app.ai.workspace import WorkspaceIn
+from app.ai.workspace import render as workspace_text
 from app.api.ui import ui_module
 from app.auth.deps import AdminRequired, CsrfProtected, Current, DbSession, SettingsDep
 from app.auth.security import verify_password
@@ -91,6 +93,9 @@ class ChatIn(BaseModel):
     conversation_id: uuid.UUID | None = None
     message: str = Field(min_length=1, max_length=20_000)
     agent: Literal["investments", "business", "general"] | None = None
+    # The user's open todos, tasks, reminders and note titles, from the app (read-only
+    # context; the backend has no access to the workspace itself). app/ai/workspace.py.
+    workspace: WorkspaceIn | None = None
 
 
 def _sse(event: str, data: dict[str, Any]) -> str:
@@ -161,6 +166,11 @@ async def chat_turn(
                 prompt=body.message,
                 agent=agent,
                 on_event=emit,
+                context=(
+                    workspace_text(body.workspace, datetime.now(IST).date())
+                    if body.workspace is not None
+                    else None
+                ),
             )
             await emit(
                 "done",

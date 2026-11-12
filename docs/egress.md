@@ -108,6 +108,7 @@ host-wide hostname allowlist. Persist the iptables rules with `iptables-persiste
 
 ## When you add a connection
 
-Aquakart, Pawsattva and Spasta todos are not connected yet (their tools are hidden from
-Claude). Connecting one adds its API host here (for Spasta todos: your Supabase project,
-`<project>.supabase.co`).
+Aquakart and Pawsattva are not connected yet (their tools are hidden from Claude).
+Connecting one adds its API host here. Todos, tasks and reminders need no egress: the app sends
+a read-only summary with each chat message, and saves Claude's suggestions itself after the
+user confirms them (docs/26-ai-providers.md, "The workspace").

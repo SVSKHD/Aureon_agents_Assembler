@@ -217,8 +217,8 @@ def test_default_tools_match_the_plan(settings: Settings) -> None:
     assert {n for n, t in names.items() if t.kind == "write"} == {
         "propose_trade",
         "draft_aquakart_blog",
-        "add_todo",
     }
+    suggest = {n for n in names if n.startswith("suggest_")}
     offered = {t.name for t in reg.for_agent("investments", settings)}
     assert offered == {
         "get_portfolio_summary",
@@ -227,9 +227,10 @@ def test_default_tools_match_the_plan(settings: Settings) -> None:
         "get_mt5_bot_status",
         "get_mt5_recent_signals",
         "propose_trade",
+        *suggest,
     }
-    # Not connected yet: never offered, so no tokens are spent on them.
-    assert reg.for_agent("business", settings) == []
+    # Aquakart / Pawsattva are not connected yet: never offered, so no tokens are spent.
+    assert {t.name for t in reg.for_agent("business", settings)} == suggest
     assert "propose_trade" not in {t.name for t in reg.for_agent("report", settings)}
 
 

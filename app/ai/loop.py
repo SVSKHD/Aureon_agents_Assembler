@@ -29,6 +29,7 @@ from app.ai.gateway import ClaudeGateway
 from app.ai.tools.registry import (
     Draft,
     Registry,
+    Suggestion,
     Tool,
     ToolContext,
     ToolInputError,
@@ -96,6 +97,8 @@ async def run_tool(
                 raise TypeError("a read tool returned a draft")
             status = "awaiting_approval"
             summary = out.summary
+        elif isinstance(out, Suggestion):
+            summary = out.summary
         else:
             summary = ctx.redactor.text(cap(str(out), ctx.settings))
     except ToolInputError as exc:
@@ -133,6 +136,12 @@ async def run_tool(
                     "approval",
                     {"id": str(approval.id), "action": out.action, "summary": out.summary},
                 )
+    if isinstance(out, Suggestion) and on_event is not None:
+        # A card for the user to confirm; the app saves it, never the server or Claude.
+        fields = {
+            k: ctx.redactor.text(v) if isinstance(v, str) else v for k, v in out.fields.items()
+        }
+        await on_event("suggestion", {"kind": out.kind, "fields": fields})
     if on_event is not None:
         await on_event("tool", {"name": name, "status": status})
     return _result(tool_use_id, summary, error=error)
