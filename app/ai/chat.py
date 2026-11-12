@@ -169,6 +169,7 @@ async def turn(
         system=SYSTEM[agent],
         budget=BUDGET_OF[agent],
         history=[*history, sent_user],
+        on_event=on_event,  # text and tool events stream to the client as they happen
     )
     last_id: int | None = None
     async with ctx.maker() as db, db.begin():

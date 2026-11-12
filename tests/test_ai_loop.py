@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -13,6 +14,7 @@ from pydantic import SecretStr
 from app.ai import loop
 from app.ai.budget import MemoryUsageStore
 from app.ai.gateway import ClaudeGateway
+from app.ai.redact import Redactor
 from app.ai.tools import default_registry
 from app.ai.tools.registry import (
     Draft,
@@ -229,3 +231,61 @@ def test_default_tools_match_the_plan(settings: Settings) -> None:
     # Not connected yet: never offered, so no tokens are spent on them.
     assert reg.for_agent("business", settings) == []
     assert "propose_trade" not in {t.name for t in reg.for_agent("report", settings)}
+
+
+async def test_chat_turn_streams_events_to_the_caller(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """chat.turn hands its on_event to the loop: without it the client gets no text."""
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from app.ai import chat
+    from app.ai.loop import LoopResult
+
+    seen: dict[str, object] = {}
+
+    async def fake_run(*args: object, **kwargs: object) -> LoopResult:
+        seen["on_event"] = kwargs.get("on_event")
+        cb = kwargs.get("on_event")
+        assert callable(cb)
+        await cb("text", {"delta": "hi"})
+        return LoopResult(
+            "hi", [{"role": "assistant", "content": []}], 1, Decimal(0), "end_turn", []
+        )
+
+    class _Db:
+        def add(self, row: object) -> None:
+            row.id = 1  # type: ignore[attr-defined]
+
+        async def flush(self) -> None: ...
+
+        async def execute(self, *_: object) -> None: ...
+
+        @asynccontextmanager
+        async def begin(self):  # type: ignore[no-untyped-def]
+            yield
+
+    @asynccontextmanager
+    async def maker():  # type: ignore[no-untyped-def]
+        yield _Db()
+
+    monkeypatch.setattr(loop, "run", fake_run)
+    events: list[tuple[str, object]] = []
+
+    async def on_event(kind: str, data: object) -> None:
+        events.append((kind, data))
+
+    ctx = SimpleNamespace(settings=settings, redactor=Redactor(), maker=maker)
+    res = await chat.turn(
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        ctx,  # type: ignore[arg-type]
+        conversation=SimpleNamespace(id=uuid.uuid4()),  # type: ignore[arg-type]
+        history=[],
+        prompt="hello",
+        agent="general",
+        on_event=on_event,
+    )
+    assert seen["on_event"] is on_event
+    assert events == [("text", {"delta": "hi"})] and res.text == "hi"

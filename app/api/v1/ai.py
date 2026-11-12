@@ -11,7 +11,7 @@ GET  /api/ai/usage                      month-to-date spend, total and per budge
 
 SSE events on /chat: `meta` {conversation_id, agent}, `text` {delta}, `tool` {name, status},
 `approval` {id, action, summary}, `done` {conversation_id, message_id, cost_usd, steps,
-stop_reason, approvals}, `error` {code, message}. A `: ping` comment is sent while idle.
+stop_reason, approvals, text}, `error` {code, message}. A `: ping` comment is sent while idle.
 The turn finishes and is saved even if the client disconnects.
 """
 
@@ -171,6 +171,9 @@ async def chat_turn(
                     "steps": res.steps,
                     "stop_reason": res.stop_reason,
                     "approvals": [str(a) for a in res.approvals],
+                    # The whole answer once more: a client that missed text events
+                    # (a proxy that drops them, a reconnect) still shows it.
+                    "text": res.text,
                 },
             )
         except (GatewayError, chat.ConversationError) as exc:
