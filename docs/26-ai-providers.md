@@ -109,7 +109,7 @@ LIVE trading stays disabled and Dhan stays read-only.
 
 | Route | Who | |
 |---|---|---|
-| `POST /chat` | any user, CSRF, `AI_CHAT_REQUESTS_PER_MINUTE` | SSE: `meta`, `text`, `tool`, `approval`, `done`, `error` |
+| `POST /chat` | any user, CSRF, `AI_CHAT_REQUESTS_PER_MINUTE` | SSE: `meta`, `text`, `tool`, `approval`, `suggestion`, `done`, `error` |
 | `POST /attachments` | any user, CSRF | multipart `file`: photo (PNG/JPEG/WebP/GIF, 5 MB), PDF (100 pages), .xlsx/CSV/TSV; returns an id for `attachments` in `POST /chat` |
 | `GET /conversations`, `GET /conversations/{id}` | owner | readable messages only |
 | `GET /approvals?status=pending` | admin | |
