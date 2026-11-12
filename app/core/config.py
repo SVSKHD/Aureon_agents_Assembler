@@ -721,6 +721,14 @@ class Settings(BaseSettings):
     AI_TOOL_RESULT_MAX_TOKENS: int = Field(default=2000, ge=100, le=20000)
     AI_CHAT_REQUESTS_PER_MINUTE: int = Field(default=10, ge=1, le=600)
     AI_CONVERSATION_MAX_MESSAGES: int = Field(default=200, ge=10, le=5000)
+    # Files attached to a chat message (app/services/chat_attachments.py): photos, PDFs,
+    # spreadsheets, kept under DATA_ROOT/ai-attachments for AI_ATTACHMENT_KEEP_DAYS.
+    AI_ATTACHMENT_MAX_BYTES: int = Field(default=10 * 1024 * 1024, ge=1024, le=32 * 1024 * 1024)
+    AI_ATTACHMENTS_PER_MESSAGE: int = Field(default=5, ge=1, le=20)
+    AI_ATTACHMENT_MAX_PDF_PAGES: int = Field(default=100, ge=1, le=600)
+    AI_ATTACHMENT_TABLE_MAX_CHARS: int = Field(default=30_000, ge=1000, le=400_000)
+    AI_ATTACHMENT_KEEP_DAYS: int = Field(default=30, ge=1, le=365)
+    AI_ATTACHMENTS_MAX_PER_USER: int = Field(default=500, ge=1, le=100_000)
     # Hard limits on propose_trade, checked in Python before an approval row exists (INR).
     AI_TRADE_MAX_LOSS_INR: Decimal = Field(default=Decimal("2000"), gt=0)
     AI_TRADE_MAX_ORDER_INR: Decimal = Field(default=Decimal("100000"), gt=0)

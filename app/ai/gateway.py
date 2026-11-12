@@ -26,6 +26,7 @@ fallback to another model is requested: the answer must come from a priced, allo
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -49,6 +50,42 @@ API_HOST = "api.anthropic.com"
 CACHE = {"type": "ephemeral"}
 
 OnText = Callable[[str], Awaitable[None]]
+
+
+# Images and PDFs travel as base64, which says nothing about their token cost. For the budget
+# reservation they count as what Claude bills: about 1,600 tokens an image (the API scales
+# larger ones down) and about 3,500 a PDF page (its text plus the page image), 4 characters a
+# token, like the rest of the estimate.
+IMAGE_EST_CHARS = 1_600 * 4
+PDF_PAGE_EST_CHARS = 3_500 * 4
+
+
+def _block_chars(block: Any) -> int:
+    if isinstance(block, dict) and isinstance(block.get("source"), dict):
+        source = block["source"]
+        if block.get("type") == "image":
+            return IMAGE_EST_CHARS
+        if block.get("type") == "document" and source.get("type") == "base64":
+            from app.services.chat_attachments import pdf_pages  # only for PDF turns
+
+            try:
+                pages = pdf_pages(base64.standard_b64decode(str(source.get("data", ""))))
+            except ValueError:
+                pages = 0
+            return max(1, pages) * PDF_PAGE_EST_CHARS
+    return len(json.dumps(block, default=str))
+
+
+def _content_chars(messages: Sequence[dict[str, Any]]) -> int:
+    """The prompt's size for the cost estimate, with images and PDFs at their token cost."""
+    total = 0
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            total += sum(_block_chars(b) for b in content) + 20
+        else:
+            total += len(json.dumps(m, default=str))
+    return total
 
 
 class GatewayError(Exception):
@@ -213,7 +250,7 @@ class ClaudeGateway:
         sent = red.messages(messages)
         system_text = red.text(system)
         tool_defs = _with_cache(tools)
-        prompt_chars = len(system_text) + len(json.dumps(sent, default=str))
+        prompt_chars = len(system_text) + _content_chars(sent)
         prompt_chars += len(json.dumps(tool_defs, default=str))
         try:
             estimate = worst_case_usd(s, model, prompt_chars, max_tokens)

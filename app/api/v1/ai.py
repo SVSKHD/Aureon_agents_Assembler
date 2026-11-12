@@ -23,9 +23,9 @@ import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
@@ -47,6 +47,8 @@ from app.models.ai import Approval, Conversation, Message, Usage
 from app.models.auth import ROLE_ADMIN
 from app.schemas.common import Page
 from app.services import audit, interactive
+from app.services import chat_attachments as files
+from app.services.health import check_data_root
 
 UI_MODULE = ui_module("chat", label="AI chat", group="ai", icon="message-square", order=40)
 router = APIRouter(prefix="/ai", tags=["ai"])
@@ -96,6 +98,51 @@ class ChatIn(BaseModel):
     # The user's open todos, tasks, reminders and note titles, from the app (read-only
     # context; the backend has no access to the workspace itself). app/ai/workspace.py.
     workspace: WorkspaceIn | None = None
+    # Files uploaded with POST /attachments (photos, PDFs, spreadsheets), at most
+    # AI_ATTACHMENTS_PER_MESSAGE; only the caller's own.
+    attachments: list[uuid.UUID] = Field(default_factory=list, max_length=20)
+
+
+class AttachmentOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    kind: Literal["image", "pdf", "table"]
+    media_type: str
+    size: int
+    pages: int | None = None
+    rows: int | None = None
+
+
+@router.post(
+    "/attachments",
+    response_model=AttachmentOut,
+    status_code=status.HTTP_201_CREATED,
+    responses={409: {}, 413: {}, 415: {}, 422: {}, 503: {}},
+)
+async def upload_attachment(
+    current: CsrfProtected,
+    settings: SettingsDep,
+    file: Annotated[UploadFile, File()],
+) -> AttachmentOut:
+    """Attach a photo (PNG, JPEG, WebP, GIF, 5 MB), a PDF or a spreadsheet (.xlsx, CSV,
+    TSV) to the next chat message: send the returned id in `attachments`. The type is read
+    from the file's bytes. A spreadsheet is converted to a text table here; images and PDFs
+    reach Claude as they are (they cannot be redacted)."""
+    try:
+        await asyncio.to_thread(check_data_root, settings)
+    except RuntimeError as exc:
+        detail = {"code": "storage_unavailable", "message": "attachment storage is not mounted"}
+        raise HTTPException(503, detail) from exc
+    try:
+        data = await files.read_upload(file, settings.AI_ATTACHMENT_MAX_BYTES)
+        att = await asyncio.to_thread(files.save, settings, current.user.id, file.filename, data)
+    except files.AttachmentError as exc:
+        raise HTTPException(exc.status, {"code": exc.code, "message": exc.message}) from exc
+    log.info("ai_attachment_saved", kind=att.kind, size=att.size)
+    return AttachmentOut(
+        id=att.id, name=att.name, kind=att.kind, media_type=att.media_type, size=att.size,
+        pages=att.pages, rows=att.rows,
+    )  # fmt: skip
 
 
 def _sse(event: str, data: dict[str, Any]) -> str:
@@ -116,6 +163,20 @@ async def chat_turn(
 ) -> StreamingResponse:
     gateway = _gateway(request)
     await _rate_limit(request, current.user.id, settings.AI_CHAT_REQUESTS_PER_MINUTE)
+    if len(body.attachments) > settings.AI_ATTACHMENTS_PER_MESSAGE:
+        raise HTTPException(
+            422,
+            {"code": "too_many_attachments",
+             "message": f"at most {settings.AI_ATTACHMENTS_PER_MESSAGE} files per message"},
+        )  # fmt: skip
+    refs: list[dict[str, Any]] = []
+    for att_id in dict.fromkeys(body.attachments):
+        found = await asyncio.to_thread(files.load, settings, current.user.id, att_id)
+        if found is None:  # missing, expired, or another user's
+            raise HTTPException(
+                404, {"code": "attachment_not_found", "message": "an attached file is gone"}
+            )
+        refs.append(files.reference(found))
     existing: Conversation | None = None
     if body.conversation_id is not None:
         try:
@@ -171,6 +232,7 @@ async def chat_turn(
                     if body.workspace is not None
                     else None
                 ),
+                attachments=refs,
             )
             await emit(
                 "done",
