@@ -534,7 +534,11 @@ Issue = Literal["db_undecryptable", "db_rejected", "db_ignored", "stale", "shado
 
 PROCESS_STARTED_AT = datetime.now(UTC)
 APPLIED_PREFIX = "settings:applied:"
-APPLIED_TTL = 7 * 24 * 3600
+# Each process re-reports every REPORT_EVERY_SECONDS; a report lives APPLIED_TTL, so a
+# container that was replaced (a deploy, a restart) drops out of diagnostics within minutes
+# instead of showing as "out of date" for days.
+REPORT_EVERY_SECONDS = 300.0
+APPLIED_TTL = 15 * 60
 REPORT_TIMEOUT_SECONDS = 2.0
 
 
@@ -703,23 +707,33 @@ def process_name() -> str:
     return name.rsplit(".", 1)[-1]
 
 
-def applied_snapshot(settings: Settings, process: str, watches: Iterable[str]) -> dict[str, Any]:
+def applied_snapshot(
+    settings: Settings,
+    process: str,
+    watches: Iterable[str],
+    applied_at: datetime | None = None,
+) -> dict[str, Any]:
+    """`applied_at` is when these settings were loaded (not when this report was sent)."""
     return {
         "process": process,
         "host": socket.gethostname(),
         "pid": os.getpid(),
         "started_at": PROCESS_STARTED_AT.isoformat(),
-        "applied_at": datetime.now(UTC).isoformat(),
+        "applied_at": (applied_at or datetime.now(UTC)).isoformat(),
         "watches": list(watches),
         "digests": {k: digest(settings, k, current_value(settings, k)) for k in REGISTRY},
     }
 
 
 async def report_applied(
-    redis: Redis, settings: Settings, process: str, watches: Iterable[str]
+    redis: Redis,
+    settings: Settings,
+    process: str,
+    watches: Iterable[str],
+    applied_at: datetime | None = None,
 ) -> None:
     """Tell diagnostics what this process loaded. Best effort: never fails the caller."""
-    snap = applied_snapshot(settings, process, watches)
+    snap = applied_snapshot(settings, process, watches, applied_at)
     try:
         async with asyncio.timeout(REPORT_TIMEOUT_SECONDS):  # never hold up a startup
             await redis.set(
@@ -727,6 +741,25 @@ async def report_applied(
             )
     except Exception as exc:
         log.warning("app_settings_report_failed", error=type(exc).__name__)
+
+
+async def keep_reporting(
+    send: Callable[[], Awaitable[None]],
+    stop: asyncio.Event | None = None,
+    every: float = REPORT_EVERY_SECONDS,
+) -> None:
+    """Call `send` now and every `every` seconds until `stop` is set (or the task is
+    cancelled), so this process's report outlives APPLIED_TTL only while it runs."""
+    while True:
+        with contextlib.suppress(Exception):  # report_applied already never raises
+            await send()
+        if stop is None:
+            await asyncio.sleep(every)
+            continue
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=every)
+        if stop.is_set():
+            return
 
 
 async def read_applied(redis: Redis) -> list[dict[str, Any]]:
@@ -950,10 +983,12 @@ def start_worker_watch(
         stop.set()
         return False
 
+    loaded_at = datetime.now(UTC)  # a worker re-execs on a change: loaded once, at start
+
     async def report() -> None:
         client = redis or Redis.from_url(settings.REDIS_URL, socket_timeout=5)
         try:
-            await report_applied(client, settings, process_name(), prefixes)
+            await report_applied(client, settings, process_name(), prefixes, loaded_at)
         finally:
             if redis is None:
                 with contextlib.suppress(Exception):
@@ -962,7 +997,7 @@ def start_worker_watch(
     task = asyncio.create_task(
         watch(maker, redis, on_change, stop, poll_seconds=30.0), name="app-settings-watch"
     )
-    reporter = asyncio.create_task(report(), name="app-settings-report")
+    reporter = asyncio.create_task(keep_reporting(report, stop), name="app-settings-report")
     for t in (task, reporter):
         _WATCHERS.add(t)  # a strong reference: the loop only keeps a weak one
         t.add_done_callback(_WATCHERS.discard)
