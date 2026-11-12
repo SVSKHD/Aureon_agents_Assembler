@@ -110,6 +110,8 @@ ADMIN = {
     ("PUT", "/api/v1/settings/{key}"),
     ("DELETE", "/api/v1/settings/{key}"),
     ("POST", "/api/v1/settings/{key}/test"),
+    ("GET", "/api/v1/settings/diagnostics"),
+    ("POST", "/api/v1/settings/reload"),
     ("PUT", "/api/finance/portfolio-profiles/{profile_id}"),
     ("POST", "/api/finance/claim"),
     ("GET", "/api/agents/{agent_id}/logs"),

@@ -372,3 +372,36 @@ async def test_no_secret_in_logs_errors_discord_or_prompts(
         for secret in (GH, AN_KEY, WEBHOOK, "WebhookSecretPart_", MASTER):
             assert secret not in text, f"secret in {where}"
     register_secret_values([])
+
+
+async def test_diagnostics_layers_and_reload(make_env: EnvFactory) -> None:
+    async with make_env() as env:
+        assert (await env.get("a", f"{URL}/diagnostics")).status_code == 403
+        assert (await _put(env, "ANTHROPIC_API_KEY", AN_KEY)).status_code == 200
+        # A row written under another master key, as after a SETTINGS_MASTER_KEY change.
+        other = svc.Cipher(Fernet.generate_key().decode()).encrypt(GH)
+        await env.sql(
+            "UPDATE core.app_settings SET value_encrypted = :v WHERE key = 'ANTHROPIC_API_KEY'",
+            v=other,
+        )
+        r = await env.get("admin", f"{URL}/diagnostics")
+        assert r.status_code == 200
+        for secret in (AN_KEY, GH, ENV_TOKEN, MASTER):
+            assert secret not in r.text
+        body = r.json()
+        assert body["database_ok"] and body["encryption_ready"] and body["master_keys"] == 1
+        assert body["undecryptable"] == ["ANTHROPIC_API_KEY"]
+        k = next(i for i in body["keys"] if i["key"] == "ANTHROPIC_API_KEY")
+        assert "db_undecryptable" in k["issues"] and "stale" in k["issues"]
+        assert k["live_masked"] == "••••" + AN_KEY[-4:] and k["db_masked"] is None
+        assert body["ai"]["configured"] and body["ai"]["matches_settings"]
+        # The list no longer calls an unreadable row "db".
+        listed = _item((await env.get("admin", URL)).json(), "ANTHROPIC_API_KEY")
+        assert listed["source"] == "unset"
+
+        assert (await env.send("a", "POST", f"{URL}/reload")).status_code == 403
+        r = await env.send("admin", "POST", f"{URL}/reload")
+        assert r.status_code == 200 and r.json()["changed"] == ["ANTHROPIC_API_KEY"]
+        assert env.app.state.settings.anthropic_key == ""
+        assert not env.app.state.ai.configured
+        assert "settings_reloaded" in await _audit(env)

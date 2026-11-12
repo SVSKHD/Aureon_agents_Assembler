@@ -128,12 +128,14 @@ The routes are under `/api/v1/` like the rest of Aureon's admin API.
 | PUT | `/api/v1/settings/{key}` | `{"value": "...", "password": "..."}` sets or replaces the DB value. `password` is required for re-auth keys. |
 | DELETE | `/api/v1/settings/{key}` | `{"password": "..."}` (re-auth keys only) reverts to `.env`. |
 | POST | `/api/v1/settings/{key}/test` | Tests the key's group with the values in effect now. See the table below. |
+| GET | `/api/v1/settings/diagnostics` | Every key at each layer, as masks: `.env` (or the default), the DB row (decrypted), what a reload would give now, and what this process is running with. Flags `db_undecryptable` (row written under another `SETTINGS_MASTER_KEY`), `db_rejected` (the value fails validation), `db_ignored` (another row failed, so every DB value is ignored), `stale` (the process runs an older value) and `shadows_env`. Also: rows for keys no longer in the registry, the master key count, the server host/pid, and the Claude gateway's key mask and whether it matches the live settings. |
+| POST | `/api/v1/settings/reload` | Re-reads `.env` + the DB now, rebuilds the clients whose keys changed (the Claude gateway included) and tells the workers. Audited as `settings_reloaded`. |
 
 What each group's test does:
 
 | Group | Test |
 |---|---|
-| OpenRouter | `GET /key`, plus a `/models` check that `OPENROUTER_DEFAULT_MODEL` exists |
+| AI | `GET /v1/models` (no tokens), then checks `AI_MODEL_MAIN` and `AI_MODEL_ROUTER` are available and priced |
 | Dhan | `GET /fundlimit` |
 | GitHub | `GET /user` |
 | Discord | `GET` on the webhook. It reads metadata and posts nothing. |
@@ -146,7 +148,7 @@ Guards:
 - **Who can call it.** `require_admin` (session plus admin role) and CSRF (`x-csrf-token`) on every write.
 - **Re-auth.** A re-auth key needs the account password (argon2 verify) on every set and revert. Five wrong passwords per session lock the endpoint for 15 minutes (`429 too_many_reauth_failures`), and each failure is audited (`settings_reauth_failed`).
 - **Rate limits.** Per admin: 20 writes and 20 tests per 10 minutes. If Redis is down they fail closed with `503`.
-- **Audit.** These events are recorded: `settings_updated`, `settings_reverted`, `settings_tested` and `settings_reauth_failed`. Their details hold the key, category, `is_secret`, version and outcome, never a value.
+- **Audit.** These events are recorded: `settings_updated`, `settings_reverted`, `settings_tested`, `settings_reloaded` and `settings_reauth_failed`. Their details hold the key, category, `is_secret`, version and outcome, never a value.
 - **Validation.** Each kind is normalized first:
   - bools must be true or false
   - numbers must be at least 0
