@@ -29,36 +29,36 @@ class _In(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
-class TodoIn(_In):
+class WorkspaceTodoIn(_In):
     text: Short
     status: Label | None = None
     tag: Label | None = None
 
 
-class TaskIn(_In):
+class WorkspaceTaskIn(_In):
     title: Short
     status: Label | None = None
     deadline: Day | None = None
     tag: Label | None = None
 
 
-class ReminderIn(_In):
+class WorkspaceReminderIn(_In):
     title: Short
     start: Day | None = None
     repeat: Label | None = None
 
 
-class NoteIn(_In):
+class WorkspaceNoteIn(_In):
     title: Short
 
 
 class WorkspaceIn(_In):
     """Open items only, soonest first; the app decides what to send."""
 
-    todos: Annotated[list[TodoIn], Field(max_length=50)] = []
-    tasks: Annotated[list[TaskIn], Field(max_length=50)] = []
-    reminders: Annotated[list[ReminderIn], Field(max_length=50)] = []
-    notes: Annotated[list[NoteIn], Field(max_length=20)] = []
+    todos: Annotated[list[WorkspaceTodoIn], Field(max_length=50)] = []
+    tasks: Annotated[list[WorkspaceTaskIn], Field(max_length=50)] = []
+    reminders: Annotated[list[WorkspaceReminderIn], Field(max_length=50)] = []
+    notes: Annotated[list[WorkspaceNoteIn], Field(max_length=20)] = []
     # How many open items exist in all, when the app sent only the first ones.
     totals: dict[Label, Annotated[int, Field(ge=0, le=100_000)]] = Field(
         default_factory=dict, max_length=8
@@ -122,4 +122,12 @@ def render(ws: WorkspaceIn, today: date) -> str:
     )
 
 
-__all__ = ["MAX_CHARS", "NoteIn", "ReminderIn", "TaskIn", "TodoIn", "WorkspaceIn", "render"]
+__all__ = [
+    "MAX_CHARS",
+    "WorkspaceIn",
+    "WorkspaceNoteIn",
+    "WorkspaceReminderIn",
+    "WorkspaceTaskIn",
+    "WorkspaceTodoIn",
+    "render",
+]
