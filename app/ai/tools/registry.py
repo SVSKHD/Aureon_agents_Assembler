@@ -4,6 +4,8 @@ A tool is a name, a description, a JSON schema for its input, a handler and a ki
 
 - "read":  the handler runs locally and returns a SHORT text summary (never a raw table).
   The summary is capped at AI_TOOL_RESULT_MAX_TOKENS (about 4 characters a token).
+  A read tool may instead return a Suggestion (app/ai/tools/workspace.py): a card the app
+  shows, which the user saves themselves by confirming it; the server never acts on it.
 - "write": the handler NEVER acts. It validates the request (and, for trades, the hard risk
   limits in app/ai/risk.py) and returns a Draft. The loop stores the draft as an
   ai.approvals row (status pending) and tells Claude "awaiting user approval". The action
@@ -54,6 +56,17 @@ class ToolContext:
 
 
 @dataclass(frozen=True, slots=True)
+class Suggestion:
+    """What a suggest tool returns: an item for the user to confirm in the app (a todo, a
+    reminder, ...). Nothing acts on it on the server; the app saves it only when the user
+    confirms (app/ai/tools/workspace.py)."""
+
+    kind: str
+    fields: dict[str, Any]
+    summary: str
+
+
+@dataclass(frozen=True, slots=True)
 class Draft:
     """What a write tool asks for: the action, its validated payload, a one-line summary."""
 
@@ -62,7 +75,7 @@ class Draft:
     summary: str
 
 
-Handler = Callable[[ToolContext, dict[str, Any]], Awaitable[str | Draft]]
+Handler = Callable[[ToolContext, dict[str, Any]], Awaitable[str | Draft | Suggestion]]
 
 
 def _always(_: Settings) -> bool:
@@ -180,6 +193,7 @@ def obj(properties: dict[str, Any], required: Iterable[str] = ()) -> dict[str, A
 __all__ = [
     "Draft",
     "Registry",
+    "Suggestion",
     "Tool",
     "ToolContext",
     "ToolInputError",

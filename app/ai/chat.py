@@ -156,11 +156,18 @@ async def turn(
     prompt: str,
     agent: AgentName,
     on_event: loop.OnEvent | None = None,
+    context: str | None = None,
 ) -> TurnResult:
+    """One turn. `context` is extra read-only data the app sent with the message (the user's
+    workspace, app/ai/workspace.py): a second text block, redacted like the rest, kept in the
+    stored blocks so the turn replays exactly; the readable message stays the user's words."""
     settings = ctx.settings
     if len(history) + 2 > settings.AI_CONVERSATION_MAX_MESSAGES:
         raise ConversationError("this conversation is full; continue in a new chat")
-    user_msg = {"role": "user", "content": [{"type": "text", "text": _stamp(prompt)}]}
+    blocks: list[dict[str, Any]] = [{"type": "text", "text": _stamp(prompt)}]
+    if context:
+        blocks.append({"type": "text", "text": context})
+    user_msg = {"role": "user", "content": blocks}
     sent_user = ctx.redactor.messages([user_msg])[0]
     result = await loop.run(
         gateway,

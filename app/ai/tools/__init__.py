@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from app.ai.tools import business, investments
+from app.ai.tools import business, investments, workspace
 from app.ai.tools.registry import Registry
 
 
 def default_registry() -> Registry:
-    return Registry([*investments.TOOLS, *business.TOOLS])
+    return Registry([*investments.TOOLS, *business.TOOLS, *workspace.TOOLS])
 
 
 __all__ = ["default_registry"]

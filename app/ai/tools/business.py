@@ -1,7 +1,8 @@
-"""Business tools (Aquakart, Pawsattva) and Spasta todos.
+"""Business tools (Aquakart, Pawsattva).
 
-None of these systems is connected to this backend yet: Aquakart and Pawsattva live in their
-own services, and Spasta todos live in the frontend's Supabase. Until a read-only connection
+Neither system is connected to this backend yet: Aquakart and Pawsattva live in their own
+services. (Todos, tasks and reminders are handled by app/ai/tools/workspace.py.) Until a
+read-only connection
 is configured, every tool here reports itself unavailable, so it is not offered to Claude at
 all (no tokens spent on a call that cannot work), and its handler refuses if called anyway.
 Connecting one means: a read-only API URL + token (or database role) in settings, a handler
@@ -17,7 +18,6 @@ from app.ai.tools.registry import Draft, Tool, ToolContext, ToolRefused, obj
 from app.core.config import Settings
 
 BUSINESS = frozenset({"business", "report"})
-GENERAL = frozenset({"general", "business"})
 
 
 def _not_connected(system: str) -> Any:
@@ -72,30 +72,6 @@ TOOLS = [
         _not_connected("Aquakart"),
         "write",
         frozenset({"business"}),
-        _off,
-    ),
-    Tool(
-        "get_todos",
-        "The user's open Spasta todos (title, due date, status).",
-        obj({"limit": {"type": "integer", "minimum": 1, "maximum": 50}}),
-        _not_connected("Spasta todos (Supabase)"),
-        "read",
-        GENERAL,
-        _off,
-    ),
-    Tool(
-        "add_todo",
-        "Add a Spasta todo, after the user approves.",
-        obj(
-            {
-                "title": {"type": "string", "minLength": 1, "maxLength": 200},
-                "due": {"type": "string", "maxLength": 10},
-            },
-            ["title"],
-        ),
-        _not_connected("Spasta todos (Supabase)"),
-        "write",
-        GENERAL,
         _off,
     ),
 ]

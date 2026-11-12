@@ -73,7 +73,18 @@ tools only). Tools:
 | get_mt5_bot_status, get_mt5_recent_signals | read | investments, report | the Aureon bot's own tables (read-only) |
 | propose_trade | write | investments | risk limits → approval → PAPER intent |
 | get_aquakart_sales_summary, get_aquakart_open_queries, get_pawsattva_summary, draft_aquakart_blog | read/write | business | **not connected**: hidden from Claude |
-| get_todos, add_todo | read/write | general | **not connected** (Spasta todos live in Supabase) |
+| suggest_todo, suggest_task, suggest_reminder, suggest_calendar_event, suggest_note | suggest | general, business, investments | a card in the chat; **the user saves it** in the app (never the server) |
+
+### The workspace (todos, tasks, reminders, notes)
+
+They live in the frontend's Supabase behind row-level security, and the backend has no key to
+them. The app sends a short read-only summary with each chat message (`workspace` in
+`POST /chat`: open todos, tasks with deadlines, upcoming reminders, recent note titles, at most
+50 of each). `app/ai/workspace.py` validates and caps it (8000 characters) and adds it to the
+message as a second text block, redacted like the rest; the readable message stays the user's
+words. Claude adds items only through the `suggest_*` tools: the loop streams a `suggestion`
+event, the app shows a card, and the item is saved by the browser, with the user's login,
+only when the user confirms it.
 
 Write tools never act: they file an `ai.approvals` row (`pending`, expires after
 `AI_APPROVAL_TTL_HOURS`) and Claude is told "awaiting user approval". An admin approves with
