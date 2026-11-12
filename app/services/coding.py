@@ -6,7 +6,8 @@ filtered out. A `change` task:
 
 1. creates a worktree at CODE_WORKTREE_ROOT/<task> on a new `aureon/task-<id>` branch from
    the repo's base branch (git hooks disabled);
-2. asks the local Ollama coding model for a unified diff over the files it was shown;
+2. asks the coding model (a client passed in by the worker; none since the AI stack is
+   Claude-only, so tasks fail with that reason, docs/26) for a unified diff;
 3. validates the diff (paths, size, no binaries/symlinks/modes) and re-checks every path
    inside the worktree with symlinks resolved, so it cannot write through a link;
 4. applies it in the worktree only, commits exactly those files, and runs the repo's
@@ -22,10 +23,11 @@ import asyncio
 import re
 import shutil
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -35,7 +37,6 @@ from app.agents.coding.commands import DEFAULT_ALLOWED, check_allowed, run_allow
 from app.agents.coding.git import TASK_BRANCH, Git, GitError
 from app.agents.coding.paths import PathRejected, is_blocked, normalize, safe_path
 from app.agents.coding.repos import BRANCH, RepoConfig, get_repo, parse_repos
-from app.agents.ollama.client import OllamaClient
 from app.core.config import Settings
 from app.core.logging import get_logger
 from app.models.agents import CodeGitOp, CodeTask
@@ -80,7 +81,7 @@ class CodingConfig:
             allowed=allowed,
             protected=frozenset(s.CODE_PROTECTED_BRANCHES),
             worktree_root=s.CODE_WORKTREE_ROOT,
-            model=s.CODE_MODEL if s.AI_LOCAL_ENABLED else None,  # local Ollama only
+            model=s.CODE_MODEL,
             model_timeout=s.CODE_MODEL_TIMEOUT_SECONDS,
             test_timeout=s.CODE_TEST_TIMEOUT_SECONDS,
             max_context=s.CODE_MAX_CONTEXT_BYTES,
@@ -171,8 +172,22 @@ SYSTEM_CHANGE = (
 )
 
 
+class ModelClient(Protocol):
+    """A chat client streaming {"message": {"content"}, "done"} chunks."""
+
+    def chat_stream(
+        self, model: str, messages: list[dict[str, str]], options: dict[str, Any]
+    ) -> AsyncIterator[dict[str, Any]]: ...
+
+
+NO_MODEL = (
+    "the coding agent has no model: the AI stack is Claude-only and code tasks are not "
+    "routed to Claude (docs/26-ai-providers.md)"
+)
+
+
 async def ask_model(
-    ollama: OllamaClient, model: str, system: str, prompt: str, *, limit_s: float
+    ollama: ModelClient | Any, model: str, system: str, prompt: str, *, limit_s: float
 ) -> str:
     parts: list[str] = []
 
@@ -266,7 +281,7 @@ async def _cleanup(git: Git, worktree: Path, branch: str | None, *, delete_branc
 async def run_task(
     maker: async_sessionmaker[AsyncSession],
     cfg: CodingConfig,
-    ollama: OllamaClient | Any,
+    ollama: ModelClient | Any | None,
     tid: uuid.UUID,
 ) -> str:
     """Execute one claimed task; returns the final status."""
@@ -277,10 +292,10 @@ async def run_task(
     branch: str | None = None
     git: Git | None = None
     try:
+        if ollama is None:
+            raise CodingError(NO_MODEL)
         if not cfg.model:
-            raise CodingError(
-                "CODE_MODEL is not set or local models are off (the local Ollama coding model)"
-            )
+            raise CodingError("CODE_MODEL is not set")
         repo = get_repo(cfg.repos, task.repo)
         git = Git(repo.path)
         base_sha = await git.head(check_ref(task.base_ref))

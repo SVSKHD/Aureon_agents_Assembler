@@ -14,11 +14,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
 from redis.asyncio import Redis
 
-from app.agents.ollama.client import OllamaClient
-from app.agents.ollama.limiter import GenerationLimiter
-from app.agents.registry import OLLAMA, AgentRegistry, Heartbeat
+from app.agents.registry import CLAUDE, AgentRegistry, Heartbeat
 from app.agents.trading.dhan import build_dhan_adapter
 from app.agents.trading.mt5 import build_mt5_adapter
+from app.ai.gateway import ClaudeGateway
 from app.api import ui
 from app.api.router import api_router
 from app.auth.deps import Current
@@ -35,32 +34,11 @@ from app.db.session import build_engine, build_sessionmaker
 from app.integrations.claude_cli import ClaudeCLI
 from app.integrations.github import build_github_client
 from app.services import app_settings, app_settings_runtime, incidents
-from app.services.ai_usage import UsageTracker
-from app.services.chat import chat_options
 from app.services.claude_review import ReviewRunner
 from app.services.health import HealthService
-from app.services.inference import build_external, build_openrouter
 from app.services.mt5_ingest import DbIngestStore
 
 log = get_logger(__name__)
-
-
-async def warm_up_chat_model(ollama: OllamaClient, settings: Settings) -> None:
-    """Load CHAT_DEFAULT_MODEL once at startup so the first chat skips the cold load (20-60 s
-    on this CPU). Best effort: an absent model or a busy/unreachable Ollama is only logged."""
-    model = settings.CHAT_DEFAULT_MODEL
-    try:
-        installed = {m.name for m in await ollama.list_models(force=True)}
-        if model not in installed:
-            log.warning("chat_warmup_skipped", model=model, reason="not installed")
-            return
-        options = chat_options(settings.CHAT_DEFAULT_NUM_CTX, settings.CHAT_NUM_THREAD)
-        seconds = await ollama.warm_up(model, options)
-        log.info("chat_warmup_done", model=model, seconds=round(seconds, 1))
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        log.warning("chat_warmup_failed", model=model, error=type(exc).__name__)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -89,37 +67,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.settings = live
         app.state.http = http
         app.state.health = HealthService(settings, engine, redis, http)
-        ollama = OllamaClient(
-            settings.OLLAMA_BASE_URL,
-            connect_timeout=settings.OLLAMA_CONNECT_TIMEOUT,
-            read_timeout=settings.OLLAMA_READ_TIMEOUT,
-            cache_ttl=settings.OLLAMA_MODEL_CACHE_SECONDS,
-            keep_alive=settings.OLLAMA_KEEP_ALIVE or None,
-        )
-        app.state.ollama = ollama
-        # OpenRouter (docs/25-openrouter.md): a client only when enabled and keyed; the daily
-        # spend counter lives in Redis.
-        openrouter = build_openrouter(live)
-        app.state.openrouter = openrouter
-        # Direct Anthropic / Gemini APIs (docs/26-ai-providers.md): same rule, a client only
-        # when enabled and keyed. Kept apart from the Claude CLI review client below.
-        app.state.anthropic = build_external(live, "anthropic")
-        app.state.gemini = build_external(live, "gemini")
-        app.state.ai_usage = UsageTracker(redis)
-        warmup: asyncio.Task[None] | None = None
-        if live.AI_LOCAL_ENABLED and settings.CHAT_WARMUP and settings.CHAT_DEFAULT_MODEL:
-            # In the background: startup and /api/health never wait for a CPU model load.
-            warmup = asyncio.create_task(warm_up_chat_model(ollama, settings))
-        app.state.chat_limiter = GenerationLimiter(
-            settings.OLLAMA_MAX_CONCURRENT,
-            settings.OLLAMA_MAX_QUEUE,
-            settings.OLLAMA_QUEUE_RETRY_AFTER,
-        )
-        # The agents' own local queue (news, voice answers, research): one generation at a
-        # time, MODEL_ROUTER_LOCAL_QUEUE waiting; chat keeps its own (docs/model-routing.md).
-        app.state.agent_limiter = GenerationLimiter(
-            1, settings.MODEL_ROUTER_LOCAL_QUEUE, settings.OLLAMA_QUEUE_RETRY_AFTER
-        )
+        # Claude, the only AI provider (docs/26-ai-providers.md): the gateway holds the key,
+        # the budgets and the redaction; it is rebuilt when ANTHROPIC_/AI_ settings change.
+        app.state.ai = ClaudeGateway.build(live, app.state.sessionmaker)
         # Read-only broker adapters by broker name: Dhan (Phase B), the MT5 bot export (Phase C).
         app.state.trading_adapters = {}
         dhan = build_dhan_adapter(live, redis, app.state.sessionmaker)
@@ -139,21 +89,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         registry = AgentRegistry(app.state.sessionmaker)
         app.state.registry = registry
         app.state.agent_paused = {}
-        limiter = app.state.chat_limiter
 
-        def ollama_state() -> tuple[str, dict[str, object]]:
-            details = {
-                "running": limiter.running,
-                "admitted": limiter.admitted,
-                "capacity": limiter.capacity,
+        def claude_state() -> tuple[str, dict[str, object]]:
+            s: Settings = app.state.settings
+            details: dict[str, object] = {
+                "configured": bool(app.state.ai.configured),
+                "model_main": s.AI_MODEL_MAIN,
+                "model_router": s.AI_MODEL_ROUTER or None,
             }
-            return ("busy" if limiter.running else "idle", details)
+            return ("idle", details)  # `configured` in the details says whether it can answer
 
-        def ollama_paused(paused: bool) -> None:
-            app.state.agent_paused[OLLAMA.id] = paused
+        def claude_paused(paused: bool) -> None:
+            app.state.agent_paused[CLAUDE.id] = paused
 
         heartbeat = Heartbeat(
-            registry, OLLAMA, settings.AGENT_HEARTBEAT_SECONDS, ollama_state, ollama_paused
+            registry, CLAUDE, settings.AGENT_HEARTBEAT_SECONDS, claude_state, claude_paused
         )
         heartbeat.start()  # registers in the background; a DB outage doesn't block startup
         # Incidents (docs/21-self-repair.md): captured exceptions are written in the
@@ -194,11 +144,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await app.state.review_runner.aclose()
             # The current clients: a settings change may have replaced the startup ones.
             await app_settings_runtime.close_clients(app)
-            if warmup is not None:
-                warmup.cancel()
-                with contextlib.suppress(Exception, asyncio.CancelledError):
-                    await warmup
-            await ollama.aclose()
             await http.aclose()
             await redis.aclose()
             await engine.dispose()

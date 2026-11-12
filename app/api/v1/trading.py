@@ -1113,7 +1113,7 @@ async def _explain(
 async def explain_signal(
     signal_id: uuid.UUID, request: Request, db: DbSession, _: CsrfProtected, settings: SettingsDep
 ) -> ExplainQueued:
-    """Ask the AI research agent (local Ollama) to explain a signal. Explanation only."""
+    """Ask the AI research agent (Claude) to explain a signal. Explanation only."""
     if await db.get(TradingSignal, signal_id) is None:
         raise HTTPException(404, "signal not found")
     return await _explain(request, settings, "signal", signal_id)

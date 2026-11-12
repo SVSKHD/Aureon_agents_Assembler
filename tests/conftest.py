@@ -30,7 +30,6 @@ def settings(data_root: Path) -> Settings:
         # Unreachable by default; DB tests override with TEST_DATABASE_URL.
         DATABASE_URL=TEST_DATABASE_URL or "postgresql+asyncpg://x:x@127.0.0.1:1/none",
         REDIS_URL=TEST_REDIS_URL,
-        OLLAMA_BASE_URL="http://ollama.test:11434",
         DATA_ROOT=data_root,
         SECRET_KEY="t" * 40,
         CORS_ORIGINS="http://localhost:5173",
@@ -38,9 +37,7 @@ def settings(data_root: Path) -> Settings:
         # Never pick up a real token from the host environment.
         GITHUB_TOKEN=None,
         DISCORD_WEBHOOK_URL=None,
-        OPENROUTER_API_KEY=None,
         ANTHROPIC_API_KEY=None,
-        GEMINI_API_KEY=None,
         # Image jobs never wait for an IST trading window in tests (tests set their own).
         IMAGE_PAUSE_WINDOWS=[],
     )
@@ -93,6 +90,7 @@ async def db_clean(migrated: str) -> AsyncIterator[str]:
                 "agents.agents, agents.repair_tasks, agents.incidents, "
                 "agents.generated_assets, agents.image_jobs, "
                 "ai.messages, ai.conversations, ai.model_inventory, "
+                "ai.tool_calls, ai.usage, ai.approvals, "
                 "audit.audit_events, core.app_settings, core.sessions, core.users "
                 "RESTART IDENTITY CASCADE"
             )

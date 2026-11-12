@@ -202,7 +202,7 @@ async def _set_agent_paused(
         details={"agent_id": agent_id, "was_paused": before},
     )
     await db.commit()
-    # Agents in this process (the ollama chat agent) see it immediately; others within
+    # Agents in this process (the claude gateway) see it immediately; others within
     # one heartbeat (AGENT_HEARTBEAT_SECONDS).
     request.app.state.agent_paused[agent_id] = paused
     await db.refresh(agent)
@@ -288,6 +288,4 @@ async def run_job_now(
 @router.get("/system/status")
 async def system_status(request: Request, _: AdminRequired) -> dict[str, Any]:
     s = request.app.state
-    return await SystemStatus(
-        s.settings, s.engine, s.sessionmaker, s.redis, s.http, s.ollama
-    ).collect()
+    return await SystemStatus(s.settings, s.engine, s.sessionmaker, s.redis, s.http).collect()

@@ -2,15 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import httpx
 import pytest
-import respx
 from httpx import AsyncClient
 
 from app.core.config import Settings
 from app.services.health import check_data_root
-
-OLLAMA_TAGS = "http://ollama.test:11434/api/tags"
 
 
 async def test_liveness(client: AsyncClient) -> None:
@@ -31,16 +27,13 @@ async def test_request_id_unsafe_value_replaced(client: AsyncClient) -> None:
     assert r.headers["x-request-id"] != "bad id\nwith newline"
 
 
-@respx.mock
 async def test_readiness_reports_each_failure(client: AsyncClient) -> None:
-    # Default test settings point Postgres at a closed port; Ollama returns 500.
-    respx.get(OLLAMA_TAGS).mock(return_value=httpx.Response(500))
+    # Default test settings point Postgres at a closed port. No Ollama check any more.
     r = await client.get("/api/health/ready")
     assert r.status_code == 503
     body = r.json()
     assert body["status"] == "not_ready"
-    assert set(body["checks"]) == {"postgres", "redis", "ollama", "data_root"}
-    assert body["checks"]["ollama"]["ok"] is False
+    assert set(body["checks"]) == {"postgres", "redis", "data_root"}
     assert body["checks"]["data_root"]["ok"] is True
 
 

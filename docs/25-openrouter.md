@@ -1,3 +1,6 @@
+> **Superseded (2026-11-12):** the AI stack is Claude-only. Ollama, OpenRouter, Gemini and the
+> provider routing described here are removed. See [26-ai-providers.md](26-ai-providers.md).
+
 # 25 — OpenRouter (opt-in external inference)
 
 **Status:** done (migration `0020`). Brief rule 4 was amended on 2026-11-03 (see "Prompt 0"

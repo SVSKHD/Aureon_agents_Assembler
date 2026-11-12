@@ -17,12 +17,11 @@ router = APIRouter(prefix="/v1/system", tags=["system"])
 @router.get("/integrations")
 async def integrations(request: Request, _: AdminRequired) -> dict[str, Any]:
     """The Spasta health card: MT5 feed freshness, Dhan, GitHub, webhook worker, Claude CLI,
-    Ollama models, Discord, the DB role and backups. Read-only; admin only."""
+    the Claude API, Discord, the DB role and backups. Read-only; admin only."""
     s = request.app.state
     return await IntegrationsSummary(
         s.settings,
         s.sessionmaker,
-        s.ollama,
         getattr(s, "claude_cli", None),
         redis=getattr(s, "redis", None),
     ).collect()

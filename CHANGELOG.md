@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased: Claude is the only AI provider
+
+- New `app/ai/` package ([docs/26-ai-providers.md](docs/26-ai-providers.md)). `gateway.py`
+  is the only module that imports the `anthropic` SDK (enforced by a test): redaction,
+  worst-case budget reservation, prompt caching on tools + system prompt + conversation,
+  streaming, SDK retries with backoff, a per-call timeout, and every call logged in
+  `ai.usage` (tokens incl. cache read/write, USD cost, latency; never content).
+- Budgets: `AI_MONTHLY_BUDGET_USD` (100) and `AI_AGENT_BUDGETS_USD` (investments 40,
+  business 30, chat 20, reserve 10), Asia/Kolkata month, enforced under a DB lock.
+- Agent loop (max 8 steps) with a tool registry: investment reads (snapshots, screener, MT5
+  bot), `propose_trade` (hard risk limits in Python, then an approval; approved = a PAPER
+  intent only). Aquakart, Pawsattva and Spasta todo tools exist but are hidden until those
+  systems are connected.
+- API `/api/ai/*`: chat (SSE), conversations, approvals (admin + password), usage (admin).
+  Scheduled daily report (08:30 IST) and weekly review (Sunday 10:00 IST).
+- Removed: Gemini, OpenRouter and Ollama clients, the classification filter, model router,
+  provider settings, `/api/chat`, `/api/models*`, `/api/conversations*`, `/api/v1/ai/*`.
+  Research explanations and the voice fallback now use Claude; the coding agent and
+  self-repair have no model (tasks fail / stay queued with the reason).
+- Migration 0030 (additive): `ai.conversations.agent`, `ai.messages.blocks`, `ai.tool_calls`,
+  `ai.usage`, `ai.approvals`. Egress allowlist and commands: [docs/egress.md](docs/egress.md).
+
 ## Unreleased: AI_LOCAL_ENABLED switch (external models only)
 
 - New setting `AI_LOCAL_ENABLED` (default `true`, editable in /settings → AI). When `false`

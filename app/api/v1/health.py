@@ -18,7 +18,7 @@ async def liveness() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@router.get("/ready", summary="Readiness: Postgres, Redis, Ollama and the HDD are reachable")
+@router.get("/ready", summary="Readiness: Postgres, Redis and the HDD are reachable")
 async def readiness(request: Request, response: Response) -> dict[str, Any]:
     svc: HealthService = request.app.state.health
     results = await svc.readiness()

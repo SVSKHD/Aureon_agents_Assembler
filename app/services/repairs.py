@@ -4,7 +4,9 @@
 - Reuses the coding agent's machinery (app/agents/coding): the repo allowlist, a git worktree
   on a `repair/<id>` branch with hooks disabled, the patch extractor/validator, symlink-safe
   path checks and the argv command allowlist with a scrubbed environment.
-- The model is the local Ollama REPAIR_MODEL. Unset = repairs disabled: tasks stay `queued`
+- The model is REPAIR_MODEL through a model client. Since the AI stack is Claude-only
+  (docs/26) no client is wired (MODEL_CLIENT_WIRED), so repairs are disabled: tasks stay
+  `queued`. Unset REPAIR_MODEL = disabled as well: tasks stay `queued`
   with the reason in `blocked_reason`.
 - HARD BLOCKS (`hard_block`): trading / paper / research / risk code, auth and security,
   secrets, and infra (compose, Dockerfile, deploy, ops scripts, alembic, CI workflows), plus
@@ -148,7 +150,7 @@ class RepairConfig:
     def from_settings(cls, s: Settings) -> RepairConfig:
         return cls(
             coding=coding.CodingConfig.from_settings(s),
-            model=((s.REPAIR_MODEL or "").strip() or None) if s.AI_LOCAL_ENABLED else None,
+            model=(s.REPAIR_MODEL or "").strip() or None,
             repo=(s.REPAIR_REPO or "").strip() or None,
             github_repo=(s.REPAIR_GITHUB_REPO or "").strip() or None,
             model_timeout=s.REPAIR_MODEL_TIMEOUT_SECONDS,
@@ -156,10 +158,15 @@ class RepairConfig:
         )
 
 
+# The coding worker has no repair model client since the AI stack became Claude-only.
+# Tests that exercise the pipeline switch this on with their own fake client.
+MODEL_CLIENT_WIRED = False
+
+
 def disabled_reason(settings: Settings) -> str | None:
     """Why repairs cannot run right now (they stay queued), or None."""
-    if not settings.AI_LOCAL_ENABLED:
-        return "repairs are disabled: local models are off (AI_LOCAL_ENABLED)"
+    if not MODEL_CLIENT_WIRED:
+        return "repairs are disabled: no model is wired for repairs (Claude-only AI, docs/26)"
     if not (settings.REPAIR_MODEL or "").strip():
         return "repairs are disabled: REPAIR_MODEL is not set"
     repo = (settings.REPAIR_REPO or "").strip()

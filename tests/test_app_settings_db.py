@@ -72,7 +72,7 @@ async def test_list_is_admin_only_and_shows_no_values(make_env: EnvFactory) -> N
         assert body["encryption_ready"] is True
         gh = _item(body, "GITHUB_TOKEN")
         assert gh["source"] == "env" and gh["is_set"] and gh["masked"] == "••••" + ENV_TOKEN[-4:]
-        assert _item(body, "OPENROUTER_API_KEY")["source"] == "unset"
+        assert _item(body, "ANTHROPIC_API_KEY")["source"] == "unset"
         assert {s["key"] for s in body["settings"]} == set(svc.REGISTRY)
 
 
@@ -82,7 +82,7 @@ async def test_writes_need_csrf(make_env: EnvFactory) -> None:
             f"{URL}/GITHUB_TOKEN", json={"value": GH, "password": PASSWORD}
         )
         assert r.status_code == 403
-        assert (await env.send("a", "PUT", f"{URL}/OPENROUTER_DEFAULT_MODEL",
+        assert (await env.send("a", "PUT", f"{URL}/AI_MODEL_MAIN",
                                json={"value": "x/y"})).status_code == 403  # fmt: skip
 
 
@@ -147,10 +147,10 @@ async def test_set_secret_overrides_env_live_then_revert(make_env: EnvFactory) -
 async def test_plain_setting_needs_no_password(make_env: EnvFactory) -> None:
     async with make_env() as env:
         r = await env.send(
-            "admin", "PUT", f"{URL}/OPENROUTER_ALLOWED_MODELS", json={"value": "a/b, c/d"}
+            "admin", "PUT", f"{URL}/DHAN_INSTRUMENT_SEGMENTS", json={"value": "NSE_EQ, IDX_I"}
         )
         assert r.status_code == 200, r.text
-        assert env.app.state.settings.OPENROUTER_ALLOWED_MODELS == ["a/b", "c/d"]
+        assert env.app.state.settings.DHAN_INSTRUMENT_SEGMENTS == ["NSE_EQ", "IDX_I"]
 
 
 async def test_bootstrap_unknown_and_invalid_keys(make_env: EnvFactory) -> None:
@@ -193,9 +193,7 @@ async def test_writes_are_rate_limited(make_env: EnvFactory, monkeypatch: Any) -
     async with make_env() as env:
         codes = [
             (
-                await env.send(
-                    "admin", "PUT", f"{URL}/OPENROUTER_DEFAULT_MODEL", json={"value": f"m/{i}"}
-                )
+                await env.send("admin", "PUT", f"{URL}/AI_MODEL_MAIN", json={"value": f"m/{i}"})
             ).status_code
             for i in range(3)
         ]
@@ -215,7 +213,7 @@ async def test_other_processes_hear_the_change(make_env: EnvFactory) -> None:
             svc.watch(env.maker, env.app.state.redis, on_change, stop, poll_seconds=3600)
         )
         await asyncio.sleep(0.3)  # subscribed
-        await env.send("admin", "PUT", f"{URL}/OPENROUTER_DEFAULT_MODEL", json={"value": "x/y"})
+        await env.send("admin", "PUT", f"{URL}/AI_MODEL_MAIN", json={"value": "x/y"})
         await asyncio.wait_for(heard.wait(), 10)
         stop.set()
         await asyncio.wait_for(watcher, 10)
@@ -230,7 +228,7 @@ async def test_worker_reload_only_for_its_keys(make_env: EnvFactory, settings: S
         )
         await asyncio.sleep(0.3)
         try:
-            await env.send("admin", "PUT", f"{URL}/OPENROUTER_DEFAULT_MODEL", json={"value": "a/b"})
+            await env.send("admin", "PUT", f"{URL}/AI_MODEL_MAIN", json={"value": "a/b"})
             await asyncio.sleep(1.0)
             assert not stop.is_set()
             r = await env.send("admin", "PUT", f"{URL}/DHAN_FEED_QUEUE_MAX", json={"value": "250"})
@@ -245,7 +243,7 @@ async def test_worker_reload_only_for_its_keys(make_env: EnvFactory, settings: S
 
 # --- acceptance checks (docs/settings.md) ------------------------------------------------
 
-OR_KEY = "sk-or-v1-" + "f00dfeed" * 8
+AN_KEY = "sk-ant-api03-" + "f00dfeed" * 8
 WEBHOOK = "https://discord.com/api/webhooks/123456789/" + "WebhookSecretPart_" * 3
 ALLOWED_FIELDS = {
     "key", "category", "description", "kind", "is_secret", "requires_reauth", "is_set",
@@ -262,12 +260,12 @@ async def _put(env: Any, key: str, value: str) -> Any:
 
 async def test_get_returns_masks_never_values(make_env: EnvFactory) -> None:
     async with make_env() as env:
-        for key, value in (("GITHUB_TOKEN", GH), ("OPENROUTER_API_KEY", OR_KEY),
+        for key, value in (("GITHUB_TOKEN", GH), ("ANTHROPIC_API_KEY", AN_KEY),
                            ("DISCORD_WEBHOOK_URL", WEBHOOK)):  # fmt: skip
             assert (await _put(env, key, value)).status_code == 200
         r = await env.get("admin", URL)
         assert r.status_code == 200
-        for secret in (GH, OR_KEY, WEBHOOK, ENV_TOKEN, MASTER, "WebhookSecretPart_"):
+        for secret in (GH, AN_KEY, WEBHOOK, ENV_TOKEN, MASTER, "WebhookSecretPart_"):
             assert secret not in r.text
         for item in r.json()["settings"]:
             assert set(item) <= ALLOWED_FIELDS, set(item) - ALLOWED_FIELDS
@@ -292,7 +290,7 @@ async def test_every_bootstrap_key_is_refused(make_env: EnvFactory) -> None:
 async def test_audit_rows_have_key_actor_time_and_no_value(make_env: EnvFactory) -> None:
     async with make_env() as env:
         await _put(env, "GITHUB_TOKEN", GH)
-        await env.send("admin", "PUT", f"{URL}/OPENROUTER_DEFAULT_MODEL", json={"value": "m/x"})
+        await env.send("admin", "PUT", f"{URL}/AI_MODEL_MAIN", json={"value": "m/x"})
         await env.send("admin", "DELETE", f"{URL}/GITHUB_TOKEN", json={"password": PASSWORD})
         rows = await env.sql(
             "SELECT event_type, actor_user_id, occurred_at, details::text FROM audit.audit_events"
@@ -301,15 +299,13 @@ async def test_audit_rows_have_key_actor_time_and_no_value(make_env: EnvFactory)
         assert [r[0] for r in rows] == ["settings_updated", "settings_updated", "settings_reverted"]
         for event, actor, at, details in rows:
             assert actor == env.ids["admin"] and at is not None, event
-            assert json.loads(details)["key"] in ("GITHUB_TOKEN", "OPENROUTER_DEFAULT_MODEL")
+            assert json.loads(details)["key"] in ("GITHUB_TOKEN", "AI_MODEL_MAIN")
             assert GH not in details and "m/x" not in details and "value" not in json.loads(details)
 
 
 async def test_plain_values_are_encrypted_at_rest_too(make_env: EnvFactory) -> None:
     async with make_env() as env:
-        await env.send(
-            "admin", "PUT", f"{URL}/OPENROUTER_DEFAULT_MODEL", json={"value": "vendor/m"}
-        )
+        await env.send("admin", "PUT", f"{URL}/AI_MODEL_MAIN", json={"value": "vendor/m"})
         await _put(env, "GITHUB_TOKEN", GH)
         rows = await env.sql("SELECT key, value_encrypted::text FROM core.app_settings")
         raw = json.dumps([list(r) for r in rows])
@@ -347,21 +343,21 @@ async def test_no_secret_in_logs_errors_discord_or_prompts(
             r = await env.send("admin", "PUT", f"{URL}/GITHUB_TOKEN",
                                json={"value": GH, "password": password})  # fmt: skip
             bodies.append(r.text)
-        bodies.append((await _put(env, "OPENROUTER_API_KEY", OR_KEY)).text)
+        bodies.append((await _put(env, "ANTHROPIC_API_KEY", AN_KEY)).text)
         bodies.append((await _put(env, "DISCORD_WEBHOOK_URL", WEBHOOK)).text)
         bodies.append((await _put(env, "DHAN_BASE_URL", f"http://x/{GH}")).text)  # invalid
         bodies.append((await env.send("admin", "POST", f"{URL}/GITHUB_TOKEN/test")).text)
-        bodies.append((await env.send("admin", "POST", f"{URL}/OPENROUTER_API_KEY/test")).text)
+        bodies.append((await env.send("admin", "POST", f"{URL}/DISCORD_WEBHOOK_URL/test")).text)
         bodies.append((await env.get("admin", URL)).text)
 
         monkeypatch.setattr(discord.httpx, "AsyncClient", fake)
-        await discord.post(WEBHOOK, {"content": f"leak? {GH} {OR_KEY}"}, attempts=1,
+        await discord.post(WEBHOOK, {"content": f"leak? {GH} {AN_KEY}"}, attempts=1,
                            request_seconds=1, retry_base_seconds=0)  # fmt: skip
-        prompt = scrub_messages([{"role": "user", "content": f"key {OR_KEY} and {GH}"}])
+        prompt = scrub_messages([{"role": "user", "content": f"key {AN_KEY} and {GH}"}])
 
         import structlog
 
-        structlog.get_logger("verify").error("boom", detail=f"{GH} {OR_KEY} {WEBHOOK}")
+        structlog.get_logger("verify").error("boom", detail=f"{GH} {AN_KEY} {WEBHOOK}")
 
     out, err = capfd.readouterr()
     haystacks = {
@@ -373,6 +369,6 @@ async def test_no_secret_in_logs_errors_discord_or_prompts(
     assert sent, "the Discord post was not attempted"
     assert '"boom"' in haystacks["logs"], "logging was not captured"
     for where, text in haystacks.items():
-        for secret in (GH, OR_KEY, WEBHOOK, "WebhookSecretPart_", MASTER):
+        for secret in (GH, AN_KEY, WEBHOOK, "WebhookSecretPart_", MASTER):
             assert secret not in text, f"secret in {where}"
     register_secret_values([])

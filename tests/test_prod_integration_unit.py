@@ -119,8 +119,8 @@ def test_code_tasks_and_repairs_run_under_the_heavy_model_lock() -> None:
 
 
 async def test_repair_loop_holds_the_lock_while_it_runs(monkeypatch: pytest.MonkeyPatch) -> None:
-    from app.agents.ollama.heavy import HEAVY_MODEL_LOCK
     from app.services import repairs
+    from app.services.heavy import HEAVY_MODEL_LOCK
     from app.workers import coding as worker
 
     stop = asyncio.Event()
@@ -243,11 +243,6 @@ def test_image_worker_is_single_instance_single_job() -> None:
     assert imaging.LOCK_KEY == "aureon:imaging:worker-lock"
     # One `current_job` slot; the serve loop awaits each job before claiming the next.
     assert src.count("self.current_job =") >= 1 and "asyncio.gather" not in src
-
-
-def test_chat_generations_are_serialised_by_default(settings: Settings) -> None:
-    assert Settings.model_fields["OLLAMA_MAX_CONCURRENT"].default == 1
-    assert settings.OLLAMA_MAX_CONCURRENT == 1
 
 
 # --- Cloudflare tunnel + nginx config -----------------------------------------------------

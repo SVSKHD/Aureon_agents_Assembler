@@ -1,3 +1,6 @@
+> **Superseded (2026-11-12):** the AI stack is Claude-only. Ollama, OpenRouter, Gemini and the
+> provider routing described here are removed. See [26-ai-providers.md](26-ai-providers.md).
+
 # Model routing for the agents
 
 Every agent that asks a language model goes through one function:

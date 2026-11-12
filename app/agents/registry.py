@@ -34,7 +34,7 @@ class AgentSpec:
     kind: str
 
 
-OLLAMA = AgentSpec("ollama", "Ollama chat", "llm")
+CLAUDE = AgentSpec("claude", "Claude gateway (AI chat)", "llm")
 IMAGING = AgentSpec("imaging", "Stable Diffusion worker", "imaging")
 SCHEDULER = AgentSpec("scheduler", "Scheduler", "scheduler")
 # Heartbeat comes from the scheduler's `github_sync` task (docs/18-github-foundation.md).

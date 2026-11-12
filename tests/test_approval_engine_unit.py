@@ -228,19 +228,19 @@ class FakeOllama:
         yield {"message": {"content": self.reply}, "done": True}
 
 
-async def test_voice_ollama_fallback_is_validated() -> None:
+async def test_voice_model_fallback_is_validated() -> None:
     ok = FakeOllama('{"intent": "open_pr", "ref": "17"}')
-    r = await voice.resolve("take me to seventeen", ollama=ok, model="m")
-    assert (r.intent, r.route, r.source) == ("open_pr", "/dev/prs/17", "ollama")
+    r = await voice.resolve("take me to seventeen", client=ok, model="m")
+    assert (r.intent, r.route, r.source) == ("open_pr", "/dev/prs/17", "model")
     # the model cannot invent an intent or a route
     bad = FakeOllama('{"intent": "approve", "ref": "1", "route": "/api/v1/approvals/1/approve"}')
-    r = await voice.resolve("do the thing", ollama=bad, model="m")
+    r = await voice.resolve("do the thing", client=bad, model="m")
     assert r.intent == "unknown" and r.route is None
     evil = FakeOllama('{"intent": "open_approval", "ref": "../../api"}')
-    assert (await voice.resolve("hmm", ollama=evil, model="m")).route is None
+    assert (await voice.resolve("hmm", client=evil, model="m")).route is None
     # the grammar answers first: no model call
     unused = FakeOllama("{}")
-    await voice.resolve("show agents", ollama=unused, model="m")
+    await voice.resolve("show agents", client=unused, model="m")
     assert unused.calls == 0
 
 

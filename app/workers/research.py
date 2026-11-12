@@ -4,7 +4,7 @@
     backtest   (queued trading.backtest_runs)
     screener   (queued trading.screener_runs; stored candles only, never a Dhan call)
     candle-backfill (trading.candle_backfill_requests → Dhan history, shared rate limit)
-    ai-research (Redis list research:ai:queue → Ollama → trading.ai_analyses)
+    ai-research (Redis list research:ai:queue → Claude gateway → trading.ai_analyses)
 
 Each agent has its own bounded asyncio queue (RESEARCH_QUEUE_MAX). A full queue drops the
 new item and counts it; the next tick re-enqueues the same work, so nothing piles up.
@@ -23,7 +23,7 @@ import json
 import signal
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -31,21 +31,18 @@ from redis.asyncio import Redis
 from redis.exceptions import TimeoutError as RedisTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.agents.ollama.client import OllamaClient
-from app.agents.providers.base import EXTERNAL_PROVIDERS, ExternalChatClient
 from app.agents.registry import AgentRegistry, AgentSpec, Heartbeat
 from app.agents.research import ai, strategies
 from app.agents.trading.base import BrokerAdapter
 from app.agents.trading.dhan import build_dhan_adapter
 from app.agents.trading.mt5 import build_mt5_adapter
 from app.agents.trading.types import Timeframe
+from app.ai.gateway import ClaudeGateway
 from app.core.config import Settings
 from app.core.logging import configure_logging, get_logger
 from app.db.session import build_engine, build_sessionmaker
 from app.models.trading import Instrument
 from app.services import app_settings, market_data, research, screener
-from app.services.ai_usage import UsageTracker
-from app.services.inference import ExternalGate, build_external, gate_for
 
 log = get_logger("worker.research")
 
@@ -54,7 +51,7 @@ TECHNICAL = AgentSpec("technical-analysis", "Technical analysis agent", "trading
 SIGNAL = AgentSpec("signal", "Signal agent", "trading")
 RISK = AgentSpec("risk", "Risk agent", "trading")
 BACKTEST = AgentSpec("backtest", "Research / backtesting agent", "trading")
-AI_RESEARCH = AgentSpec("ai-research", "AI research agent (Ollama, explanations only)", "trading")
+AI_RESEARCH = AgentSpec("ai-research", "AI research agent (Claude, explanations only)", "trading")
 SCREENER = AgentSpec("screener", "Screener agent (stored candles, no broker calls)", "trading")
 BACKFILL = AgentSpec("candle-backfill", "Candle history agent (Dhan, rate limited)", "trading")
 SPECS = (MARKET_DATA, TECHNICAL, SIGNAL, RISK, BACKTEST, AI_RESEARCH, SCREENER, BACKFILL)
@@ -114,16 +111,13 @@ class ResearchWorker:
         adapters: dict[str, BrokerAdapter],
         *,
         redis: Redis | None = None,
-        ollama: OllamaClient | None = None,
-        external: Mapping[str, ExternalGate] | ExternalGate | None = None,
+        gateway: ClaudeGateway | None = None,
     ) -> None:
         self.settings = settings
-        # Only when AI_RESEARCH_EXTERNAL_ALLOWED=true (docs/25-openrouter.md); else None.
-        self.external = external
+        self.gateway = gateway
         self.maker = maker
         self.adapters = adapters
         self.redis = redis
-        self.ollama = ollama
         self.registry = AgentRegistry(maker)
         qmax = settings.RESEARCH_QUEUE_MAX
         self.lanes = {s.id: AgentLane(s, asyncio.Queue(maxsize=qmax)) for s in SPECS}
@@ -206,21 +200,9 @@ class ResearchWorker:
 
     async def do_ai(self, req: dict[str, Any]) -> None:
         why = ai.unavailable_reason(self.settings)
-        if why is not None or self.ollama is None:
-            raise RuntimeError(why or "no Ollama client")
-        # The local model is the fallback only: an external answer (Gemini first, where
-        # permitted) is never followed by a local call.
-        # AI_LOCAL_ENABLED off: external only, never a local fallback.
-        model = self.settings.RESEARCH_AI_MODEL if self.settings.AI_LOCAL_ENABLED else None
-        await ai.explain(
-            self.maker,
-            self.ollama,
-            model,
-            req["kind"],
-            uuid.UUID(req["id"]),
-            limit_s=self.settings.RESEARCH_AI_TIMEOUT_SECONDS,
-            external=self.external,
-        )
+        if why is not None or self.gateway is None:
+            raise RuntimeError(why or "no Claude gateway")
+        await ai.explain(self.maker, self.gateway, req["kind"], uuid.UUID(req["id"]))
 
     # --- loops ---------------------------------------------------------------------------
 
@@ -408,33 +390,14 @@ async def main() -> int:
     mt5 = build_mt5_adapter(settings)
     if mt5 is not None:
         adapters["mt5"] = mt5
-    ollama = OllamaClient(
-        settings.OLLAMA_BASE_URL,
-        connect_timeout=settings.OLLAMA_CONNECT_TIMEOUT,
-        read_timeout=settings.OLLAMA_READ_TIMEOUT,
-        cache_ttl=0,
-    )
-    # Every configured provider's client (docs/30); none unless research may go external.
-    clients: dict[str, ExternalChatClient] = (
-        {p: c for p in EXTERNAL_PROVIDERS if (c := build_external(settings, p)) is not None}
-        if settings.AI_RESEARCH_EXTERNAL_ALLOWED
-        else {}
-    )
-    usage = UsageTracker(redis)
-    external: dict[str, ExternalGate] | None = {
-        p: gate_for(settings, p, clients, usage) for p in clients
-    } or None
-    worker = ResearchWorker(
-        settings, maker, adapters, redis=redis, ollama=ollama, external=external
-    )
+    gateway = ClaudeGateway.build(settings, maker)
+    worker = ResearchWorker(settings, maker, adapters, redis=redis, gateway=gateway)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
     # A change to its keys from Spasta re-execs this worker (docs/settings.md).
-    app_settings.start_worker_watch(
-        settings, maker, stop, ("OPENROUTER_", "GEMINI_", "ANTHROPIC_", "AI_"), redis
-    )
+    app_settings.start_worker_watch(settings, maker, stop, ("ANTHROPIC_", "AI_"), redis)
 
     beats = []
     for spec in SPECS:
@@ -474,9 +437,7 @@ async def main() -> int:
             await dhan.aclose()
         if mt5 is not None:
             await mt5.aclose()
-        await ollama.aclose()
-        for client in clients.values():
-            await client.aclose()
+        await gateway.aclose()
         await redis.aclose()
         await engine.dispose()
         log.info("research_worker_stopped")

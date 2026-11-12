@@ -28,8 +28,6 @@ from typing import Any
 from sqlalchemy import select, update
 
 from app.agents.coding.git import Git
-from app.agents.ollama.client import OllamaClient
-from app.agents.ollama.heavy import HEAVY_MODEL_LOCK
 from app.agents.registry import AgentRegistry, AgentSpec, Heartbeat
 from app.core.logging import configure_logging, get_logger
 from app.core.procsec import make_non_dumpable
@@ -38,6 +36,7 @@ from app.integrations.github import build_github_client
 from app.integrations.github.client import GitHubClient
 from app.models.agents import CodeTask
 from app.services import app_settings, coding, coding_git, incidents, repairs
+from app.services.heavy import HEAVY_MODEL_LOCK
 
 log = get_logger("worker.coding")
 CODING = AgentSpec("coding", "Coding agent", "coding")
@@ -67,7 +66,7 @@ async def repair_loop(
     maker: Any,
     settings: Any,
     cfg: repairs.RepairConfig,
-    ollama: OllamaClient,
+    ollama: Any,
     github: GitHubClient | None,
     registry: AgentRegistry,
     stop: asyncio.Event,
@@ -144,18 +143,15 @@ async def main() -> int:
     engine = build_engine(settings)
     maker = build_sessionmaker(engine)
     registry = AgentRegistry(maker)
-    ollama = OllamaClient(
-        settings.OLLAMA_BASE_URL,
-        connect_timeout=settings.OLLAMA_CONNECT_TIMEOUT,
-        read_timeout=settings.OLLAMA_READ_TIMEOUT,
-        cache_ttl=0,
-    )
+    # No model client: the AI stack is Claude-only (docs/26). Code tasks fail with that
+    # reason and repairs stay queued (repairs.disabled_reason); git ops are unaffected.
+    ollama = None
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
     # A change to its keys from Spasta re-execs this worker (docs/settings.md).
-    app_settings.start_worker_watch(settings, maker, stop, ("GITHUB_", "AI_LOCAL_"), None)
+    app_settings.start_worker_watch(settings, maker, stop, ("GITHUB_",), None)
     state: dict[str, Any] = {"paused": False, "running": None}
 
     def report() -> tuple[str, dict[str, Any]]:
@@ -234,7 +230,6 @@ async def main() -> int:
         await hb.stop()
         if github is not None:
             await github.aclose()
-        await ollama.aclose()
         await engine.dispose()
         log.info("coding_worker_stopped")
     return 0

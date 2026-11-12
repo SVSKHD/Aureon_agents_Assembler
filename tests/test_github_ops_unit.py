@@ -155,7 +155,6 @@ def test_settings_defaults() -> None:
         ENV="test",
         DATABASE_URL="postgresql+asyncpg://x:x@127.0.0.1:1/none",
         SECRET_KEY="t" * 40,
-        OLLAMA_BASE_URL="http://x:1",
     )
     assert s.GITHUB_DIFF_MAX_BYTES == 2 * 1024 * 1024
     assert s.APPROVALS_TTL_MINUTES == 30 and s.APPROVALS_ALLOW_SELF_APPROVAL is True

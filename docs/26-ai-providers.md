@@ -1,372 +1,106 @@
-# 26 — Direct AI providers: Anthropic and Gemini next to OpenRouter and Ollama
+# 26 — Claude: the only AI provider
 
-**Status:** implemented (migration `0023`). Off by default. Local Ollama stays the default
-and the only fallback. This extends the OpenRouter design ([25](25-openrouter.md)); it is
-not a second AI stack. The same gate, filter, usage counter, chat stream, model router and
-settings registry now serve four providers.
+**Status:** implemented (migration `0030`). Claude (the Anthropic API) is Aureon's only AI
+model. Gemini, OpenRouter and local Ollama are removed. Agents, tools and data stay on this
+server; the only outbound AI traffic is HTTPS to `api.anthropic.com`, and only
+`app/ai/gateway.py` makes it (`tests/test_ai_gateway.py` fails if any other module imports
+the `anthropic` SDK or names that host). Egress allowlist: [egress.md](egress.md).
 
-| Provider | Credential | Role | Cost source |
-| --- | --- | --- | --- |
-| `ollama` | none (local service) | private default and the only fallback | none |
-| `openrouter` | `OPENROUTER_API_KEY` | multi-model gateway (unchanged) | OpenRouter's reported `usage.cost` |
-| `anthropic` | `ANTHROPIC_API_KEY` | direct Claude models | operator-configured price × tokens |
-| `gemini` | `GEMINI_API_KEY` | direct Gemini models (Developer API) | operator-configured price × tokens |
+## Layout (`app/ai/`)
 
-**Two Claude integrations, kept separate.** Direct Anthropic inference
-(`app/agents/anthropic/`) uses an API key from the Anthropic Console. The advisory PR review
-([22](22-claude-review.md)) runs the local Claude Code CLI with its own login. Neither
-credential grants the other: an API key does not log the CLI in, and a Claude subscription
-does not authorize API calls. The review's flags, filter and approval rules are unchanged.
+| Module | Role |
+|---|---|
+| `gateway.py` | the only SDK user: redaction, budget reservation, caching, streaming, retries, usage log |
+| `redact.py` | strips names, emails, phones, addresses, account/client ids, PAN/Aadhaar/IFSC/cards, keys and tokens |
+| `budget.py` | monthly + per-budget caps (Asia/Kolkata month), reserved before every call |
+| `pricing.py` | cost of a call from its tokens (input, output, cache read, cache write) |
+| `tools/` | the tool registry; investment, business and Spasta tools |
+| `loop.py` | the agent loop (max `AI_MAX_STEPS`) |
+| `approvals.py` | write requests: file, approve/reject, backend-only execution |
+| `risk.py` | hard limits on proposed trades |
+| `agents.py` | agents, their fixed system prompts, budgets, the router prompt |
+| `chat.py` | conversations: replay, persistence, one turn |
+| `reports.py` | the scheduled daily report and weekly review |
+| `voice.py` | voice navigation's model fallback over the gateway |
 
-## Architecture
+## Settings (/settings → AI, or `.env`)
 
-```
-POST /api/chat ─┐                     app/services/inference.py
-ModelRouter ────┼─► ExternalGate(provider).decide ──"no"──► local Ollama (reason recorded)
-research worker ┘        │ (one gate, every provider)
-                         "yes" ─► ExternalChatClient.chat_stream
-                                   ├─ OpenRouterClient  (httpx, unchanged)
-                                   ├─ AnthropicClient   (official `anthropic` SDK)
-                                   └─ GeminiClient      (official `google-genai` SDK)
-                                  error / refusal ─► local Ollama (never another provider)
-```
+| Key | Default | Meaning |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | unset | Console API key. Unset = every AI feature is off. Never logged or returned. |
+| `AI_MODEL_MAIN` | `claude-opus-5-5` | every agent's model |
+| `AI_MODEL_ROUTER` | `claude-haiku-5-5` | picks the agent when a chat names none; voice fallback. Empty = off |
+| `AI_EFFORT` | `medium` | thinking effort (Opus 5.5 always thinks; effort is the control) |
+| `AI_MONTHLY_BUDGET_USD` | `100` | cap on all spend this month |
+| `AI_AGENT_BUDGETS_USD` | investments 40, business 30, chat 20, reserve 10 | caps per budget |
+| `AI_MODEL_PRICES` | `{}` | extra/override prices; a model without a price is never called |
+| `AI_MAX_STEPS` | `8` | model calls per turn |
+| `AI_TOOL_RESULT_MAX_TOKENS` | `2000` | each tool result is cut to about this |
+| `AI_TRADE_MAX_LOSS_INR` / `_MAX_ORDER_INR` / `_MAX_PER_DAY` | 2000 / 100000 / 3 | propose_trade limits |
+| `AI_DAILY_REPORT_CRON` / `AI_WEEKLY_REVIEW_CRON` | `30 8 * * *` / `0 10 * * 0` (IST) | reports; empty = off |
 
-- **One interface** (`app/agents/providers/base.py`): `chat_stream()` yields
-  `{"content"}` pieces and then one `{"done", "usage": {prompt_tokens, completion_tokens,
-  cost_usd}, "model"}`. `list_models()` and `aclose()` complete it. Every failure is a
-  `ProviderError`, and its `code` is the fallback reason. `OpenRouterError` is now a
-  `ProviderError`, and all OpenRouter class names are kept.
-- **Error rules, the same for every adapter.** Messages are fixed strings built from the
-  HTTP status, never the response body (a body can echo the prompt). SDK exceptions are
-  re-raised `from None`, so no body is chained. Keys appear only in the SDK's request
-  header: never in `repr`, an error or a log line.
-- **Anthropic specifics.**
-  - SDK 2.x sends `anthropic-version: 2026-10-21` and the key as `Authorization: Bearer`.
-  - `temperature`, `top_p` and `top_k` are never sent: that API version rejects them with
-    a 400.
-  - `max_tokens` is the caller's value, else `AI_EXTERNAL_MAX_OUTPUT_TOKENS`.
-  - `stop_reason: "refusal"` raises `refused`.
-  - Server-side refusal `fallbacks` are deliberately **not** enabled. They would answer from
-    a different model that may not be allowlisted or priced, which defeats the budget.
-- **Gemini specifics.**
-  - Uses the Developer API, with the key in the `x-goog-api-key` header (never in the URL).
-  - The model id is validated before use, because it becomes part of the request path.
-  - Thought parts are never streamed. Thinking tokens are counted as output, since they are
-    billed as output.
-  - A blocked prompt, or a SAFETY / PROHIBITED_CONTENT / BLOCKLIST / SPII / RECITATION
-    finish, raises `refused`.
+Built-in prices (USD per million tokens, input / output / cache read; cache write = 1.25 ×
+input): Opus 5.5 4 / 20 / 0.20, Sonnet 5.5 2 / 10 / 0.20, Haiku 5.5 0.10 / 0.50 / 0.01
+(0.50 / 2.50 above 100K prompt tokens).
 
-## Settings
+## Every call (gateway)
 
-All of these are runtime settings (`/settings`, stored Fernet-encrypted in
-`core.app_settings`, [settings.md](settings.md)) with `.env` as the fallback. Keys are
-`secret` specs: they need the admin's password to write or revert, are masked in every
-response, are audited by key name only, and are registered with the log scrubber.
+1. The model must be priced, or nothing is sent.
+2. Redaction of the system prompt, user text and tool results. Claude's own earlier turns are
+   replayed byte-for-byte (they came from redacted input, and their thinking blocks must not
+   change).
+3. The worst-case cost (whole prompt at the cache-write rate + `max_tokens` output) is reserved
+   in `ai.usage` under a Postgres advisory lock; if it could cross the monthly cap or the
+   call's budget cap, the call is refused (`budget_exceeded`, HTTP 402 / SSE error).
+4. Streaming request with `cache_control` on the last tool and on the system prompt (both fixed
+   text) plus automatic caching of the conversation, `output_config.effort`, no sampling
+   parameters. No server-side fallback to another model: the answer comes from a priced,
+   allowed model or not at all.
+5. SDK retries with backoff on connection errors, 408/409/429, 5xx (`AI_MAX_RETRIES`); the
+   whole call is bounded by `AI_TIMEOUT_SECONDS`.
+6. The reservation is settled: agent, model, input/output/cache tokens, USD cost, latency,
+   request id, stop reason. Never content. A refusal is recorded and returned as `refused`.
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `ANTHROPIC_ENABLED` / `GEMINI_ENABLED` | `false` | Master switch. Off: no client is built, nothing is sent |
-| `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` | empty | Server only. Never returned, logged or given to the SPA (no `VITE_` copy) |
-| `ANTHROPIC_BASE_URL` / `GEMINI_BASE_URL` | `https://api.anthropic.com` / `https://generativelanguage.googleapis.com` | API base |
-| `ANTHROPIC_DEFAULT_MODEL` / `GEMINI_DEFAULT_MODEL` | empty | Required for the provider to be usable; always allowed |
-| `ANTHROPIC_ALLOWED_MODELS` / `GEMINI_ALLOWED_MODELS` | empty | Extra allowed ids (comma list) |
-| `ANTHROPIC_DAILY_LIMIT_USD` / `GEMINI_DAILY_LIMIT_USD` | `0` | Per-provider cap per UTC day. `0` = no budget, everything stays local |
-| `ANTHROPIC_MODEL_PRICES` / `GEMINI_MODEL_PRICES` | `{}` | `{"<model>": {"input": "<usd>", "output": "<usd>"}}`, USD per million tokens. **A model without a price is never used** (`no_pricing`). Nothing is built in: copy current prices from the provider's pricing page |
-| `ANTHROPIC_TIMEOUT_SECONDS` / `GEMINI_TIMEOUT_SECONDS` | `60` | Per request |
-| `AI_DEFAULT_EXTERNAL_PROVIDER` | `openrouter` | Provider for new conversations and `auto` agents, only when usable |
-| `AI_EXTERNAL_DAILY_LIMIT_USD` | unset | Cap on today's **total** external spend across providers. Unset = per-provider caps only |
-| `AI_EXTERNAL_MAX_OUTPUT_TOKENS` | `4096` | Output tokens when the caller sets none; also the worst case reserved before a priced call |
-| `AI_EXTERNAL_MAX_RETRIES` | `1` | SDK retries before the first byte (connection errors, 408/409/429/5xx) |
-| `AI_EXTERNAL_REQUESTS_PER_MINUTE` | `30` | Calls per provider per minute from this server (`0` = no local limit). Also applies to OpenRouter |
-| `AGENT_{NEWS,VOICE,RESEARCH}_PROVIDER` | `auto` | Now also `anthropic` / `gemini` |
-| `AGENT_{NEWS,VOICE,RESEARCH}_MODEL` | empty | The external model for that provider (empty = its default) |
+## Agents and tools
 
-Every OpenRouter setting keeps its meaning. With the defaults above
-(`AI_DEFAULT_EXTERNAL_PROVIDER=openrouter`, no global cap), the existing OpenRouter setup
-behaves as before, apart from the new 30/min local rate limit.
+Agents: `investments`, `business`, `general` (chat budget), `report` (reserve budget, read
+tools only). Tools:
 
-A provider is **usable** when it is enabled, has a key and a default model, its cap is
-above 0, and the global cap (if set) is above 0. A model is **selectable** when it is
-allowlisted and, for Anthropic and Gemini, priced.
+| Tool | Kind | Agents | Source |
+|---|---|---|---|
+| get_portfolio_summary, get_positions | read | investments, report | latest position snapshots (no broker call) |
+| get_dhan_screener_results | read | investments, report | latest finished screener run |
+| get_mt5_bot_status, get_mt5_recent_signals | read | investments, report | the Aureon bot's own tables (read-only) |
+| propose_trade | write | investments | risk limits → approval → PAPER intent |
+| get_aquakart_sales_summary, get_aquakart_open_queries, get_pawsattva_summary, draft_aquakart_blog | read/write | business | **not connected**: hidden from Claude |
+| get_todos, add_todo | read/write | general | **not connected** (Spasta todos live in Supabase) |
 
-## The gate, in order (first "no" wins)
+Write tools never act: they file an `ai.approvals` row (`pending`, expires after
+`AI_APPROVAL_TTL_HOURS`) and Claude is told "awaiting user approval". An admin approves with
+CSRF and their password; the backend then runs the executor. `paper_trade` creates a PAPER
+order intent through the paper engine (its own risk check and paper approval still apply);
+LIVE trading stays disabled and Dhan stays read-only.
 
-| Reason | Meaning |
-| --- | --- |
-| `disabled` / `not_configured` / `no_budget` | settings (`Settings.external_unusable_reason`) |
-| `model_not_allowed` | not the provider's default or on its allowlist |
-| `no_pricing` | an Anthropic/Gemini model without a configured price |
-| `context` | conversation linked to finance / trading / research (research: unless `AI_RESEARCH_EXTERNAL_ALLOWED`) |
-| `filter` | the classifier hit on the **full** outbound payload (`filter_categories` lists which) |
-| `daily_cap_reached` / `usage_unavailable` | the provider's counter in Redis; unreadable = refuse (fail closed) |
-| `rate_limited_local` | over `AI_EXTERNAL_REQUESTS_PER_MINUTE` for this provider |
-| `daily_cap_reached` / `global_cap_reached` | the call's worst case could not be reserved |
+## API (`/api/ai`, signed-in sessions only)
 
-Errors during a call fall back to local with: `rate_limited`, `upstream_error`,
-`unavailable`, `timeout`, `rejected` (bad or expired key, unknown model, no credits) and
-`refused` (the provider's safety filter declined).
+| Route | Who | |
+|---|---|---|
+| `POST /chat` | any user, CSRF, `AI_CHAT_REQUESTS_PER_MINUTE` | SSE: `meta`, `text`, `tool`, `approval`, `done`, `error` |
+| `GET /conversations`, `GET /conversations/{id}` | owner | readable messages only |
+| `GET /approvals?status=pending` | admin | |
+| `POST /approvals/{id}` `{action, password?}` | admin + CSRF; approve needs the password | executes on approve |
+| `GET /usage` | admin | month-to-date total and per budget, remaining |
 
-**No external-to-external failover.** If Anthropic fails, the turn goes to local Ollama, not
-to Gemini or OpenRouter. Sending a payload to a second company is a separate decision; the
-user has to make it by picking that provider.
+Admins can pause the `claude` agent from the agents page; chat then answers `ai_paused`.
 
-## Budgets and concurrency
+## What changed for other features
 
-- **Per-provider counters** live in Redis at `ai:<provider>:usage:<UTC day>`. OpenRouter's key
-  is unchanged, so today's OpenRouter spend carries over.
-- **Reservations for the priced providers** (Anthropic, Gemini).
-  - The worst case is reserved with an atomic `HINCRBY` on `ai:<provider>:reserved:<day>`
-    before the call, then checked against the cap. Worst case = prompt chars / 3 tokens at the
-    input price, plus `max_tokens` at the output price.
-  - So N concurrent calls can never jointly pass the cap.
-  - The real cost is recorded afterwards, and the reservation is released.
-  - A reservation left by a crashed process expires 15 minutes after the last reservation.
-    That only makes the cap stricter in the meantime.
-  - OpenRouter reports its cost only at the end, so it keeps its documented rule: concurrent
-    calls can overshoot by at most their own cost.
-- **The global cap** compares the sum of all providers' spend plus open reservations
-  against `AI_EXTERNAL_DAILY_LIMIT_USD`.
-
-## Privacy
-
-- Unchanged and shared by every provider:
-  - The classifier (`app/services/chat_filter.py`) runs on the whole outbound payload: system
-    prompt, re-sent history and new turns.
-  - Secrets, finance records, broker data, positions and logs always stay local.
-  - Trading text leaves only for `news` (public market news), or for research when
-    `AI_RESEARCH_EXTERNAL_ALLOWED=true`.
-- **Added:** Google API keys (`AIza…`) are recognized by the classifier, the log scrubber and
-  the GitHub redactor. Anthropic keys (`sk-ant-…`) already were.
-- **Unchanged paths:**
-  - Voice speech-to-text and text-to-speech stay local.
-  - Risk calculations never call a model.
-  - The research worker's explanations keep their OpenRouter-only path, behind
-    `AI_RESEARCH_EXTERNAL_ALLOWED`. They now also count against the global cap.
-  - The coding agent and the Claude review are not touched.
-
-## API contract for ASTRA-FRONTEND
-
-Every change is additive: existing fields and their meanings are unchanged.
-
-### `GET /api/models/catalog` (signed in)
-
-```jsonc
-{
-  "default": {"provider": "gemini", "model": "gemini-…"},       // or ollama + local model
-  "local_fallback_model": "qwen2.5:3b",
-  "ollama_reachable": true,
-  "models": [
-    {"provider": "ollama", "id": "qwen2.5:3b", "label": "qwen2.5:3b",
-     "available": true, "unavailable_reason": null,
-     "capabilities": ["chat", "streaming"], "privacy": "local"},
-    {"provider": "anthropic", "id": "claude-…", "label": "claude-…",
-     "available": false, "unavailable_reason": "no_pricing", "privacy": "external", …}
-  ],
-  "openrouter": {"enabled": false, "unavailable_reason": "disabled",
-                 "research_external_allowed": false},            // unchanged
-  "providers": [                                                  // NEW, local first
-    {"provider": "ollama", "label": "Local (Ollama)", "enabled": true, "configured": true,
-     "usable": true, "unavailable_reason": null, "default_model": "qwen2.5:3b",
-     "allowed_models": ["qwen2.5:3b"], "daily_limit_usd": null,
-     "cost_source": "none", "privacy": "local"},
-    {"provider": "anthropic", "label": "Anthropic", "enabled": true, "configured": true,
-     "usable": true, …, "daily_limit_usd": "1.00", "cost_source": "configured_price",
-     "privacy": "external"}
-  ],
-  "default_external_provider": "openrouter",
-  "global_daily_limit_usd": null
-}
-```
-
-- External models are listed only for **usable** providers.
-- Show `available: false` models disabled, with their `unavailable_reason`.
-- `configured` means a key is set. The key itself is never returned.
-
-### `POST /api/chat` (signed in, CSRF)
-
-- **Request.** `provider` now accepts `ollama | openrouter | anthropic | gemini`.
-  - A `model` sent without a `provider` is matched against each provider's allowlist.
-    OpenRouter ids contain `/`.
-  - A model that is not allowed returns 404 `{detail, available}`, as before.
-- **SSE events are unchanged.** `meta`, `done` and `error` carry:
-  - `provider` and `model`: who actually answered.
-  - `requested_provider` and `requested_model`: what was asked for.
-  - `fallback_reason`: the gate or error reason above.
-  - `local_only`: true when the data had to stay local.
-  - `filter_categories`.
-  - A `fallback` event `{provider: "ollama", model, reason, reset: true}` means: discard the
-    partial text, the local model continues.
-- **Per conversation.** The chosen provider and model are stored on the conversation
-  (`ai.conversations.provider` now allows `anthropic` and `gemini`) and reused on the next
-  turn when the request names none.
-
-### `GET /api/ai/usage?provider=openrouter|anthropic|gemini` (signed in)
-
-- Default `openrouter`: the same response as before.
-- Added fields: `global_limit_usd` and `global_spent_usd` (all providers, open reservations
-  included).
-
-### `GET /api/v1/ai/usage?days=1` (admin)
-
-- Unchanged: `items`, with per-agent rows by provider (calls, failures, fallbacks,
-  local_only, tokens, cost, avg latency); OpenRouter's `daily_limit_usd` and
-  `spent_today_usd`.
-- Added: `providers[]` `{provider, daily_limit_usd, spent_today_usd, reserved_usd,
-  calls_today, failures_today}`, `global_limit_usd` and `global_spent_today_usd`.
-
-### `/api/v1/settings` (admin, CSRF; writing a secret needs `{"password"}`)
-
-- New categories: `anthropic`, `gemini`, `ai`, with the keys above.
-- Secrets come back as `{is_secret: true, masked: "••••abcd" | "••••", source}`.
-- `POST /api/v1/settings/{key}/test` runs that category's connection test:
-  - **Anthropic / Gemini.** Lists models with the key (no tokens spent), then checks the
-    default model exists and is priced. Result: `{ok, detail}` as a status line.
-  - **ai.** Checks the default provider is usable (no network call).
-
-### `GET /api/v1/system/integrations` (admin)
-
-New section, `ai_providers`:
-- Per provider: `enabled`, `configured`, `usable`, `reason`, `default_model`,
-  `daily_limit_usd`.
-- Overall `status`: `ok`, `degraded` (an enabled provider is unusable or its default is
-  unpriced) or `disabled`.
-- Built from settings only; it never calls a provider.
-
-## Gemini 3.5 Flash-Lite: the primary external model
-
-Model id `gemini-3.5-flash-lite` (Gemini Developer API). Verified standard paid-tier price,
-USD per million tokens: **input 0.30** (text, image, video, audio), **output 2.50** (includes
-thinking tokens), no free tier (ai.google.dev/gemini-api/docs/pricing, checked 2026-11-11).
-
-Shipped defaults (code and `.env.example`):
-
-| Setting | Default |
-| --- | --- |
-| `AI_DEFAULT_EXTERNAL_PROVIDER` | `gemini` (was `openrouter`) |
-| `GEMINI_DEFAULT_MODEL` | `gemini-3.5-flash-lite`; blank also means this model |
-| `GEMINI_ALLOWED_MODELS` | `gemini-3.5-flash-lite` (the default model is always allowed) |
-| `GEMINI_MODEL_PRICES` | `{}`; `BUILTIN_MODEL_PRICES` supplies 0.30 / 2.50 for this model only. An operator entry for the same model wins |
-| `AGENT_NEWS/VOICE/RESEARCH_PROVIDER` | `gemini` (was `auto`) |
-| `GEMINI_ENABLED`, `GEMINI_DAILY_LIMIT_USD`, `AI_EXTERNAL_DAILY_LIMIT_USD`, `AI_RESEARCH_EXTERNAL_ALLOWED` | **unchanged** (off / 0 / unset / false): spending limits and privacy switches are never raised by this change |
-
-**Precedence** (highest first): a value saved in Settings (`core.app_settings`) → the
-environment / `.env` → the code default. A saved or `.env` value such as
-`AI_DEFAULT_EXTERNAL_PROVIDER=openrouter` or `AGENT_NEWS_PROVIDER=auto` therefore keeps the old
-routing until it is changed; the code defaults only apply where nothing is set.
-
-**When Qwen/Ollama runs** (nothing else starts it):
-
-1. the agent's provider is `ollama` (explicitly local), or the caller forces local;
-2. the content filter or the context keeps the request local (`local_only`: personal, finance,
-   broker or secret data; research without `AI_RESEARCH_EXTERNAL_ALLOWED`);
-3. Gemini (and every provider in `AI_EXTERNAL_FALLBACK_PROVIDERS`) refused (disabled, no key,
-   model not allowed or unpriced, daily/global cap, rate limit) or failed (error, timeout).
-
-A successful external answer returns at once: no second (local) inference.
-`ModelRouter.complete(..., allow_local=False)` lets a caller with no local model never start
-Qwen; research explanations without `RESEARCH_AI_MODEL` fail visibly instead of inventing text.
-
-**Per agent** (when Gemini is enabled, keyed and budgeted, and the gate allows the payload):
-
-| Agent | Model call | Provider / model | Local fallback |
-| --- | --- | --- | --- |
-| News | none: the news job only ingests RSS (`app/services/news.py`); no LLM call exists to route | n/a | n/a |
-| Voice | only when the deterministic grammar finds no intent; **local Ollama only** (`VOICE_OLLAMA_MODEL`), not routed: the voice module is barred from importing services/DB code (`tests/test_approval_engine_unit.py::test_voice_module_cannot_reach_state`) so it can never reach approval state. Routing it to Gemini needs that boundary redesigned first (decision pending) | n/a (local) | `VOICE_OLLAMA_MODEL` if set, else grammar only |
-| Research (router agent) | `ModelRouter("research")`, context `research` | gemini / gemini-3.5-flash-lite (needs `AI_RESEARCH_EXTERNAL_ALLOWED=true`) | `AGENT_RESEARCH_LOCAL_MODEL` (qwen2.5:3b) |
-| Trading research explanations (research worker) | `app/agents/research/ai.py`, provider from `AGENT_RESEARCH_PROVIDER`/`_MODEL` | gemini / gemini-3.5-flash-lite (needs `AI_RESEARCH_EXTERNAL_ALLOWED=true`) | `RESEARCH_AI_MODEL` if set; explanations no longer require it when external research is permitted |
-| Dhan market data, screener, indicators, signals, risk, execution | **never**: deterministic code with no model client (enforced by `tests/test_gemini_routing.py`) | n/a | n/a |
-
-Every attempt is a row in `ai.model_calls` (agent, provider, model, outcome, route reason,
-fallback, local_only, tokens, latency, cost; never content). Trading explanations use agent
-`trading-research` and still write the metadata-only `ai.external_call` audit event.
-
-### Verifying the routing (after deploy; changes nothing but a few tokens of spend)
-
-`POST /api/v1/ai/route-check` (admin, CSRF; agent `news`, `voice` or `research`: the router
-agents' settings, even where no feature calls them yet) sends a fixed public prompt ("Reply with the single
-word OK.") through the agent's real route and returns the answer's provider/model/fallback/
-reason plus the `ai.model_calls` rows it wrote, which is the evidence.
-
-```bash
-# as an admin session (cookie + x-csrf-token), for agent in voice research news:
-curl -sS -X POST https://<host>/api/v1/ai/route-check \
-  -H "content-type: application/json" -H "x-csrf-token: $CSRF" -b "$COOKIE" \
-  -d '{"agent": "voice"}'
-# then the audit trail:
-psql "$READONLY_DSN" -c "SELECT at, agent, provider, model, outcome, route_reason, fallback, local_only, cost_usd FROM ai.model_calls ORDER BY id DESC LIMIT 20"
-```
-
-Expected for a correctly configured Gemini: one row per check with `provider=gemini`,
-`model=gemini-3.5-flash-lite`, `outcome=ok`, `fallback=false`, and **no** `ollama` row after
-it. For trading explanations, queue one with `POST /api/trading/backtests/{id}/explain` and
-look for agent `trading-research` rows.
-
-### Switching an existing deployment (admin, Settings; no restart, no secret touched)
-
-`PUT /api/v1/settings/{key}` with `{"value": ...}` (or the Settings page), only for keys that
-are saved with old values:
-
-| Key | Value |
-| --- | --- |
-| `AI_DEFAULT_EXTERNAL_PROVIDER` | `gemini` |
-| `GEMINI_DEFAULT_MODEL` | `gemini-3.5-flash-lite` |
-| `GEMINI_ALLOWED_MODELS` | add `gemini-3.5-flash-lite` to the existing list |
-| `AGENT_NEWS_PROVIDER`, `AGENT_VOICE_PROVIDER`, `AGENT_RESEARCH_PROVIDER` | `gemini` |
-
-`GEMINI_API_KEY`, `GEMINI_ENABLED`, the daily limits and `AI_RESEARCH_EXTERNAL_ALLOWED` are left
-as they are. `POST /api/v1/settings/GEMINI_API_KEY/test` checks that the key sees the model
-and that it is priced, without spending tokens.
-
-## Manual setup (on the server, after merge)
-
-1. Create keys: an Anthropic Console API key and/or a Google AI Studio API key. Use
-   **API keys**, not a Claude.ai or Claude Code subscription login.
-2. In Spasta `/settings` (re-enter your password for each secret):
-   - **Anthropic:** `ANTHROPIC_API_KEY`, `ANTHROPIC_DEFAULT_MODEL` (pick from **Test**,
-     which lists the models your key can use), `ANTHROPIC_MODEL_PRICES` with that model's
-     current price per million tokens, and `ANTHROPIC_DAILY_LIMIT_USD`. Then **Test**, then
-     `ANTHROPIC_ENABLED=true`.
-   - **Gemini:** the same with the `GEMINI_` keys.
-   - **AI:** optionally `AI_EXTERNAL_DAILY_LIMIT_USD` and `AI_DEFAULT_EXTERNAL_PROVIDER`.
-3. No restart is needed: the API rebuilds the changed client on the settings event. Existing
-   production keys in `.env` and `core.app_settings` are untouched by this change.
-
-## Deploy and rollback
-
-- **Deploy.** Merging to `main` deploys automatically ([deploy-automation.md](deploy-automation.md)):
-  build (installs `anthropic` and `google-genai`), then `migrate` (0022 → 0023, a constraint
-  swap), then `up -d`, then the readiness gate. A failed deploy rolls back the image and the
-  SHA by itself. Do not merge until the PR is approved.
-- **Manual roll back** (on the server, as `svskhd8`, from the repo directory):
-
-```bash
-# 1. Turn the providers off without a deploy (instant, no data change):
-#    /settings -> Anthropic / Gemini -> ENABLED=false   (or delete the rows to revert to .env)
-# 2. Code rollback to the previous image (kept by scripts/deploy.sh):
-docker tag aureon-agentic:rollback aureon-agentic:dev && docker compose up -d
-# 3. Schema rollback (only if required; 0023 is a constraint swap and the old code runs on it):
-docker compose run --rm migrate alembic downgrade 0022
-```
-
-The 0023 downgrade re-adds the narrow check as `NOT VALID`. Conversations already stored with
-`anthropic` or `gemini` are kept as they are; nothing is rewritten or deleted.
-
-## Decisions
-
-- **D-26-1:** use the official SDKs. The project rule and the brief ask for them. Anthropic
-  2.x runs on `httpx2` (tests use `httpx2.MockTransport`); google-genai runs on `httpx` (tests
-  use `MockTransport`/respx). OpenRouter keeps its tested httpx client.
-- **D-26-2:** never build prices in. No price = `no_pricing` = local. A cap the system cannot
-  compute is not a cap.
-- **D-26-3:** reserve the worst case for priced providers. That stops concurrent calls from
-  jointly passing the cap. OpenRouter cannot be estimated (no price table), so its
-  documented overshoot rule stays.
-- **D-26-4:** no external-to-external failover. Each provider is a separate data recipient
-  the user opted into; local is the only automatic fallback.
-- **D-26-5:** no Anthropic server-side refusal fallbacks (see the Anthropic specifics above).
-- **D-26-6:** the research worker stays OpenRouter-only. Its explanations are trading text,
-  external only with `AI_RESEARCH_EXTERNAL_ALLOWED`; widening that to new recipients needs a
-  separate decision.
-- **Found and fixed along the way:** `ModelRouter` re-parsed the OpenRouter client's
-  already-parsed usage and lost `cost_usd`, so agent calls through OpenRouter were never
-  charged against `OPENROUTER_DAILY_LIMIT_USD`. A regression test pins the fix.
+- Research explanations (`/api/trading/*/explain`) use Claude (investments budget).
+- Voice navigation's fallback uses `AI_MODEL_ROUTER`; the grammar still answers first.
+- Coding agent and self-repair have no model (Ollama-only before): code tasks fail with that
+  reason, repairs stay queued. Git ops are unaffected.
+- `/api/health/ready` no longer checks Ollama; the integrations card has a `claude` section.
+- The `refresh-model-inventory` job is paused on startup. Old tables (`ai.model_calls`,
+  `ai.model_inventory`) are kept as history.
+- Removed routes: `/api/chat`, `/api/models*`, `/api/conversations*`, `/api/v1/ai/usage`,
+  `/api/v1/ai/route-check`. ASTRA-FRONTEND needs a follow-up to use `/api/ai/*`.

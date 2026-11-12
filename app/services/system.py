@@ -25,7 +25,6 @@ from redis.asyncio import Redis
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from app.agents.ollama.client import OllamaClient
 from app.agents.registry import IMAGING, effective_state
 from app.core.config import Settings
 from app.models.agents import Agent
@@ -112,10 +111,9 @@ class SystemStatus:
         maker: async_sessionmaker[AsyncSession],
         redis: Redis,
         http: httpx.AsyncClient,
-        ollama: OllamaClient,
     ) -> None:
         self.settings, self.engine, self.maker = settings, engine, maker
-        self.redis, self.http, self.ollama = redis, http, ollama
+        self.redis, self.http = redis, http
 
     async def _postgres(self) -> Section:
         async with self.engine.connect() as conn:
@@ -134,14 +132,6 @@ class SystemStatus:
     async def _redis(self) -> Section:
         info = await self.redis.info("memory")
         return {"used_memory_bytes": int(info.get("used_memory", 0))}
-
-    async def _ollama(self) -> Section:
-        running = await self.ollama.running()
-        installed = await self.ollama.list_models()
-        return {
-            "installed_models": len(installed),
-            "loaded_models": [m.get("name") for m in running],
-        }
 
     async def _imaging(self) -> Section:
         async with self.maker() as db:
@@ -194,12 +184,11 @@ class SystemStatus:
 
     async def collect(self) -> dict[str, Any]:
         t = self.settings.HEALTH_CHECK_TIMEOUT
-        names = ["host", "postgres", "redis", "ollama", "imaging", "docker", "host_services"]
+        names = ["host", "postgres", "redis", "imaging", "docker", "host_services"]
         results = await asyncio.gather(
             _guard(lambda: asyncio.to_thread(host_resources, self.settings), t + 1),
             _guard(self._postgres, t),
             _guard(self._redis, t),
-            _guard(self._ollama, t),
             _guard(self._imaging, t),
             _guard(self._docker, t),
             _guard(lambda: asyncio.to_thread(host_services, self.settings), t),

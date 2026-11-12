@@ -1,3 +1,6 @@
+> **Superseded (2026-11-12):** the AI stack is Claude-only. Ollama, OpenRouter, Gemini and the
+> provider routing described here are removed. See [26-ai-providers.md](26-ai-providers.md).
+
 # 03 — Ollama integration
 
 **Status:** done (revision `0003`). It talks only to the existing Ollama container over the private
