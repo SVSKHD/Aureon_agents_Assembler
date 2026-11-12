@@ -103,7 +103,7 @@ class ChatIn(BaseModel):
     attachments: list[uuid.UUID] = Field(default_factory=list, max_length=20)
 
 
-class AttachmentOut(BaseModel):
+class ChatAttachmentOut(BaseModel):
     id: uuid.UUID
     name: str
     kind: Literal["image", "pdf", "table"]
@@ -115,7 +115,7 @@ class AttachmentOut(BaseModel):
 
 @router.post(
     "/attachments",
-    response_model=AttachmentOut,
+    response_model=ChatAttachmentOut,
     status_code=status.HTTP_201_CREATED,
     responses={409: {}, 413: {}, 415: {}, 422: {}, 503: {}},
 )
@@ -123,7 +123,7 @@ async def upload_attachment(
     current: CsrfProtected,
     settings: SettingsDep,
     file: Annotated[UploadFile, File()],
-) -> AttachmentOut:
+) -> ChatAttachmentOut:
     """Attach a photo (PNG, JPEG, WebP, GIF, 5 MB), a PDF or a spreadsheet (.xlsx, CSV,
     TSV) to the next chat message: send the returned id in `attachments`. The type is read
     from the file's bytes. A spreadsheet is converted to a text table here; images and PDFs
@@ -139,7 +139,7 @@ async def upload_attachment(
     except files.AttachmentError as exc:
         raise HTTPException(exc.status, {"code": exc.code, "message": exc.message}) from exc
     log.info("ai_attachment_saved", kind=att.kind, size=att.size)
-    return AttachmentOut(
+    return ChatAttachmentOut(
         id=att.id, name=att.name, kind=att.kind, media_type=att.media_type, size=att.size,
         pages=att.pages, rows=att.rows,
     )  # fmt: skip
