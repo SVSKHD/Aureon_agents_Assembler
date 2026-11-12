@@ -124,12 +124,13 @@ The routes are under `/api/v1/` like the rest of Aureon's admin API.
 
 | Method | Path | What |
 |---|---|---|
-| GET | `/api/v1/settings` | Every key: `category`, `is_secret`, `requires_reauth`, `is_set`, `masked`, `source` (`db`/`env`/`default`/`unset`), `updated_at`, `version`. `managed`. `DHAN_ACCESS_TOKEN` also gets `expires_at` (from the JWT `exp`) and `expires_soon` (inside `DHAN_TOKEN_WARN_HOURS`); `DHAN_SESSION_TOKEN` gets them from the login's expiry. Also returns the last test per group and `encryption_ready`. **Never a value.** |
+| GET | `/api/v1/settings` | Every key: `category`, `is_secret`, `requires_reauth`, `is_set`, `masked`, `value`, `source` (`db`/`env`/`default`/`unset`), `updated_at`, `version`, `managed`. `value` is the full value of a **non-secret** (models, budgets, limits, crons, URLs) and always `null` for a secret. A DB row the server cannot decrypt is not reported as `db`. `DHAN_ACCESS_TOKEN` also gets `expires_at` (from the JWT `exp`) and `expires_soon` (inside `DHAN_TOKEN_WARN_HOURS`); `DHAN_SESSION_TOKEN` gets them from the login's expiry. Also returns the last test per group and `encryption_ready`. |
 | PUT | `/api/v1/settings/{key}` | `{"value": "...", "password": "..."}` sets or replaces the DB value. `password` is required for re-auth keys. |
 | DELETE | `/api/v1/settings/{key}` | `{"password": "..."}` (re-auth keys only) reverts to `.env`. |
 | POST | `/api/v1/settings/{key}/test` | Tests the key's group with the values in effect now. See the table below. |
-| GET | `/api/v1/settings/diagnostics` | Every key at each layer, as masks: `.env` (or the default), the DB row (decrypted), what a reload would give now, and what this process is running with. Flags `db_undecryptable` (row written under another `SETTINGS_MASTER_KEY`), `db_rejected` (the value fails validation), `db_ignored` (another row failed, so every DB value is ignored), `stale` (the process runs an older value) and `shadows_env`. Also: rows for keys no longer in the registry, the master key count, the server host/pid, and the Claude gateway's key mask and whether it matches the live settings. |
+| GET | `/api/v1/settings/diagnostics` | Every key at each layer: `.env` (or the default), the DB row (decrypted), what a reload would give now, and what this API process runs with. Full values for non-secrets (`*_value`), masks for everything (`*_masked`). Flags `db_undecryptable` (row written under another `SETTINGS_MASTER_KEY`), `db_rejected` (the value fails validation), `db_ignored` (another row failed, so every DB value is ignored), `stale` (this process runs an older value) and `shadows_env`. Also: `processes` (the API and every worker: when it loaded its settings, the key prefixes it reloads on, and the keys it still runs an older value of), `redis` (reachable, and how many processes listen for changes), the last connection test per group, rows for retired keys, the master key count, the server host/pid/start time, and the Claude gateway's key mask and whether it matches the live settings. `Cache-Control: no-store`. |
 | POST | `/api/v1/settings/reload` | Re-reads `.env` + the DB now, rebuilds the clients whose keys changed (the Claude gateway included) and tells the workers. Audited as `settings_reloaded`. |
+| POST | `/api/v1/settings/{key}/reveal` | `{"password": "..."}` (re-auth keys only) returns the **full** value at every layer: `env`, `db` (`null` with `db_present` true when it cannot be decrypted), `expected`, `live`. Same password lock-out as writes; 10 reveals per admin per 10 minutes; audited as `settings_revealed` (key name only); `Cache-Control: no-store`. The UI shows the value for 60 seconds, in memory only. |
 
 What each group's test does:
 
@@ -148,7 +149,7 @@ Guards:
 - **Who can call it.** `require_admin` (session plus admin role) and CSRF (`x-csrf-token`) on every write.
 - **Re-auth.** A re-auth key needs the account password (argon2 verify) on every set and revert. Five wrong passwords per session lock the endpoint for 15 minutes (`429 too_many_reauth_failures`), and each failure is audited (`settings_reauth_failed`).
 - **Rate limits.** Per admin: 20 writes and 20 tests per 10 minutes. If Redis is down they fail closed with `503`.
-- **Audit.** These events are recorded: `settings_updated`, `settings_reverted`, `settings_tested`, `settings_reloaded` and `settings_reauth_failed`. Their details hold the key, category, `is_secret`, version and outcome, never a value.
+- **Audit.** These events are recorded: `settings_updated`, `settings_reverted`, `settings_tested`, `settings_reloaded`, `settings_revealed` and `settings_reauth_failed`. Their details hold the key, category, `is_secret`, version and outcome, never a value.
 - **Validation.** Each kind is normalized first:
   - bools must be true or false
   - numbers must be at least 0
@@ -160,11 +161,12 @@ Guards:
 
 ## Keeping values secret
 
-- **API responses.** They show masks only: `••••` plus the last four characters, and only the bullets for secrets shorter than 16 characters. Tests return outcome lines.
+- **API responses.** Secrets show as masks: `••••` plus the last four characters, and only the bullets for secrets shorter than 16 characters. A secret's full value is returned only by `/{key}/reveal`, after the password. Non-secret values are returned in full. Tests return outcome lines.
+- **Process reports.** Each process (the API, each worker) writes what it loaded to Redis (`settings:applied:{process}@{host}`, 7 days) as HMAC-SHA256 digests under `SECRET_KEY`, never the values, so diagnostics can tell which process runs an older value.
 - **Logs, incidents and AI prompts.** Each process registers the exact secret values it holds with the log scrubber (`app/core/logging.py`, `register_secret_values`). This covers every registry secret plus `SECRET_KEY`, the DB URLs and the master key. Every structlog event and every captured incident passes through `scrub()`, and so does the incident brief that self-repair sends to a model. A token is removed even when its shape isn't recognisable. Discord webhook URLs are also redacted by pattern.
 - **Discord.** Notices never include settings.
 - **Subprocesses.** `SETTINGS_`, `OPENROUTER_` and `DISCORD_` were added to the Claude CLI's `DENIED_ENV_PREFIXES`. The coding sandbox already passes only `PATH`/`LANG`/`LC_ALL`/`TZ`.
-- **Browser.** The Settings module keeps a typed value only in the input until it is sent, then clears it. Nothing is written to `localStorage`/`sessionStorage`, and there are no `VITE_` variables.
+- **Browser.** The Settings module keeps a typed value only in the input until it is sent, then clears it, and a revealed secret only in memory for 60 seconds. Nothing is written to `localStorage`/`sessionStorage`, and there are no `VITE_` variables.
 
 ## Tests
 

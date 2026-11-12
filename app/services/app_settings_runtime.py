@@ -69,7 +69,17 @@ def apply(app: FastAPI, new: Settings) -> list[str]:
 async def reload(app: FastAPI) -> list[str]:
     """Re-read core.app_settings over the .env settings and apply the result."""
     new = await app_settings.effective(app.state.sessionmaker, app.state.env_settings)
-    return apply(app, new)
+    changed = apply(app, new)
+    await report(app)
+    return changed
+
+
+async def report(app: FastAPI) -> None:
+    """Record what this API process now runs with, for settings diagnostics."""
+    from datetime import UTC, datetime
+
+    app.state.settings_applied_at = datetime.now(UTC)
+    await app_settings.report_applied(app.state.redis, app.state.settings, "api", ("",))
 
 
 def start_listener(app: FastAPI, stop: asyncio.Event) -> asyncio.Task[None]:
