@@ -89,7 +89,8 @@ def test_invalid_db_value_is_named_and_ignored(env: Settings) -> None:
     assert "db_rejected" in _key(d, "AI_MAX_STEPS").issues
     # One bad row drops every DB value: the key row is ignored too.
     assert "db_ignored" in _key(d, "ANTHROPIC_API_KEY").issues
-    assert "not-a-number" not in _all_text(d)
+    # Not a secret: shown in full, so the bad value can be read and fixed.
+    assert _key(d, "AI_MAX_STEPS").db_value == "not-a-number"
 
 
 def test_env_shadowed_and_unknown_rows(env: Settings) -> None:
@@ -101,3 +102,47 @@ def test_env_shadowed_and_unknown_rows(env: Settings) -> None:
     assert "shadows_env" in k.issues and k.env_masked == "••••AAAA"
     assert d.unknown_rows == ("GEMINI_API_KEY",) and d.rows == 2
     assert "old-key-value" not in _all_text(d)
+
+
+def test_non_secret_values_in_full_secrets_never(env: Settings) -> None:
+    rows = [_row(env, "AI_MODEL_MAIN", "claude-sonnet-5-5"), _row(env, "ANTHROPIC_API_KEY", KEY_A)]
+    live = svc.overlay(env, {"AI_MODEL_MAIN": "claude-sonnet-5-5", "ANTHROPIC_API_KEY": KEY_A})
+    d = svc.diagnose(env, live, rows)
+    model = _key(d, "AI_MODEL_MAIN")
+    assert (model.env_value, model.db_value) == ("claude-opus-5-5", "claude-sonnet-5-5")
+    assert model.expected_value == model.live_value == "claude-sonnet-5-5"
+    key = _key(d, "ANTHROPIC_API_KEY")
+    assert (key.env_value, key.db_value, key.expected_value, key.live_value) == (None,) * 4
+    assert KEY_A not in _all_text(d)
+
+
+def test_layer_values_are_full_for_the_reveal(env: Settings) -> None:
+    rows = [_row(env, "ANTHROPIC_API_KEY", KEY_B)]
+    live = svc.overlay(env, {"ANTHROPIC_API_KEY": KEY_A})
+    v = svc.layer_values(env, live, rows, "ANTHROPIC_API_KEY")
+    assert (v.env, v.db, v.db_present, v.expected, v.live) == (None, KEY_B, True, KEY_B, KEY_A)
+
+
+def test_processes_report_what_they_loaded(env: Settings) -> None:
+    rows = [_row(env, "ANTHROPIC_API_KEY", KEY_B)]
+    now = svc.overlay(env, {"ANTHROPIC_API_KEY": KEY_B})
+    old = svc.overlay(env, {"ANTHROPIC_API_KEY": KEY_A})
+    research = svc.applied_snapshot(old, "research", ("ANTHROPIC_", "AI_"))
+    dhan = svc.applied_snapshot(old, "dhan_feed", ("DHAN_",))
+    api = svc.applied_snapshot(now, "api", ("",))
+    d = svc.diagnose(env, now, rows, [research, dhan, api])
+    by = {p.process: p for p in d.processes}
+    assert by["research"].stale == ("ANTHROPIC_API_KEY",)
+    # The feed holds the old key too, but never uses it live: noted, not a problem.
+    assert by["dhan_feed"].stale == () and by["dhan_feed"].unwatched_stale == ("ANTHROPIC_API_KEY",)
+    assert by["api"].stale == () and by["api"].unwatched_stale == ()
+    # Reports carry keyed digests, never values.
+    assert KEY_A not in repr([research, dhan, api]) and KEY_B not in repr([research, dhan, api])
+
+
+def test_digest_is_keyed_and_stable(env: Settings) -> None:
+    a = svc.digest(env, "ANTHROPIC_API_KEY", KEY_A)
+    assert a == svc.digest(env, "ANTHROPIC_API_KEY", KEY_A) and a != svc.digest(env, "X", KEY_A)
+    other = env.model_copy(update={"SECRET_KEY": SecretStr("another-secret-key-" * 3)})
+    assert a != svc.digest(other, "ANTHROPIC_API_KEY", KEY_A)
+    assert svc.digest(env, "ANTHROPIC_API_KEY", None) is None

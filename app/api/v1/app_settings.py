@@ -1,7 +1,9 @@
 """Runtime settings and secrets: /api/v1/settings (admin only; docs/settings.md).
 
-No endpoint returns a value. GET lists masks and where each value comes from; PUT sets a DB
-value over .env; DELETE drops it so .env applies again; POST …/test tries the credential.
+GET lists every key with where its value comes from: the full value for a non-secret, a mask
+for a secret (POST …/reveal shows one secret after the admin's password, audited, never
+cached). PUT sets a DB value over .env; DELETE drops it so .env applies again; POST …/test
+tries the credential; GET /diagnostics compares every layer and every process.
 Writing a secret (or a URL a credential is sent to) needs the admin's password in the body.
 Every write and test is audited by key name, rate limited per admin, and fails closed.
 """
@@ -12,13 +14,14 @@ import asyncio
 import os
 import socket
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 import structlog
 from cryptography.fernet import InvalidToken
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
+from redis.asyncio import Redis
 from sqlalchemy import select
 
 from app.agents.trading.ratelimit import BrokerRateLimiter, RateLimitExceeded, Window
@@ -37,6 +40,7 @@ router = APIRouter(prefix="/v1/settings", tags=["settings"])
 
 WRITES_PER_10_MIN = 20
 TESTS_PER_10_MIN = 20
+REVEALS_PER_10_MIN = 10
 MAX_REAUTH_FAILURES = 5
 REAUTH_FAIL_WINDOW = 900
 TEST_RESULT_TTL = 7 * 24 * 3600
@@ -54,6 +58,7 @@ class SettingOut(BaseModel):
     managed: bool = False
     is_set: bool
     masked: str | None
+    value: str | None = None  # the full value; None for a secret (see /{key}/reveal)
     source: Source
     updated_at: datetime | None = None
     version: int | None = None
@@ -103,7 +108,7 @@ def _spec(key: str, write: bool = False) -> svc.Spec:
 
 
 def _limiter(request: Request, admin: AdminRequired, bucket: str) -> BrokerRateLimiter:
-    limit = WRITES_PER_10_MIN if bucket == "write" else TESTS_PER_10_MIN
+    limit = {"write": WRITES_PER_10_MIN, "reveal": REVEALS_PER_10_MIN}.get(bucket, TESTS_PER_10_MIN)
     return BrokerRateLimiter(
         request.app.state.redis,
         f"rl:settings:{admin.user.id}",
@@ -130,6 +135,10 @@ async def write_limited(request: Request, admin: AdminRequired) -> None:
 
 async def test_limited(request: Request, admin: AdminRequired) -> None:
     await _rate_limit(_limiter(request, admin, "test"), "test")
+
+
+async def reveal_limited(request: Request, admin: AdminRequired) -> None:
+    await _rate_limit(_limiter(request, admin, "reveal"), "reveal")
 
 
 async def _reauth(
@@ -219,6 +228,7 @@ def _describe(spec: svc.Spec, row: AppSetting | None, live: Settings, env: Setti
         managed=spec.managed,
         is_set=value is not None,
         masked=svc.mask(value, spec.secret),
+        value=svc.plain(spec, value),
         source=_source(spec.key, row, env),
         updated_at=row.updated_at if row is not None else None,
         version=row.version if row is not None else None,
@@ -259,20 +269,30 @@ async def list_settings(request: Request, _: AdminRequired, db: DbSession) -> Se
 # --- diagnostics --------------------------------------------------------------------------
 
 
+IssueCode = Literal["db_undecryptable", "db_rejected", "db_ignored", "stale", "shadows_env"]
+
+
 class KeyDiagnosisOut(BaseModel):
     key: str
     category: str
     is_secret: bool
+    kind: str
+    requires_reauth: bool
+    # Each layer: a mask, and the full value when the key is not a secret.
     env_masked: str | None
+    env_value: str | None
     env_source: Literal["env", "default", "unset"]
     db_present: bool
     db_masked: str | None
+    db_value: str | None
     db_version: int | None
     db_updated_at: datetime | None
     expected_masked: str | None
+    expected_value: str | None
     expected_source: Source
     live_masked: str | None
-    issues: list[Literal["db_undecryptable", "db_rejected", "db_ignored", "stale", "shadows_env"]]
+    live_value: str | None
+    issues: list[IssueCode]
 
 
 class AiRuntimeOut(BaseModel):
@@ -287,6 +307,26 @@ class ServerOut(BaseModel):
     host: str
     pid: int
     environment: str
+    started_at: datetime
+    settings_applied_at: datetime | None
+
+
+class ProcessOut(BaseModel):
+    process: str
+    host: str
+    pid: int
+    started_at: datetime | None
+    applied_at: datetime | None
+    watches: list[str]
+    stale: list[str]
+    unwatched_stale: list[str]
+    this: bool  # the API process that answered
+
+
+class RedisOut(BaseModel):
+    ok: bool
+    error: str | None
+    listeners: int | None  # processes subscribed to settings changes
 
 
 class DiagnosticsOut(BaseModel):
@@ -304,7 +344,10 @@ class DiagnosticsOut(BaseModel):
     overlay_ok: bool
     overlay_fields: list[str]
     stale: list[str]
+    redis: RedisOut
+    processes: list[ProcessOut]
     ai: AiRuntimeOut
+    tests: dict[str, TestResultOut]
     keys: list[KeyDiagnosisOut]
 
 
@@ -320,10 +363,30 @@ def _ai_runtime(state: object, live: Settings) -> AiRuntimeOut:
     )
 
 
+async def _redis_state(redis: Redis) -> tuple[RedisOut, list[dict[str, Any]]]:
+    try:
+        async with asyncio.timeout(5):
+            applied = await svc.read_applied(redis)
+            subs = await redis.pubsub_numsub(svc.CHANNEL)
+        listeners = int(subs[0][1]) if subs else 0
+        return RedisOut(ok=True, error=None, listeners=listeners), applied
+    except Exception as exc:
+        return RedisOut(ok=False, error=type(exc).__name__, listeners=None), []
+
+
+def _when(value: object) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value)) if value else None
+    except ValueError:
+        return None
+
+
 @router.get("/diagnostics", response_model=DiagnosticsOut)
-async def diagnostics(request: Request, _: AdminRequired) -> DiagnosticsOut:
-    """Where every value comes from, layer by layer (.env, the encrypted DB row, what a reload
-    would give, what this process runs with) and where they disagree. Masks only."""
+async def diagnostics(request: Request, response: Response, _: AdminRequired) -> DiagnosticsOut:
+    """Every setting at each layer (.env, the encrypted DB row, what a reload would give,
+    what this process runs with), what every process loaded, and where they disagree.
+    Non-secret values in full; secrets as masks (use /{key}/reveal for one)."""
+    response.headers["Cache-Control"] = "no-store"
     state = request.app.state
     live: Settings = state.settings
     env: Settings = state.env_settings
@@ -334,11 +397,17 @@ async def diagnostics(request: Request, _: AdminRequired) -> DiagnosticsOut:
             rows = list((await db.scalars(select(AppSetting))).all())
     except Exception as exc:  # the report still shows .env and the live process
         db_error = type(exc).__name__
-    d = svc.diagnose(env, live, rows)
+    redis_out, applied = await _redis_state(state.redis)
+    d = svc.diagnose(env, live, rows, applied)
+    host, pid = socket.gethostname(), os.getpid()
     return DiagnosticsOut(
         checked_at=datetime.now(UTC),
         server=ServerOut(
-            host=socket.gethostname(), pid=os.getpid(), environment=live.DEVOPS_ENVIRONMENT
+            host=host,
+            pid=pid,
+            environment=live.DEVOPS_ENVIRONMENT,
+            started_at=svc.PROCESS_STARTED_AT,
+            settings_applied_at=getattr(state, "settings_applied_at", None),
         ),
         encryption_ready=d.encryption_ready,
         encryption_problem=d.encryption_problem,
@@ -352,25 +421,91 @@ async def diagnostics(request: Request, _: AdminRequired) -> DiagnosticsOut:
         overlay_ok=d.overlay_ok,
         overlay_fields=list(d.overlay_fields),
         stale=list(d.stale),
+        redis=redis_out,
+        processes=[
+            ProcessOut(
+                process=p.process,
+                host=p.host,
+                pid=p.pid,
+                started_at=_when(p.started_at),
+                applied_at=_when(p.applied_at),
+                watches=list(p.watches),
+                stale=list(p.stale),
+                unwatched_stale=list(p.unwatched_stale),
+                this=p.process == "api" and p.host == host and p.pid == pid,
+            )
+            for p in d.processes
+        ],
         ai=_ai_runtime(state, live),
+        tests=await _test_results(request),
         keys=[
             KeyDiagnosisOut(
                 key=k.key,
                 category=k.category,
                 is_secret=k.is_secret,
+                kind=svc.REGISTRY[k.key].kind,
+                requires_reauth=svc.REGISTRY[k.key].reauth,
                 env_masked=k.env_masked,
+                env_value=k.env_value,
                 env_source=k.env_source,
                 db_present=k.db_present,
                 db_masked=k.db_masked,
+                db_value=k.db_value,
                 db_version=k.db_version,
                 db_updated_at=k.db_updated_at,
                 expected_masked=k.expected_masked,
+                expected_value=k.expected_value,
                 expected_source=k.expected_source,
                 live_masked=k.live_masked,
+                live_value=k.live_value,
                 issues=list(k.issues),
             )
             for k in d.keys
         ],
+    )
+
+
+class RevealIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    password: str | None = Field(default=None, max_length=1024)
+
+
+class RevealOut(BaseModel):
+    key: str
+    env: str | None
+    db: str | None
+    db_present: bool  # a row exists; db is None when it cannot be decrypted
+    expected: str | None
+    live: str | None
+
+
+@router.post("/{key}/reveal", response_model=RevealOut, dependencies=[Depends(reveal_limited)])
+async def reveal_setting(
+    key: str,
+    body: RevealIn,
+    request: Request,
+    response: Response,
+    admin: AdminRequired,
+    db: DbSession,
+) -> RevealOut:
+    """The full value at every layer. A secret needs the admin's password (failures count
+    towards the lock-out); every reveal is audited by key name and never cached."""
+    response.headers["Cache-Control"] = "no-store"
+    spec = _spec(key)
+    await _reauth(request, db, admin, spec, body.password)
+    state = request.app.state
+    rows = list((await db.scalars(select(AppSetting))).all())
+    v = svc.layer_values(state.env_settings, state.settings, rows, key)
+    audit.record(
+        db,
+        "settings_revealed",
+        ClientInfo.from_request(request),
+        actor_user_id=admin.user.id,
+        details={"key": key, "category": spec.category, "is_secret": spec.secret},
+    )
+    await db.commit()
+    return RevealOut(
+        key=key, env=v.env, db=v.db, db_present=v.db_present, expected=v.expected, live=v.live
     )
 
 
