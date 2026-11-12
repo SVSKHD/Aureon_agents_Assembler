@@ -74,12 +74,22 @@ async def reload(app: FastAPI) -> list[str]:
     return changed
 
 
-async def report(app: FastAPI) -> None:
-    """Record what this API process now runs with, for settings diagnostics."""
+async def report(app: FastAPI, *, loaded: bool = True) -> None:
+    """Record what this API process now runs with, for settings diagnostics. `loaded=False`
+    is the periodic re-report: same values, same load time."""
     from datetime import UTC, datetime
 
-    app.state.settings_applied_at = datetime.now(UTC)
-    await app_settings.report_applied(app.state.redis, app.state.settings, "api", ("",))
+    if loaded or getattr(app.state, "settings_applied_at", None) is None:
+        app.state.settings_applied_at = datetime.now(UTC)
+    await app_settings.report_applied(
+        app.state.redis, app.state.settings, "api", ("",), app.state.settings_applied_at
+    )
+
+
+async def keep_reporting(app: FastAPI) -> None:
+    """Report now, then every few minutes for as long as this process runs."""
+    await report(app)
+    await app_settings.keep_reporting(lambda: report(app, loaded=False))
 
 
 def start_listener(app: FastAPI, stop: asyncio.Event) -> asyncio.Task[None]:
