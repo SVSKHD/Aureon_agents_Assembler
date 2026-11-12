@@ -161,6 +161,25 @@ REGISTRY: dict[str, Spec] = {
             managed=True,
         ),
         _s("DHAN_SESSION_ALERT_MINUTES", "dhan", "int", "Alert this many minutes before expiry"),
+        _s("DHAN_PIN", "dhan", "secret", "Dhan PIN, for automatic login (with the TOTP secret)"),
+        _s(
+            "DHAN_TOTP_SECRET",
+            "dhan",
+            "secret",
+            "Dhan TOTP secret (base32 key from the authenticator setup), for automatic login",
+        ),
+        _s(
+            "DHAN_AUTO_LOGIN_CRON",
+            "dhan",
+            "str",
+            "How often to check the Dhan session and log in again when needed (blank = off)",
+        ),
+        _s(
+            "DHAN_AUTO_LOGIN_BEFORE_MINUTES",
+            "dhan",
+            "int",
+            "Log in again this many minutes before the session expires",
+        ),
         _s(
             "DHAN_ACCESS_TOKEN",
             "dhan",

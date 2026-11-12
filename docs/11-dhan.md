@@ -91,6 +91,49 @@ Every step is audited without values: `dhan_login_started`, `dhan_login_complete
 expiry), `dhan_login_failed` (with an error code) and `dhan_logout`. A Dhan response body is
 never returned or logged.
 
+## Automatic login
+
+Dhan tokens last 24 hours. To avoid logging in every day, the scheduler can log in itself
+with your Dhan PIN and the TOTP secret from your authenticator setup
+(`app/services/dhan_auto_login.py`).
+
+**Set up:**
+
+1. On Dhan, turn on TOTP and add it to an authenticator. Keep the base32 key it shows.
+2. On /settings → Dhan, set `DHAN_PIN` and `DHAN_TOTP_SECRET`. Both are encrypted
+   secrets: masked everywhere, revealed only with your password, scrubbed from logs.
+3. The scheduler restarts on the change and adds the `dhan-auto-login` job.
+
+**How it runs:** every `DHAN_AUTO_LOGIN_CRON` (default every 10 minutes) the job checks the
+session. It logs in only when no session token is active, or the active one expires within
+`DHAN_AUTO_LOGIN_BEFORE_MINUTES` (default 120). In practice that is about once a day. A login
+calls `POST {DHAN_AUTH_URL}/app/generateAccessToken?dhanClientId=…&pin=…&totp=…`, then goes
+through the same checks as "Log in to Dhan":
+
+- the Profile API must confirm the token belongs to `DHAN_CLIENT_ID`; otherwise the token is
+  not stored;
+- the token is stored encrypted as `DHAN_SESSION_TOKEN` / `DHAN_SESSION_EXPIRES_AT`;
+- the event is audited as `dhan_auto_login_completed` or `dhan_auto_login_failed`;
+- every process (API, feed, scheduler, research) picks the new token up.
+
+**Safety:**
+
+- **A refusal is never retried.** If Dhan refuses the PIN + TOTP, the job remembers that
+  pair (as an HMAC) and stops until the PIN or the secret changes, so it cannot lock your
+  Dhan account. The job shows as failed in the scheduler, and the `auth` incident says so.
+- **A logout sticks.** Logging out of Dhan pauses automatic login until someone logs in to
+  Dhan again. That login also clears a remembered refusal.
+- There is one login at a time, and never two within an hour.
+- The PIN, the secret, the code and the token are never logged, returned or audited.
+  `GET /api/v1/dhan/auth/status` shows `auto_login_configured` and `auto_login_last`
+  (time, outcome, error code, expiry).
+- It obtains the same read-only data session as the manual login. Orders still need LIVE
+  mode (off) and Dhan's static IP whitelist.
+
+**The trade-off:** with the PIN and the TOTP secret on the server, anyone who gets the
+server *and* `SETTINGS_MASTER_KEY` can log in to your Dhan account. To turn it off, blank
+`DHAN_AUTO_LOGIN_CRON` or clear `DHAN_PIN`.
+
 ## Credentials and token expiry
 
 > Since the API key login, `DHAN_ACCESS_TOKEN` is only the **manual fallback**. The notes
@@ -247,6 +290,7 @@ Phase 5 scheduler, with retries, backoff and audit logs:
 | Job | Default cron (IST) | Does |
 | --- | --- | --- |
 | `dhan-refresh-instruments` | `11 8 * * 1-5` | Downloads the master into `dhan.instruments` and `trading.instruments`, links them, and deactivates Dhan instruments that have vanished. It refuses to act on an empty file. |
+| `dhan-auto-login` | `*/10 * * * *` | Logs in with PIN + TOTP when the session is missing or expires within `DHAN_AUTO_LOGIN_BEFORE_MINUTES` (see "Automatic login"). Only created when `DHAN_PIN` and `DHAN_TOTP_SECRET` are set. |
 | `dhan-reconcile` | `*/5 9-15 * * 1-5` | Checks the token (and warns), then for each active `broker_accounts` row with this client id: orders + events, trades → executions, positions + funds snapshots, profile |
 | `dhan-backfill-candles` | `41 16 * * 1-5` | `DHAN_BACKFILL_INSTRUMENTS` × `DHAN_BACKFILL_TIMEFRAMES` (`1d,15m`) over the last `DHAN_BACKFILL_DAYS`, upserted into `market_candles` with session tags. Only created when the list is non-empty. |
 

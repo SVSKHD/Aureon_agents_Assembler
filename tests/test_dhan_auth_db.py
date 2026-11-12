@@ -494,3 +494,58 @@ async def test_dhan_refusal_is_a_code_never_a_body(make_env: EnvFactory) -> None
         r = await env.send("admin", "POST", f"{URL}/start")
         assert r.status_code == 502 and r.json()["detail"]["code"] == "dhan_refused"
         assert API_SECRET not in r.text and "bad app credentials" not in r.text
+
+
+async def test_auto_login_with_pin_and_totp_stores_and_reports(make_env: EnvFactory) -> None:
+    """The scheduler's PIN + TOTP login end to end: stored encrypted like a manual login,
+    the connection marked, audited without values, shown on /status; logout pauses it."""
+    from app.services import dhan_auto_login
+
+    pin, secret = "246810", "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+    async with make_env() as env:
+        fake = FakeDhan()
+        sent: list[httpx.Request] = []
+
+        def auth(req: httpx.Request) -> httpx.Response:
+            if req.url.path == "/app/generateAccessToken":
+                sent.append(req)
+                return httpx.Response(
+                    200,
+                    json={"dhanClientId": CLIENT, "accessToken": ACCESS,
+                          "expiryTime": fake.expiry},
+                )  # fmt: skip
+            return fake(req)
+
+        s = env.app.state.settings.model_copy(
+            update={"DHAN_PIN": SecretStr(pin), "DHAN_TOTP_SECRET": SecretStr(secret)}
+        )
+        redis = env.app.state.redis
+        async with httpx.AsyncClient(transport=httpx.MockTransport(auth)) as http:
+            res = await dhan_auto_login.run(
+                env.maker, s, redis, http, transport=httpx.MockTransport(fake)
+            )
+        assert res.outcome == "logged_in", res
+        assert len(sent) == 1 and sent[0].url.params["pin"] == pin
+
+        rows = dict(await env.sql("SELECT key, value_encrypted FROM core.app_settings"))
+        assert svc.Cipher(MASTER).decrypt(rows["DHAN_SESSION_TOKEN"]) == ACCESS
+        conn_row = await env.sql("SELECT status, token_source FROM dhan.connections")
+        assert list(conn_row[0]) == ["connected", "session"]
+        events = await _audit(env)
+        assert "dhan_auto_login_completed" in events
+        for value in (ACCESS, pin, secret):
+            assert value not in events
+
+        st = await env.get("admin", f"{URL}/status")
+        body = st.json()
+        assert body["auto_login_last"]["outcome"] == "logged_in"
+        assert ACCESS not in st.text and pin not in st.text and secret not in st.text
+
+        # A logout sticks: the next run does not log back in.
+        await env.app.state.redis.delete(dhan_auto_login.LAST_KEY)  # past the 1 h gap
+        out = await env.send("admin", "DELETE", f"{URL}/session")
+        assert out.status_code == 200, out.text
+        expired = s.model_copy(update={"DHAN_SESSION_TOKEN": None})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(auth)) as http:
+            again = await dhan_auto_login.run(env.maker, expired, redis, http)
+        assert again.outcome == "paused" and len(sent) == 1
