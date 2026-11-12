@@ -51,9 +51,23 @@ async def test_migrations_upgrade_downgrade_leave_existing_tables(require_db: st
     assert "public.aureon_alembic_version" in after_up
     assert "public.trades" in after_up
 
-    await asyncio.to_thread(_alembic, "downgrade", "base", url=require_db)
-    assert "public.trades" in await _tables(require_db)
-    await asyncio.to_thread(_alembic, "upgrade", "head", url=require_db)
+    # Earlier tests leave rows in aureon.*, and migration 0027 refuses (rightly) to drop a
+    # schema holding data; empty them first, as a fresh install would be.
+    engine = create_async_engine(require_db)
+    async with engine.begin() as conn:
+        aureon_tables = (await conn.execute(text(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'aureon'"
+        ))).scalars().all()  # fmt: skip
+        if aureon_tables:
+            names = ", ".join(f"aureon.{t}" for t in aureon_tables)
+            await conn.execute(text(f"TRUNCATE {names} CASCADE"))
+    await engine.dispose()
+    try:
+        await asyncio.to_thread(_alembic, "downgrade", "base", url=require_db)
+        assert "public.trades" in await _tables(require_db)
+    finally:
+        # Always back to head: every later test in the run needs the full schema.
+        await asyncio.to_thread(_alembic, "upgrade", "head", url=require_db)
 
 
 @respx.mock
