@@ -66,9 +66,11 @@ Rules:
   last verification are reset. The fingerprint is never returned.
 - **Logout** keeps the row and every broker account. The status becomes `unverified` while
   a manual token is in use, and `disconnected` otherwise.
-- **Renewal is manual.** RenewToken only applies to Dhan-Web tokens and its response isn't
-  documented. The API-key flow needs the user's own login (consent + OTP). Aureon never
-  works around that.
+- **Renewal is manual unless automatic login is set up.** With `DHAN_PIN` and
+  `DHAN_TOTP_SECRET` set, the `dhan-auto-login` job logs in again before the session expires
+  (docs/11-dhan.md, "Automatic login"), and `renewal` reads `auto`. Without them, or after
+  Dhan refused the PIN + TOTP (never retried until they change), a person logs in.
+  RenewToken is not used: it only applies to Dhan-Web tokens.
 
 ### `dhan.connections` (migration 0024)
 

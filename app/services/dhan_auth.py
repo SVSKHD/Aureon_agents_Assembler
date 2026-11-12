@@ -17,7 +17,12 @@ No Dhan response body is ever returned or logged (it holds the token); errors ar
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import hmac
 import re
+import struct
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -128,6 +133,71 @@ async def generate_consent(settings: Settings, http: httpx.AsyncClient) -> str:
     return consent
 
 
+def totp(secret_b32: str, at: datetime | None = None, *, step: int = 30, digits: int = 6) -> str:
+    """RFC 6238 TOTP (HMAC-SHA1, 30 s, 6 digits): the code an authenticator app shows for
+    `secret_b32`. Standard library only; the secret never leaves this function."""
+    key = base64.b32decode(secret_b32 + "=" * (-len(secret_b32) % 8), casefold=True)
+    counter = int((at or datetime.now(UTC)).timestamp()) // step
+    mac = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = mac[-1] & 0x0F
+    code = (struct.unpack(">I", mac[offset : offset + 4])[0] & 0x7FFFFFFF) % 10**digits
+    return str(code).zfill(digits)
+
+
+def _session_from(data: dict[str, Any], cid: str) -> Session:
+    """accessToken + expiryTime + dhanClientId, checked; the same shape for every flow."""
+    token = data.get("accessToken")
+    if not isinstance(token, str) or len(token) < 20 or len(token) > 8192:
+        raise DhanAuthError(502, "dhan_bad_response", "Dhan did not return an access token")
+    got = str(data.get("dhanClientId") or "").strip()
+    if got != cid:
+        raise DhanAuthError(
+            403, "dhan_client_mismatch", "the Dhan login was for a different client id"
+        )
+    expires = parse_expiry(data.get("expiryTime"))
+    name = data.get("dhanClientName")
+    return Session(token, expires, got, name if isinstance(name, str) else None)
+
+
+async def generate_with_totp(
+    settings: Settings, http: httpx.AsyncClient, now: datetime | None = None
+) -> Session:
+    """Automatic login: POST {DHAN_AUTH_URL}/app/generateAccessToken with the client id, the
+    PIN and the current TOTP code (needs TOTP enabled on the Dhan account). A refusal is
+    `dhan_refused`; the caller must not retry the same PIN + secret after one."""
+    cid = (settings.DHAN_CLIENT_ID or "").strip()
+    pin = settings.DHAN_PIN.get_secret_value() if settings.DHAN_PIN else ""
+    secret = settings.DHAN_TOTP_SECRET.get_secret_value() if settings.DHAN_TOTP_SECRET else ""
+    if not (cid and pin and secret):
+        raise DhanAuthError(
+            409,
+            "dhan_auto_login_not_configured",
+            "set DHAN_CLIENT_ID, DHAN_PIN and DHAN_TOTP_SECRET on /settings first",
+        )
+    try:
+        code = totp(secret, now)
+    except (ValueError, binascii.Error) as exc:
+        raise DhanAuthError(
+            409, "dhan_totp_secret_invalid", "DHAN_TOTP_SECRET is not a base32 key"
+        ) from exc
+    try:
+        resp = await http.post(
+            f"{_base(settings)}/app/generateAccessToken",
+            params={"dhanClientId": cid, "pin": pin, "totp": code},
+            headers={"Accept": "application/json"},
+            timeout=settings.DHAN_HTTP_TIMEOUT,
+        )
+    except httpx.HTTPError as exc:
+        raise DhanAuthError(502, "dhan_unavailable", "could not reach Dhan") from exc
+    if resp.status_code != 200:
+        raise _refused(resp, "automatic login")
+    data = _json(resp)
+    if not data.get("accessToken"):
+        # Dhan answers some refusals (wrong PIN / TOTP) with 200 and an error body.
+        raise DhanAuthError(502, "dhan_refused", "Dhan refused the automatic login")
+    return _session_from(data, cid)
+
+
 def login_url(settings: Settings, consent_id: str) -> str:
     """Step 2: where the admin's browser goes to log in on Dhan."""
     return f"{_base(settings)}/login/consentApp-login?" + urlencode({"consentAppId": consent_id})
@@ -149,20 +219,9 @@ async def consume_consent(settings: Settings, http: httpx.AsyncClient, token_id:
         raise DhanAuthError(502, "dhan_unavailable", "could not reach Dhan") from exc
     if resp.status_code != 200:
         raise _refused(resp, "token exchange")
-    data = _json(resp)
-    token = data.get("accessToken")
-    if not isinstance(token, str) or len(token) < 20 or len(token) > 8192:
-        raise DhanAuthError(502, "dhan_bad_response", "Dhan did not return an access token")
-    got = str(data.get("dhanClientId") or "").strip()
     # The session must be for the configured account: a tokenId from someone else's login
     # (e.g. a crafted callback link) yields a token for another client id and is refused.
-    if got != cid:
-        raise DhanAuthError(
-            403, "dhan_client_mismatch", "the Dhan login was for a different client id"
-        )
-    expires = parse_expiry(data.get("expiryTime"))
-    name = data.get("dhanClientName")
-    return Session(token, expires, got, name if isinstance(name, str) else None)
+    return _session_from(_json(resp), cid)
 
 
 async def store_session(
@@ -212,6 +271,7 @@ def status(settings: Settings, now: datetime | None = None) -> dict[str, Any]:
     return {
         "client_id_set": bool(settings.DHAN_CLIENT_ID),
         "api_key_configured": bool(settings.DHAN_API_KEY and settings.DHAN_API_SECRET),
+        "auto_login_configured": settings.dhan_auto_login_configured,
         "redirect_url": settings.DHAN_REDIRECT_URL,
         "session_active": active,
         "session_expires_at": exp if has_session else None,

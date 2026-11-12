@@ -34,6 +34,7 @@ Read-only: this only obtains the data session; there is no order code anywhere.
 
 from __future__ import annotations
 
+import contextlib
 from datetime import datetime
 from typing import Literal
 
@@ -51,6 +52,7 @@ from app.models.brokers import DhanConnection
 from app.services import app_settings as svc
 from app.services import app_settings_runtime, audit
 from app.services import dhan_auth as dhan
+from app.services import dhan_auto_login as auto_login
 from app.services import dhan_connection as conn
 from app.services import dhan_login_handoff as handoff
 from app.services.audit import ClientInfo
@@ -79,6 +81,13 @@ class ConsumeIn(BaseModel):
     token_id: str | None = Field(default=None, min_length=8, max_length=256)
 
 
+class AutoLoginLast(BaseModel):
+    at: datetime
+    outcome: str
+    code: str | None = None
+    expires_at: datetime | None = None
+
+
 class StatusOut(BaseModel):
     client_id_set: bool
     api_key_configured: bool
@@ -92,6 +101,10 @@ class StatusOut(BaseModel):
     data_stale: bool
     # Additive: the result of verifying the new token with Dhan's Profile API (consume only).
     verification: Literal["ok", "unavailable"] | None = None
+    # Additive: automatic login with PIN + TOTP (DHAN_PIN + DHAN_TOTP_SECRET set) and its
+    # last attempt (time, outcome, code, expiry). Never the PIN, the secret or the token.
+    auto_login_configured: bool = False
+    auto_login_last: AutoLoginLast | None = None
 
 
 class DhanConnectionOut(BaseModel):
@@ -114,7 +127,7 @@ class DhanConnectionOut(BaseModel):
     last_check_outcome: str | None
     last_error_code: str | None
     consecutive_failures: int
-    renewal: Literal["manual"]
+    renewal: Literal["manual", "auto"]
     action: str | None
     version: int
 
@@ -418,6 +431,7 @@ async def consume(
         },
     )
     await db.commit()
+    await auto_login.resume(redis)
     await app_settings_runtime.reload(request.app)
     await svc.publish(redis, list(dhan.SESSION_KEYS))
     out = StatusOut.model_validate(dhan.status(request.app.state.settings))
@@ -429,7 +443,12 @@ async def consume(
 @router.get("/status", response_model=StatusOut)
 async def session_status(request: Request, _: Current) -> StatusOut:
     """For /settings and /trading: is there a valid Dhan session, until when. No token."""
-    return StatusOut.model_validate(dhan.status(request.app.state.settings))
+    out = StatusOut.model_validate(dhan.status(request.app.state.settings))
+    prev = await auto_login.last(request.app.state.redis)
+    if prev is not None:
+        with contextlib.suppress(ValueError):
+            out.auto_login_last = AutoLoginLast.model_validate(prev)
+    return out
 
 
 @router.delete("/session", response_model=StatusOut)
@@ -449,6 +468,8 @@ async def logout(request: Request, admin: AdminRequired, db: DbSession) -> Statu
         details={"removed": removed, "status": row.status if row is not None else None},
     )
     await db.commit()
+    # A logout must stick: automatic login waits until someone logs in to Dhan again.
+    await auto_login.pause(request.app.state.redis)
     if removed:
         await app_settings_runtime.reload(request.app)
         await svc.publish(request.app.state.redis, list(dhan.SESSION_KEYS))

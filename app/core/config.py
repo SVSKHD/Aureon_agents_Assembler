@@ -252,6 +252,15 @@ class Settings(BaseSettings):
     DHAN_SESSION_EXPIRES_AT: datetime | None = None
     # Discord alert when the Dhan session has expired or expires within this many minutes.
     DHAN_SESSION_ALERT_MINUTES: int = Field(default=60, ge=0, le=24 * 60)
+    # Automatic login with PIN + TOTP (docs/11-dhan.md, "Automatic login"): the scheduler
+    # mints a new session token itself when none is active or it expires within
+    # DHAN_AUTO_LOGIN_BEFORE_MINUTES. Needs TOTP enabled on the Dhan account; the TOTP
+    # secret is the base32 key shown when you set up the authenticator. Both are stored
+    # encrypted (core.app_settings) and never logged or returned. Blank cron = off.
+    DHAN_PIN: SecretStr | None = None
+    DHAN_TOTP_SECRET: SecretStr | None = None
+    DHAN_AUTO_LOGIN_CRON: str = "*/10 * * * *"
+    DHAN_AUTO_LOGIN_BEFORE_MINUTES: int = Field(default=120, ge=10, le=20 * 60)
     # Credential verification against GET /profile (docs/28-dhan-operations.md). The result
     # is kept in dhan.connections; a Dhan outage never downgrades a verdict.
     DHAN_SESSION_CHECK_CRON: str = "*/15 * * * *"
@@ -295,6 +304,16 @@ class Settings(BaseSettings):
     @property
     def dhan_configured(self) -> bool:
         return bool(self.DHAN_CLIENT_ID and self.dhan_access_token())
+
+    @property
+    def dhan_auto_login_configured(self) -> bool:
+        """Client id, PIN and TOTP secret all set, and the schedule not blanked."""
+        return bool(
+            self.DHAN_CLIENT_ID
+            and _secret_text(self.DHAN_PIN)
+            and _secret_text(self.DHAN_TOTP_SECRET)
+            and self.DHAN_AUTO_LOGIN_CRON.strip()
+        )
 
     # --- MT5 bot (Trading Phase C, docs/12-mt5-adapter.md). Read-only status export only. ---
     # Either the bot's logs/status.json (bind-mounted read-only) or its GET /status endpoint.
@@ -885,6 +904,28 @@ class Settings(BaseSettings):
             if not re.fullmatch(r"[a-z0-9_+]{1,30}", str(spec.get("sampler", "euler_a"))):
                 raise ValueError(f"IMAGE_MODELS[{name}]: bad sampler")
         return v
+
+    @field_validator("DHAN_PIN")
+    @classmethod
+    def _check_dhan_pin(cls, v: SecretStr | None) -> SecretStr | None:
+        text = _secret_text(v).strip()
+        if not text:
+            return None
+        if not re.fullmatch(r"\d{4,8}", text):
+            raise ValueError("DHAN_PIN must be your Dhan PIN: digits only")  # never echo it
+        return SecretStr(text)
+
+    @field_validator("DHAN_TOTP_SECRET")
+    @classmethod
+    def _check_totp_secret(cls, v: SecretStr | None) -> SecretStr | None:
+        text = re.sub(r"[\s-]", "", _secret_text(v)).upper()
+        if not text:
+            return None
+        if not re.fullmatch(r"[A-Z2-7]{16,128}=*", text):
+            raise ValueError(
+                "DHAN_TOTP_SECRET must be the base32 key from Dhan's authenticator setup"
+            )
+        return SecretStr(text.rstrip("="))
 
     @field_validator("DHAN_INSTRUMENT_SEGMENTS")
     @classmethod

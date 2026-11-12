@@ -54,6 +54,7 @@ from app.services import (
     app_settings,
     audit,
     devops,
+    dhan_auto_login,
     dhan_connection,
     dhan_monitor,
     dhan_sync,
@@ -211,6 +212,26 @@ async def dhan_session_check(ctx: TaskContext) -> dict[str, Any]:
         "status": rec.row.status if rec else None,
         "error_code": v.error_code,
     }
+
+
+async def dhan_auto_login_job(ctx: TaskContext) -> dict[str, Any]:
+    """Log in to Dhan with PIN + TOTP when the session is missing or about to expire
+    (app/services/dhan_auto_login.py). A refusal is not retried until the PIN or secret
+    changes; a failure raises so it shows on the job and in the scheduler logs."""
+    if ctx.redis is None:
+        raise RuntimeError("Redis is required for the Dhan automatic login")
+    http = ctx.http or httpx.AsyncClient(timeout=ctx.settings.DHAN_HTTP_TIMEOUT)
+    try:
+        res = await dhan_auto_login.run(ctx.maker, ctx.settings, ctx.redis, http)
+    finally:
+        if ctx.http is None:
+            await http.aclose()
+    if res.outcome in ("failed", "blocked"):
+        await AgentRegistry(ctx.maker).log(
+            SCHEDULER.id, "error", f"Dhan automatic login {res.outcome}: {res.code}"
+        )
+        raise RuntimeError(f"Dhan automatic login {res.outcome}: {res.code}")
+    return res.as_dict()
 
 
 async def dhan_monitor_job(ctx: TaskContext) -> dict[str, Any]:
@@ -485,6 +506,7 @@ TASKS: dict[str, TaskFn] = {
     "ai_daily_report": ai_daily_report,
     "ai_weekly_review": ai_weekly_review,
     "dhan_refresh_instruments": dhan_refresh_instruments,
+    "dhan_auto_login": dhan_auto_login_job,
     "dhan_reconcile": dhan_reconcile,
     "dhan_backfill_candles": dhan_backfill_candles,
     "dhan_universe_backfill": dhan_universe_backfill,
@@ -541,6 +563,8 @@ def default_jobs(settings: Settings) -> list[tuple[str, str, str]]:
         # Even without a usable token: an expired/rejected credential must stay visible.
         jobs.append(("dhan-session-check", "dhan_session_check", settings.DHAN_SESSION_CHECK_CRON))
         jobs.append(("dhan-monitor", "dhan_monitor", settings.DHAN_MONITOR_CRON))
+        if settings.dhan_auto_login_configured:
+            jobs.append(("dhan-auto-login", "dhan_auto_login", settings.DHAN_AUTO_LOGIN_CRON))
         # Public file, no token needed: registered with the client id, not the session.
         jobs.append(
             ("dhan-refresh-instruments", "dhan_refresh_instruments", settings.DHAN_INSTRUMENTS_CRON)

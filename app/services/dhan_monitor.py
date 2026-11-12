@@ -55,8 +55,12 @@ WARNING_CODES = frozenset({"stale_instruments", "subscriptions_incomplete", "sta
 # After this many failed verification attempts in a row (Dhan unreachable) say so.
 UNVERIFIED_WARN_AFTER = 3
 RENEWAL_NOTE = (
-    "automatic renewal is not available: Dhan's supported renewal needs your own login "
-    "(consent + OTP)"
+    "automatic login is off: set DHAN_PIN and DHAN_TOTP_SECRET on /settings to have the "
+    "scheduler log in again before the session expires, or log in to Dhan yourself"
+)
+AUTO_RENEWAL_NOTE = (
+    "automatic login is on but did not produce a usable session: check the dhan-auto-login "
+    "job in the scheduler (a refused PIN or TOTP secret is not retried until it changes)"
 )
 FEED_HINTS = {
     "not_running": "start it: add `dhan` to COMPOSE_PROFILES and redeploy "
@@ -101,9 +105,9 @@ def auth_check(settings: Settings, connection: dict[str, Any], now: datetime) ->
             {
                 "check": "auth",
                 "status": status,
-                "renewal": "manual",
+                "renewal": "auto" if settings.dhan_auto_login_configured else "manual",
                 "action": dhan_connection.ACTIONS.get(status),
-                "note": RENEWAL_NOTE,
+                "note": AUTO_RENEWAL_NOTE if settings.dhan_auto_login_configured else RENEWAL_NOTE,
             },
         )
     ]

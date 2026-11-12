@@ -21,10 +21,11 @@ Verification uses Dhan's supported Profile API (GET {DHAN_BASE_URL}/profile, hea
 the previous status is kept and `consecutive_failures` counts up. A credential seen for the
 first time during an outage is `unverified`.
 
-Renewal is never automatic. Dhan's RenewToken only applies to tokens generated on Dhan Web
-and its response is not documented, and the API-key flow needs the user's own login on Dhan
-(OTP / consent). An expired or rejected credential therefore always needs a person: "Log in
-to Dhan" on /settings, or a new manual token.
+Renewal is manual unless automatic login is configured. With DHAN_PIN + DHAN_TOTP_SECRET
+set, the scheduler logs in again before the session expires (app/services/dhan_auto_login.py;
+`renewal: auto`). Otherwise, or after Dhan refused the PIN + TOTP, an expired or rejected
+credential needs a person: "Log in to Dhan" on /settings, or a new manual token. Dhan's
+RenewToken is not used: it only applies to tokens generated on Dhan Web.
 
 No token, secret or Dhan body is ever returned, logged or stored here. `credential_fp` is an
 HMAC of the token keyed by SECRET_KEY: enough to notice a replaced credential, useless to
@@ -366,7 +367,7 @@ def view(row: DhanConnection | None, settings: Settings) -> dict[str, Any]:
             "last_check_outcome": None,
             "last_error_code": None,
             "consecutive_failures": 0,
-            "renewal": "manual",
+            "renewal": "auto" if settings.dhan_auto_login_configured else "manual",
             "action": ACTIONS[status],
             "version": 0,
         }
@@ -385,7 +386,7 @@ def view(row: DhanConnection | None, settings: Settings) -> dict[str, Any]:
         "last_check_outcome": row.last_check_outcome,
         "last_error_code": row.last_error_code,
         "consecutive_failures": row.consecutive_failures,
-        "renewal": "manual",
+        "renewal": "auto" if settings.dhan_auto_login_configured else "manual",
         "action": ACTIONS.get(row.status),
         "version": row.version,
     }

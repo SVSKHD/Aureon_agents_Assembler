@@ -76,7 +76,7 @@ def test_unusable_credential_is_never_auto_recovered(s: Settings, status: str) -
     auth = out["auth"]
     assert auth.severity == "error" and not auth.recoverable
     assert auth.details["renewal"] == "manual" and "log in" in auth.details["action"]
-    assert "automatic renewal is not available" in auth.details["note"]
+    assert "automatic login is off" in auth.details["note"]
     inc = Incident(source="dhan", details={**auth.details, "recoverable": False})
     assert repair_recovery.plan(inc) == ()  # -> escalates to a person straight away
 
