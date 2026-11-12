@@ -168,6 +168,35 @@ async def test_instrument_sync_upserts_links_and_deactivates(env: Env) -> None:
     assert ref and ref.instrument == "OPTIDX"
 
 
+def test_instrument_writes_stay_under_the_postgres_parameter_limit() -> None:
+    rows = [{f"c{k}": k for k in range(23)} for _ in range(dhan_sync.BATCH)]
+    pieces = dhan_sync._pieces(rows)
+    assert sum(len(p) for p in pieces) == dhan_sync.BATCH
+    assert all(len(p) * 23 <= dhan_sync.PG_MAX_PARAMS for p in pieces)
+    assert dhan_sync._pieces([]) == []
+
+
+@respx.mock
+async def test_instrument_sync_saves_a_full_batch(env: Env) -> None:
+    """A real master has ~200k rows: a full 2000-row batch must fit Postgres's 32767 limit."""
+    header = (FIX / "master_real_sample.csv").read_text(encoding="utf-8").splitlines()[0]
+    n = dhan_sync.BATCH + 500
+    lines = [header] + [
+        f"NSE,E,{900000 + k},,EQUITY,,SYM{k},SYM {k} LTD,Sym {k},ES,EQ,1.0,,,,0.05,NA,"
+        "N,N,N,NA,A,0,0,0,0,0,0,0,0,0,0,"
+        for k in range(n)
+    ]
+    body = "\n".join(lines).encode()
+    respx.get(CSV_URL).mock(return_value=httpx.Response(200, content=body))
+    out = await dhan_sync.sync_instruments(env.maker, env.adapter, today=date(2026, 11, 10))
+    assert out["instruments"] == n
+    assert await env.count(DhanInstrument) == n
+    assert await env.count(Instrument) == n
+    async with env.maker() as db:
+        run = await db.scalar(select(DhanInstrumentSyncRun))
+    assert run and run.status == "succeeded" and run.upserted == n
+
+
 @respx.mock
 async def test_empty_master_never_deactivates_everything(env: Env) -> None:
     respx.get(CSV_URL).mock(return_value=httpx.Response(200, content=b"EXCH_ID,SEGMENT\n"))
