@@ -249,6 +249,7 @@ ALLOWED_FIELDS = {
     "key", "category", "description", "kind", "is_secret", "requires_reauth", "is_set",
     "masked", "source", "updated_at", "version", "expires_at", "expires_soon",
     "managed",  # a key only its own flow writes (Dhan login); never a value
+    "value",  # the full value of a non-secret only (checked below)
 }  # fmt: skip
 
 
@@ -271,6 +272,8 @@ async def test_get_returns_masks_never_values(make_env: EnvFactory) -> None:
             assert set(item) <= ALLOWED_FIELDS, set(item) - ALLOWED_FIELDS
             if item["is_secret"] and item["masked"]:
                 assert item["masked"].startswith("••••") and len(item["masked"]) == 8
+            if item["is_secret"]:
+                assert item.get("value") is None, item["key"]
         assert _item(r.json(), "GITHUB_TOKEN")["source"] == "db"
 
 
@@ -405,3 +408,62 @@ async def test_diagnostics_layers_and_reload(make_env: EnvFactory) -> None:
         assert env.app.state.settings.anthropic_key == ""
         assert not env.app.state.ai.configured
         assert "settings_reloaded" in await _audit(env)
+
+        # Every process reported what it loaded: this API is one of them.
+        r = await env.get("admin", f"{URL}/diagnostics")
+        body = r.json()
+        assert body["redis"]["ok"]
+        api_proc = next(p for p in body["processes"] if p["this"])
+        assert api_proc["process"] == "api" and api_proc["stale"] == []
+        assert body["server"]["settings_applied_at"]
+
+
+async def test_non_secret_values_are_shown_in_full(make_env: EnvFactory) -> None:
+    async with make_env() as env:
+        assert (await _put(env, "AI_MODEL_MAIN", "claude-sonnet-5-5")).status_code == 200
+        item = _item((await env.get("admin", URL)).json(), "AI_MODEL_MAIN")
+        assert item["value"] == "claude-sonnet-5-5" and item["source"] == "db"
+        k = next(
+            i
+            for i in (await env.get("admin", f"{URL}/diagnostics")).json()["keys"]
+            if i["key"] == "AI_MODEL_MAIN"
+        )
+        assert k["db_value"] == "claude-sonnet-5-5" == k["live_value"] == k["expected_value"]
+        assert k["env_value"] == "claude-opus-5-5" and "shadows_env" in k["issues"]
+
+
+async def test_reveal_needs_password_is_audited_and_never_cached(make_env: EnvFactory) -> None:
+    async with make_env() as env:
+        assert (await _put(env, "GITHUB_TOKEN", GH)).status_code == 200
+        url = f"{URL}/GITHUB_TOKEN/reveal"
+        assert (await env.send("a", "POST", url, json={"password": PASSWORD})).status_code == 403
+        r = await env.send("admin", "POST", url, json={})
+        assert r.status_code == 403 and GH not in r.text
+        r = await env.send("admin", "POST", url, json={"password": "wrong-password"})
+        assert r.status_code == 403 and GH not in r.text
+        r = await env.send("admin", "POST", url, json={"password": PASSWORD})
+        assert r.status_code == 200 and r.headers["cache-control"] == "no-store"
+        assert r.json() == {
+            "key": "GITHUB_TOKEN",
+            "env": ENV_TOKEN,
+            "db": GH,
+            "db_present": True,
+            "expected": GH,
+            "live": GH,
+        }
+        trail = await _audit(env)
+        assert "settings_revealed" in trail and GH not in trail and ENV_TOKEN not in trail
+        # A non-secret needs no password.
+        r = await env.send("admin", "POST", f"{URL}/AI_EFFORT/reveal", json={})
+        assert r.status_code == 200 and r.json()["live"] == "medium"
+        assert (await env.send("admin", "POST", f"{URL}/NOPE/reveal", json={})).status_code == 404
+
+
+async def test_reveals_are_rate_limited(make_env: EnvFactory, monkeypatch: Any) -> None:
+    monkeypatch.setattr(api, "REVEALS_PER_10_MIN", 2)
+    async with make_env() as env:
+        codes = [
+            (await env.send("admin", "POST", f"{URL}/AI_EFFORT/reveal", json={})).status_code
+            for _ in range(3)
+        ]
+        assert codes == [200, 200, 429]

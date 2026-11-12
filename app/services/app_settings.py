@@ -17,17 +17,22 @@ gracefully and re-executes itself in the same container (`run_worker`): no conta
 restart, no `docker compose` call.
 Workers without Redis (the coding worker) notice by polling a DB fingerprint.
 
-SECRECY. Values never leave this module except into Settings: the API returns masks, tests
-return outcomes, audit rows carry key names, and every secret value is registered with the
-log scrubber (app/core/logging.py), which also covers incidents and AI incident briefs.
+SECRECY. Secret values never leave this module except into Settings: the API returns masks
+(a full secret only through the password-checked, audited reveal; non-secret values in
+full), tests return outcomes, audit rows carry key names, and every secret value is
+registered with the log scrubber (app/core/logging.py), which also covers incidents and AI
+incident briefs.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import hmac
 import json
 import os
+import socket
 import sys
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass
@@ -499,27 +504,143 @@ async def effective(maker: async_sessionmaker[AsyncSession], env: Settings) -> S
 
 
 # --- diagnostics --------------------------------------------------------------------------
+#
+# Where a value comes from, layer by layer: .env (or the default) → the encrypted DB row →
+# what a reload would give (.env + every DB row, validated) → what each process runs with.
+# Non-secret values are shown in full; secrets as masks (a full secret only through the
+# password-checked reveal). Each process reports what it loaded to Redis as keyed digests
+# (HMAC over SECRET_KEY, never the value), so a worker still running an old value shows.
 
 Issue = Literal["db_undecryptable", "db_rejected", "db_ignored", "stale", "shadows_env"]
+
+PROCESS_STARTED_AT = datetime.now(UTC)
+APPLIED_PREFIX = "settings:applied:"
+APPLIED_TTL = 7 * 24 * 3600
+REPORT_TIMEOUT_SECONDS = 2.0
+
+
+def plain(spec: Spec, value: str | None) -> str | None:
+    """The full value of a non-secret setting; None for a secret (masks only)."""
+    return None if spec.secret else value
+
+
+@dataclass(frozen=True, slots=True)
+class Layers:
+    """Every DB row decrypted and validated, and the settings a reload would give."""
+
+    known: dict[str, AppSetting]
+    unknown: tuple[str, ...]
+    decrypted: dict[str, str]
+    undecryptable: tuple[str, ...]
+    rejected: tuple[str, ...]
+    expected: Settings
+    overlay_ok: bool
+    overlay_fields: tuple[str, ...]
+    cipher_problem: str | None
+
+
+def layers(env: Settings, rows: Iterable[AppSetting]) -> Layers:
+    rows = list(rows)
+    try:
+        cipher: Cipher | None = Cipher(env.SETTINGS_MASTER_KEY)
+        problem = None
+    except SettingsError as exc:
+        cipher, problem = None, exc.detail
+    known = {r.key: r for r in rows if r.key in REGISTRY}
+    decrypted: dict[str, str] = {}
+    undecryptable: list[str] = []
+    for key, stored in known.items():
+        if cipher is None:
+            undecryptable.append(key)
+            continue
+        try:
+            decrypted[key] = cipher.decrypt(stored.value_encrypted)
+        except InvalidToken:
+            undecryptable.append(key)
+    rejected: list[str] = []
+    for key, value in decrypted.items():
+        try:
+            overlay(env, {key: value})
+        except ValidationError:
+            rejected.append(key)
+    overlay_fields: tuple[str, ...] = ()
+    try:
+        expected = overlay(env, decrypted)
+        overlay_ok = True
+    except ValidationError as exc:
+        expected, overlay_ok, overlay_fields = env, False, _rejected_fields(exc)
+    return Layers(
+        known=known,
+        unknown=tuple(sorted(r.key for r in rows if r.key not in REGISTRY)),
+        decrypted=decrypted,
+        undecryptable=tuple(sorted(undecryptable)),
+        rejected=tuple(sorted(rejected)),
+        expected=expected,
+        overlay_ok=overlay_ok,
+        overlay_fields=overlay_fields,
+        cipher_problem=problem,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class LayerValues:
+    """One key's full value at each layer: only for the password-checked reveal."""
+
+    env: str | None
+    db: str | None
+    db_present: bool
+    expected: str | None
+    live: str | None
+
+
+def layer_values(
+    env: Settings, live: Settings, rows: Iterable[AppSetting], key: str
+) -> LayerValues:
+    lay = layers(env, rows)
+    return LayerValues(
+        env=current_value(env, key),
+        db=lay.decrypted.get(key),
+        db_present=key in lay.known,
+        expected=current_value(lay.expected, key),
+        live=current_value(live, key),
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class KeyReport:
-    """One key's value at each layer, as masks only."""
+    """One key at each layer: masks, plus the full value when it is not a secret."""
 
     key: str
     category: str
     is_secret: bool
     env_masked: str | None  # .env (or the default)
+    env_value: str | None
     env_source: Literal["env", "default", "unset"]
     db_present: bool
     db_masked: str | None  # the decrypted DB value; None when absent or undecryptable
+    db_value: str | None
     db_version: int | None
     db_updated_at: datetime | None
     expected_masked: str | None  # what a reload would give now (.env + DB)
+    expected_value: str | None
     expected_source: Literal["db", "env", "default", "unset"]
     live_masked: str | None  # what this process is running with
+    live_value: str | None
     issues: tuple[Issue, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessReport:
+    """What one process (the API, a worker) loaded, from its own report in Redis."""
+
+    process: str
+    host: str
+    pid: int
+    started_at: str | None
+    applied_at: str | None
+    watches: tuple[str, ...]  # key prefixes it reloads on ("" = every key)
+    stale: tuple[str, ...]  # watched keys whose loaded value is not what a reload gives
+    unwatched_stale: tuple[str, ...]  # differ, but the process does not use them live
 
 
 @dataclass(frozen=True, slots=True)
@@ -533,8 +654,9 @@ class Diagnosis:
     rejected: tuple[str, ...]  # rows whose value fails validation on its own
     overlay_ok: bool  # False = every DB value is ignored and .env alone applies
     overlay_fields: tuple[str, ...]
-    stale: tuple[str, ...]  # live value differs from what a reload would give
+    stale: tuple[str, ...]  # this process's live value differs from what a reload gives
     keys: tuple[KeyReport, ...]
+    processes: tuple[ProcessReport, ...]
 
 
 def _env_source(env: Settings, key: str) -> Literal["env", "default", "unset"]:
@@ -547,57 +669,106 @@ def _rejected_fields(exc: ValidationError) -> tuple[str, ...]:
     return tuple(sorted({str(e["loc"][0]) for e in exc.errors() if e.get("loc")}))
 
 
-def diagnose(env: Settings, live: Settings, rows: Iterable[AppSetting]) -> Diagnosis:
-    """Every layer a value passes through (.env, the encrypted DB row, the overlay, this
-    process's live settings) and where they disagree. Masks and key names only."""
-    rows = list(rows)
-    try:
-        cipher: Cipher | None = Cipher(env.SETTINGS_MASTER_KEY)
-        problem = None
-    except SettingsError as exc:
-        cipher, problem = None, exc.detail
-    master = current_value(env, "SETTINGS_MASTER_KEY") or ""
-    unknown = tuple(sorted(r.key for r in rows if r.key not in REGISTRY))
-    known = {r.key: r for r in rows if r.key in REGISTRY}
+def digest(settings: Settings, key: str, value: str | None) -> str | None:
+    """A keyed fingerprint of a value (HMAC-SHA256 under SECRET_KEY), never reversible."""
+    if value is None:
+        return None
+    secret = (current_value(settings, "SECRET_KEY") or "").encode()
+    return hmac.new(secret, f"{key}\0{value}".encode(), hashlib.sha256).hexdigest()[:20]
 
-    decrypted: dict[str, str] = {}
-    undecryptable: list[str] = []
-    for key, stored in known.items():
-        if cipher is None:
-            undecryptable.append(key)
+
+def process_name() -> str:
+    """This process's short name: the worker module (`research`, `scheduler`, …)."""
+    spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+    name = str(getattr(spec, "name", "") or "process")
+    return name.rsplit(".", 1)[-1]
+
+
+def applied_snapshot(settings: Settings, process: str, watches: Iterable[str]) -> dict[str, Any]:
+    return {
+        "process": process,
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "started_at": PROCESS_STARTED_AT.isoformat(),
+        "applied_at": datetime.now(UTC).isoformat(),
+        "watches": list(watches),
+        "digests": {k: digest(settings, k, current_value(settings, k)) for k in REGISTRY},
+    }
+
+
+async def report_applied(
+    redis: Redis, settings: Settings, process: str, watches: Iterable[str]
+) -> None:
+    """Tell diagnostics what this process loaded. Best effort: never fails the caller."""
+    snap = applied_snapshot(settings, process, watches)
+    try:
+        async with asyncio.timeout(REPORT_TIMEOUT_SECONDS):  # never hold up a startup
+            await redis.set(
+                f"{APPLIED_PREFIX}{process}@{snap['host']}", json.dumps(snap), ex=APPLIED_TTL
+            )
+    except Exception as exc:
+        log.warning("app_settings_report_failed", error=type(exc).__name__)
+
+
+async def read_applied(redis: Redis) -> list[dict[str, Any]]:
+    keys = [k async for k in redis.scan_iter(match=f"{APPLIED_PREFIX}*", count=200)]
+    if not keys:
+        return []
+    out = []
+    for raw in await redis.mget(keys):
+        if not raw:
             continue
-        try:
-            decrypted[key] = cipher.decrypt(stored.value_encrypted)
-        except InvalidToken:
-            undecryptable.append(key)
+        with contextlib.suppress(ValueError, TypeError):
+            item = json.loads(raw)
+            if isinstance(item, dict):
+                out.append(item)
+    return sorted(out, key=lambda x: (str(x.get("process")), str(x.get("host"))))
 
-    rejected: list[str] = []
-    for key, value in decrypted.items():
-        try:
-            overlay(env, {key: value})
-        except ValidationError:
-            rejected.append(key)
-    overlay_fields: tuple[str, ...] = ()
-    try:
-        expected = overlay(env, decrypted)
-        overlay_ok = True
-    except ValidationError as exc:
-        expected, overlay_ok, overlay_fields = env, False, _rejected_fields(exc)
 
+def _process_report(item: Mapping[str, Any], expected: Mapping[str, str | None]) -> ProcessReport:
+    watches = tuple(str(p) for p in item.get("watches") or ())
+    digests = item.get("digests") or {}
+    stale: list[str] = []
+    unwatched: list[str] = []
+    for key, want in expected.items():
+        if digests.get(key) == want:
+            continue
+        (stale if key.startswith(watches) else unwatched).append(key)
+    return ProcessReport(
+        process=str(item.get("process") or "?"),
+        host=str(item.get("host") or "?"),
+        pid=int(item.get("pid") or 0),
+        started_at=item.get("started_at"),
+        applied_at=item.get("applied_at"),
+        watches=watches,
+        stale=tuple(stale),
+        unwatched_stale=tuple(unwatched),
+    )
+
+
+def diagnose(
+    env: Settings,
+    live: Settings,
+    rows: Iterable[AppSetting],
+    applied: Iterable[Mapping[str, Any]] = (),
+) -> Diagnosis:
+    """Every layer a value passes through and where they disagree. Secrets as masks only."""
+    lay = layers(env, rows)
+    master = current_value(env, "SETTINGS_MASTER_KEY") or ""
     reports: list[KeyReport] = []
     stale: list[str] = []
     for key, spec in REGISTRY.items():
-        row = known.get(key)
+        row = lay.known.get(key)
         env_value = current_value(env, key)
-        db_value = decrypted.get(key)
-        expected_value = current_value(expected, key)
+        db_value = lay.decrypted.get(key)
+        expected_value = current_value(lay.expected, key)
         live_value = current_value(live, key)
         issues: list[Issue] = []
-        if row is not None and key not in decrypted:
+        if row is not None and key not in lay.decrypted:
             issues.append("db_undecryptable")
-        if key in rejected:
+        if key in lay.rejected:
             issues.append("db_rejected")
-        elif db_value is not None and not overlay_ok:
+        elif db_value is not None and not lay.overlay_ok:
             issues.append("db_ignored")
         if live_value != expected_value:
             issues.append("stale")
@@ -611,29 +782,35 @@ def diagnose(env: Settings, live: Settings, rows: Iterable[AppSetting]) -> Diagn
                 category=spec.category,
                 is_secret=spec.secret,
                 env_masked=mask(env_value, spec.secret),
+                env_value=plain(spec, env_value),
                 env_source=env_src,
                 db_present=row is not None,
                 db_masked=mask(db_value, spec.secret),
+                db_value=plain(spec, db_value),
                 db_version=row.version if row is not None else None,
                 db_updated_at=as_utc(row.updated_at) if row is not None else None,
                 expected_masked=mask(expected_value, spec.secret),
-                expected_source="db" if overlay_ok and db_value is not None else env_src,
+                expected_value=plain(spec, expected_value),
+                expected_source="db" if lay.overlay_ok and db_value is not None else env_src,
                 live_masked=mask(live_value, spec.secret),
+                live_value=plain(spec, live_value),
                 issues=tuple(issues),
             )
         )
+    want = {k: digest(env, k, current_value(lay.expected, k)) for k in REGISTRY}
     return Diagnosis(
-        encryption_ready=cipher is not None,
-        encryption_problem=problem,
+        encryption_ready=lay.cipher_problem is None,
+        encryption_problem=lay.cipher_problem,
         master_keys=len([k for k in master.split(",") if k.strip()]),
-        rows=len(rows),
-        unknown_rows=unknown,
-        undecryptable=tuple(sorted(undecryptable)),
-        rejected=tuple(sorted(rejected)),
-        overlay_ok=overlay_ok,
-        overlay_fields=overlay_fields,
+        rows=len(lay.known) + len(lay.unknown),
+        unknown_rows=lay.unknown,
+        undecryptable=lay.undecryptable,
+        rejected=lay.rejected,
+        overlay_ok=lay.overlay_ok,
+        overlay_fields=lay.overlay_fields,
         stale=tuple(stale),
         keys=tuple(reports),
+        processes=tuple(_process_report(item, want) for item in applied),
     )
 
 
@@ -754,11 +931,22 @@ def start_worker_watch(
         stop.set()
         return False
 
+    async def report() -> None:
+        client = redis or Redis.from_url(settings.REDIS_URL, socket_timeout=5)
+        try:
+            await report_applied(client, settings, process_name(), prefixes)
+        finally:
+            if redis is None:
+                with contextlib.suppress(Exception):
+                    await client.aclose()
+
     task = asyncio.create_task(
         watch(maker, redis, on_change, stop, poll_seconds=30.0), name="app-settings-watch"
     )
-    _WATCHERS.add(task)  # a strong reference: the loop only keeps a weak one
-    task.add_done_callback(_WATCHERS.discard)
+    reporter = asyncio.create_task(report(), name="app-settings-report")
+    for t in (task, reporter):
+        _WATCHERS.add(t)  # a strong reference: the loop only keeps a weak one
+        t.add_done_callback(_WATCHERS.discard)
     return task
 
 

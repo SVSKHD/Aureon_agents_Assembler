@@ -65,6 +65,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         live = await app_settings.effective(app.state.sessionmaker, settings)
         app_settings.install(live)
         app.state.settings = live
+        # What this process loaded, for /settings/diagnostics: in the background, never
+        # holding up startup (Redis may be slow or down).
+        settings_report = asyncio.create_task(
+            app_settings_runtime.report(app), name="app-settings-report"
+        )
         app.state.http = http
         app.state.health = HealthService(settings, engine, redis, http)
         # Claude, the only AI provider (docs/26-ai-providers.md): the gateway holds the key,
@@ -132,6 +137,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             log.info("shutdown")
             docker_stop.set()
             settings_stop.set()
+            settings_report.cancel()
             if settings_task is not None:  # a listener: nothing to finish, just stop it
                 settings_task.cancel()
                 with contextlib.suppress(Exception, asyncio.CancelledError):
