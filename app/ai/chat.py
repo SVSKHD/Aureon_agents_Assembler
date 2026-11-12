@@ -11,6 +11,7 @@ in a new one (older turns are never edited or dropped).
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ from app.ai.budget import IST
 from app.ai.gateway import ClaudeGateway
 from app.ai.tools.registry import Registry, ToolContext
 from app.models.ai import Conversation, Message
+from app.services import chat_attachments as files
 
 
 class ConversationError(Exception):
@@ -157,6 +159,7 @@ async def turn(
     agent: AgentName,
     on_event: loop.OnEvent | None = None,
     context: str | None = None,
+    attachments: Sequence[dict[str, Any]] = (),
 ) -> TurnResult:
     """One turn. `context` is extra read-only data the app sent with the message (the user's
     workspace, app/ai/workspace.py): a second text block, redacted like the rest, kept in the
@@ -167,15 +170,27 @@ async def turn(
     blocks: list[dict[str, Any]] = [{"type": "text", "text": _stamp(prompt)}]
     if context:
         blocks.append({"type": "text", "text": context})
+    # Files go as references (app/services/chat_attachments.py): stored as such, expanded
+    # from disk for Claude on this turn and every replay.
+    blocks.extend(attachments)
     user_msg = {"role": "user", "content": blocks}
     sent_user = ctx.redactor.messages([user_msg])[0]
+    to_claude = [*history, sent_user]
+    has_files = any(
+        isinstance(b, dict) and b.get("type") == files.REF_TYPE
+        for m in to_claude
+        if isinstance(m.get("content"), list)
+        for b in m["content"]
+    )
+    if has_files and ctx.user_id is not None:
+        to_claude = await asyncio.to_thread(files.expand, settings, ctx.user_id, to_claude)
     result = await loop.run(
         gateway,
         registry,
         ctx,
         system=SYSTEM[agent],
         budget=BUDGET_OF[agent],
-        history=[*history, sent_user],
+        history=to_claude,
         on_event=on_event,  # text and tool events stream to the client as they happen
     )
     last_id: int | None = None

@@ -75,6 +75,19 @@ tools only). Tools:
 | get_aquakart_sales_summary, get_aquakart_open_queries, get_pawsattva_summary, draft_aquakart_blog | read/write | business | **not connected**: hidden from Claude |
 | suggest_todo, suggest_task, suggest_reminder, suggest_calendar_event, suggest_note | suggest | general, business, investments | a card in the chat; **the user saves it** in the app (never the server) |
 
+### Attachments (photos, PDFs, spreadsheets)
+
+`POST /api/ai/attachments` stores one file under `DATA_ROOT/ai-attachments/<user>/<uuid>`
+(app/services/chat_attachments.py); `POST /chat` takes up to `AI_ATTACHMENTS_PER_MESSAGE` ids
+in `attachments`, the caller's own only (another user's id is 404). The type is sniffed from
+the bytes. Photos go to Claude as image blocks and PDFs as document blocks, **unredacted**
+(the app says so); spreadsheets are converted at upload to a text table, capped at
+`AI_ATTACHMENT_TABLE_MAX_CHARS`, and redacted like any text. Stored messages keep a reference
+block, never the file; it is expanded from disk on every replay (same bytes, so the prompt
+cache still matches). Files are removed after `AI_ATTACHMENT_KEEP_DAYS`. The budget
+reservation counts an image as about 1,600 tokens and a PDF page as about 3,500, not by its
+base64 size. Nothing new leaves the server: the files go only to api.anthropic.com.
+
 ### The workspace (todos, tasks, reminders, notes)
 
 They live in the frontend's Supabase behind row-level security, and the backend has no key to
@@ -96,7 +109,8 @@ LIVE trading stays disabled and Dhan stays read-only.
 
 | Route | Who | |
 |---|---|---|
-| `POST /chat` | any user, CSRF, `AI_CHAT_REQUESTS_PER_MINUTE` | SSE: `meta`, `text`, `tool`, `approval`, `done`, `error` |
+| `POST /chat` | any user, CSRF, `AI_CHAT_REQUESTS_PER_MINUTE` | SSE: `meta`, `text`, `tool`, `approval`, `suggestion`, `done`, `error` |
+| `POST /attachments` | any user, CSRF | multipart `file`: photo (PNG/JPEG/WebP/GIF, 5 MB), PDF (100 pages), .xlsx/CSV/TSV; returns an id for `attachments` in `POST /chat` |
 | `GET /conversations`, `GET /conversations/{id}` | owner | readable messages only |
 | `GET /approvals?status=pending` | admin | |
 | `POST /approvals/{id}` `{action, password?}` | admin + CSRF; approve needs the password | executes on approve |

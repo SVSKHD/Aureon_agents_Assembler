@@ -24,6 +24,8 @@ dependencies = [
     "numpy>=2.0,<3",
     "pandas>=2.2,<4",
     "python-multipart>=0.0.9",
+    # Reads .xlsx files attached to an AI chat message (app/services/chat_attachments.py).
+    "openpyxl>=3.1,<4",
     "pyjwt[crypto]>=2.8",
     # Claude, the only AI provider (docs/26-ai-providers.md). anthropic 2.x sends
     # anthropic-version 2026-10-21 and runs on httpx2. Imported only by app/ai/gateway.py.
@@ -41,6 +43,7 @@ dev = [
     "types-psutil",
     "types-croniter",
     "pandas-stubs",
+    "types-openpyxl",
     "pyyaml>=6.0",
     # The vendored Aureon v1.63 client the compatibility tests drive (tests/fixtures).
     "requests>=2.31",

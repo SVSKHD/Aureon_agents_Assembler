@@ -222,3 +222,32 @@ async def test_pg_reservations_never_overspend(make_env: EnvFactory) -> None:  #
         results = await asyncio.gather(*(one() for _ in range(8)))
         assert results.count(True) == 3
         assert (await store.spend()).by_budget["chat"] == Decimal("0.90")
+
+
+async def test_attachments_upload_send_and_stay_private(make_env: EnvFactory) -> None:  # noqa: F811
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+    async with make_env() as env:
+        fake = _install(env, [text_reply("A blank image.")])
+        upload = {"file": ("chart.png", png, "application/octet-stream")}
+        assert (await env.user.post("/api/ai/attachments", files=upload)).status_code == 403
+        r = await env.post("user", "/api/ai/attachments", files=upload)
+        assert r.status_code == 201, r.text
+        att = r.json()
+        assert (att["kind"], att["media_type"], att["name"]) == ("image", "image/png", "chart.png")
+        bad = {"file": ("x.exe", b"MZ\x90\x00" * 4, "image/png")}
+        assert (await env.post("user", "/api/ai/attachments", files=bad)).status_code == 415
+
+        # Another user cannot send it.
+        other = {"message": "what is this?", "agent": "general", "attachments": [att["id"]]}
+        r2 = await env.post("admin", "/api/ai/chat", json=other)
+        assert r2.status_code == 404
+        assert r2.json()["detail"]["code"] == "attachment_not_found"
+
+        r3 = await env.post("user", "/api/ai/chat", json=other)
+        assert _events(r3.text)[-1][0] == "done"
+        sent = fake.calls[-1]["messages"][-1]["content"]
+        assert [b["type"] for b in sent] == ["text", "image"]
+        # The stored row keeps a reference, not the file.
+        row = await env.scalar(select(Message).where(Message.role == "user"))
+        assert row is not None and row.blocks is not None
+        assert row.blocks[1]["type"] == "aureon_attachment" and "source" not in row.blocks[1]
