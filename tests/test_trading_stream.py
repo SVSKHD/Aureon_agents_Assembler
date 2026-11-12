@@ -44,8 +44,8 @@ def test_openapi_export_lists_the_frontend_endpoints() -> None:
     for p in (
         "/api/auth/login",
         "/api/auth/me",
-        "/api/chat",
-        "/api/models",
+        "/api/ai/chat",
+        "/api/ai/usage",
         "/api/trading/stream",
         "/api/trading/signals",
         "/api/trading/mt5/status",

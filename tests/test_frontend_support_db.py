@@ -36,7 +36,6 @@ def settings(data_root: Path) -> Settings:
         ENV="test",
         DATABASE_URL=TEST_DATABASE_URL or "postgresql+asyncpg://x:x@127.0.0.1:1/none",
         REDIS_URL=TEST_REDIS_URL,
-        OLLAMA_BASE_URL="http://ollama.test:11434",
         DATA_ROOT=data_root,
         SECRET_KEY="t" * 40,
         HEALTH_CHECK_TIMEOUT=1.0,

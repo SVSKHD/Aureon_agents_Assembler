@@ -1,512 +1,258 @@
-"""Models, chat (SSE) and conversation endpoints."""
+"""Aureon AI over Claude (docs/26-ai-providers.md). Every route needs a signed-in session.
+
+POST /api/ai/chat                       stream one turn (SSE); CSRF; rate-limited per user
+GET  /api/ai/conversations              the caller's conversations, newest first
+GET  /api/ai/conversations/{id}         one conversation's readable messages
+GET  /api/ai/approvals?status=pending   write requests from the agents (admin)
+POST /api/ai/approvals/{id}             {action: approve|reject, password?} (admin + CSRF;
+                                        approve also needs the admin's password). On approve
+                                        the backend executes the action, never Claude.
+GET  /api/ai/usage                      month-to-date spend, total and per budget (admin)
+
+SSE events on /chat: `meta` {conversation_id, agent}, `text` {delta}, `tool` {name, status},
+`approval` {id, action, summary}, `done` {conversation_id, message_id, cost_usd, steps,
+stop_reason, approvals}, `error` {code, message}. A `: ping` comment is sent while idle.
+The turn finishes and is saved even if the client disconnects.
+"""
 
 from __future__ import annotations
 
+import asyncio
+import json
 import uuid
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Annotated, Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Query, Request, Response, status
-from fastapi.responses import JSONResponse
-from sqlalchemy import select
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import func, select
 
-from app.agents.ollama.client import OllamaClient, OllamaUnavailable
-from app.agents.ollama.limiter import GenerationLimiter, QueueFull, Ticket
-from app.agents.providers.base import EXTERNAL_PROVIDERS, PROVIDER_LABELS
+from app.agents.registry import CLAUDE
+from app.ai import approvals, chat
+from app.ai.agents import CHAT_AGENTS, AgentName
+from app.ai.budget import month_start, next_month_start
+from app.ai.gateway import ClaudeGateway, GatewayError
+from app.ai.tools import default_registry
+from app.ai.tools.registry import ToolContext
 from app.api.ui import ui_module
-from app.auth.deps import CsrfProtected, Current, DbSession, SettingsDep
-from app.core.config import Settings
-from app.models.ai import Conversation, ModelInventory
-from app.schemas.ai import (
-    AiUsage,
-    CatalogModel,
-    CatalogTarget,
-    ChatRequest,
-    ConversationDetail,
-    ConversationOut,
-    ConversationPage,
-    MessageOut,
-    ModelCatalog,
-    ModelList,
-    ModelOut,
-    ModelStatus,
-    ModelStatusList,
-    OpenRouterStatus,
-    ProviderStatus,
-)
+from app.auth.deps import AdminRequired, CsrfProtected, Current, DbSession, SettingsDep
+from app.auth.security import verify_password
+from app.core.logging import get_logger
+from app.models.ai import Approval, Conversation, Message, Usage
+from app.models.auth import ROLE_ADMIN
+from app.schemas.common import Page
 from app.services import audit, interactive
-from app.services.ai_usage import MICRO, DailyUsage, UsageTracker, to_micro, utc_today
-from app.services.chat import (
-    ChatJob,
-    ChatStream,
-    ChatStreamingResponse,
-    ConversationService,
-    chat_options,
-    sync_inventory,
-    trim_history,
-)
-from app.services.inference import (
-    Decision,
-    ExternalGate,
-    choose,
-    external_clients,
-    gate_for,
-    local_fallback_model,
-)
 
 UI_MODULE = ui_module("chat", label="AI chat", group="ai", icon="message-square", order=40)
-router = APIRouter(tags=["ai"])
+router = APIRouter(prefix="/ai", tags=["ai"])
+log = get_logger("api.ai")
+PING_SECONDS = 15.0
+_RUNNING: set[asyncio.Task[Any]] = set()
 
 
-LOCAL_DISABLED = "local models are disabled (AI_LOCAL_ENABLED is off)"
-
-
-def _ollama(request: Request) -> OllamaClient:
-    client: OllamaClient = request.app.state.ollama
-    return client
-
-
-def _gate(request: Request, settings: Settings, provider: str = "openrouter") -> ExternalGate:
-    state = request.app.state
-    return gate_for(settings, provider, external_clients(state), getattr(state, "ai_usage", None))
-
-
-def _gates(request: Request, settings: Settings) -> dict[str, ExternalGate]:
-    return {p: _gate(request, settings, p) for p in EXTERNAL_PROVIDERS}
-
-
-def _default_external(settings: Settings, gates: dict[str, ExternalGate]) -> ExternalGate | None:
-    """The first usable gate in the chain: AI_DEFAULT_EXTERNAL_PROVIDER, then
-    AI_EXTERNAL_FALLBACK_PROVIDERS (docs/30). None = local."""
-    for p in settings.external_chain(settings.AI_DEFAULT_EXTERNAL_PROVIDER):
-        gate = gates.get(p)
-        if gate is not None and gate.usable:
-            return gate
-    return None
-
-
-def _provider_status(settings: Settings, gate: ExternalGate) -> ProviderStatus:
-    cfg = settings.external(gate.provider)
-    reason = gate.unusable_reason()
-    return ProviderStatus(
-        provider=gate.provider,
-        label=PROVIDER_LABELS[gate.provider],
-        enabled=cfg.enabled,
-        configured=bool(cfg.api_key),
-        usable=reason is None,
-        unavailable_reason=reason,
-        default_model=cfg.default_model or None,
-        allowed_models=list(cfg.models),
-        daily_limit_usd=cfg.daily_limit_usd,
-        cost_source="provider" if cfg.reports_cost else "configured_price",
-        privacy="external",
-    )
-
-
-async def _models_synced(request: Request, db: DbSession) -> list[Any]:
-    """Installed models (cached); upsert ai.model_inventory once per cache refresh.
-    OllamaUnavailable without calling Ollama when AI_LOCAL_ENABLED is off."""
-    if not request.app.state.settings.AI_LOCAL_ENABLED:
-        raise OllamaUnavailable(LOCAL_DISABLED)
-    client = _ollama(request)
-    models = await client.list_models()
-    if getattr(request.app.state, "inventory_generation", None) != client.generation:
-        await sync_inventory(db, models)
-        await db.commit()
-        request.app.state.inventory_generation = client.generation
-    return models
-
-
-@router.get("/models", response_model=ModelList)
-async def list_models(
-    request: Request, db: DbSession, _: Current, settings: SettingsDep
-) -> ModelList:
-    try:
-        models = await _models_synced(request, db)
-    except OllamaUnavailable as exc:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, exc.message) from exc
-    default = settings.CHAT_DEFAULT_MODEL
-    if default not in {m.name for m in models}:
-        default = ""
-    # The default first: the SPA preselects the first model when none is chosen yet.
-    models = sorted(models, key=lambda m: m.name != default)
-    return ModelList(
-        default_model=default or None,
-        models=[
-            ModelOut(
-                name=m.name,
-                size=m.size,
-                family=m.family,
-                parameter_size=m.parameter_size,
-                quantization=m.quantization,
-                modified_at=m.modified_at,
-            )
-            for m in models
-        ],
-    )
-
-
-@router.get("/models/status", response_model=ModelStatusList)
-async def models_status(request: Request, db: DbSession, _: Current) -> ModelStatusList:
-    try:
-        await _models_synced(request, db)
-        running = {m.get("name"): m for m in await _ollama(request).running()}
-        reachable = True
-    except OllamaUnavailable:
-        running, reachable = {}, False
-    inventory = (await db.scalars(select(ModelInventory).order_by(ModelInventory.name))).all()
-    return ModelStatusList(
-        reachable=reachable,
-        models=[
-            ModelStatus(
-                name=row.name,
-                size=row.size_bytes,
-                loaded=row.name in running,
-                size_vram=(running.get(row.name) or {}).get("size_vram"),
-                expires_at=(running.get(row.name) or {}).get("expires_at"),
-                last_used_at=row.last_used_at,
-            )
-            for row in inventory
-        ],
-    )
-
-
-@router.get("/models/catalog", response_model=ModelCatalog)
-async def model_catalog(
-    request: Request, db: DbSession, _: Current, settings: SettingsDep
-) -> ModelCatalog:
-    """The picker's list: installed Ollama models plus the allowed OpenRouter ids."""
-    try:
-        installed = [m.name for m in await _models_synced(request, db)]
-        reachable = True
-    except OllamaUnavailable:
-        installed, reachable = [], False
-    gates = _gates(request, settings)
-    local = (
-        local_fallback_model(settings, installed if reachable else None)
-        if settings.AI_LOCAL_ENABLED
-        else None
-    )
-    models = [CatalogModel(provider="ollama", id=m, label=m) for m in installed]
-    for p, g in gates.items():
-        if not g.usable:
-            continue
-        for m in g.models:
-            priced = g.priced(m)
-            models.append(
-                CatalogModel(
-                    provider=p,
-                    id=m,
-                    label=m,
-                    available=priced,
-                    unavailable_reason=None if priced else "no_pricing",
-                    privacy="external",
-                )
-            )
-    default_gate = _default_external(settings, gates)
-    default = (
-        CatalogTarget(
-            provider=default_gate.provider,
-            model=default_gate.default_model,
+def _gateway(request: Request) -> ClaudeGateway:
+    if getattr(request.app.state, "agent_paused", {}).get(CLAUDE.id):
+        raise HTTPException(
+            503, {"code": "ai_paused", "message": "the claude agent is paused by an admin"}
         )
-        if default_gate is not None
-        else CatalogTarget(provider="ollama", model=local)
-    )
-    local_on = settings.AI_LOCAL_ENABLED
-    local_status = ProviderStatus(
-        provider="ollama",
-        label=PROVIDER_LABELS["ollama"],
-        enabled=local_on,
-        configured=True,
-        usable=reachable,
-        unavailable_reason=None if reachable else ("unreachable" if local_on else "disabled"),
-        default_model=local,
-        allowed_models=installed,
-        daily_limit_usd=None,
-        cost_source="none",
-        privacy="local",
-    )
-    return ModelCatalog(
-        default=default,
-        local_fallback_model=local,
-        ollama_reachable=reachable,
-        models=models,
-        openrouter=OpenRouterStatus(
-            enabled=settings.OPENROUTER_ENABLED,
-            unavailable_reason=gates["openrouter"].unusable_reason(),
-            research_external_allowed=settings.AI_RESEARCH_EXTERNAL_ALLOWED,
-        ),
-        providers=[local_status, *(_provider_status(settings, g) for g in gates.values())],
-        default_external_provider=settings.AI_DEFAULT_EXTERNAL_PROVIDER,
-        global_daily_limit_usd=settings.AI_EXTERNAL_DAILY_LIMIT_USD,
-    )
+    gw: ClaudeGateway | None = getattr(request.app.state, "ai", None)
+    if gw is None or not gw.configured:
+        raise HTTPException(
+            503, {"code": "ai_not_configured", "message": "ANTHROPIC_API_KEY is not set"}
+        )
+    return gw
 
 
-@router.get("/ai/usage", response_model=AiUsage)
-async def ai_usage(
-    request: Request,
-    _: Current,
-    settings: SettingsDep,
-    provider: Annotated[str, Query(pattern="^(openrouter|anthropic|gemini)$")] = "openrouter",
-) -> AiUsage:
-    """Today's (UTC) spend, tokens and calls of one provider (default OpenRouter) against its
-    daily cap, plus today's total across providers against the shared cap."""
-    limit = settings.external(provider).daily_limit_usd
-    base: UsageTracker | None = getattr(request.app.state, "ai_usage", None)
-    tracker = base.for_provider(provider) if base is not None else None
-    available = True
-    global_spent = None
+async def _rate_limit(request: Request, user_id: uuid.UUID, per_minute: int) -> None:
+    redis = getattr(request.app.state, "redis", None)
+    if redis is None:
+        return
+    key = f"rl:ai:{user_id}:{int(datetime.now(UTC).timestamp()) // 60}"
     try:
-        usage = await tracker.today() if tracker else DailyUsage(utc_today())
-        if tracker is not None:
-            global_spent = Decimal(await tracker.total_today_micro()) / MICRO
-    except Exception:
-        usage, available = DailyUsage(utc_today()), False
-    spent = usage.spent_usd
-    return AiUsage(
-        day=usage.day,
-        spent_usd=spent,
-        limit_usd=limit,
-        remaining_usd=max(limit - spent, 0),
-        prompt_tokens=usage.prompt_tokens,
-        completion_tokens=usage.completion_tokens,
-        calls=usage.calls,
-        failures=usage.failures,
-        cap_reached=limit <= 0 or usage.cost_micro >= to_micro(limit),
-        available=available,
-        provider=provider,
-        global_limit_usd=settings.AI_EXTERNAL_DAILY_LIMIT_USD,
-        global_spent_usd=global_spent,
-    )
+        n = await redis.incr(key)
+        if n == 1:
+            await redis.expire(key, 70)
+    except Exception as exc:  # pragma: no cover - fail open on a Redis outage
+        log.warning("ai_rate_limit_unavailable", error=type(exc).__name__)
+        return
+    if n > per_minute:
+        raise HTTPException(429, {"code": "rate_limited", "message": "too many AI requests"})
 
 
-def _target(
-    body: ChatRequest,
-    conv: Conversation | None,
-    gates: dict[str, ExternalGate],
-    settings: Settings,
-) -> tuple[str, str]:
-    """(provider, model) the user asked for; model "" = the local default."""
-    if body.provider is not None:
-        provider = body.provider
-        model = body.model or (conv.model if conv is not None and conv.provider == provider else "")
-        if provider in gates and not model:
-            model = gates[provider].default_model
-        return provider, model
-    if body.model:
-        for p in EXTERNAL_PROVIDERS:
-            if p == "openrouter" and "/" not in body.model:
-                continue
-            if body.model in settings.external(p).models:
-                return p, body.model
-        return "ollama", body.model
-    if conv is not None:
-        return conv.provider, conv.model
-    # A new conversation: the first *enabled* provider in the chain, usable or not. It is
-    # stored on the conversation, so once the provider is fixed (key, price, budget) later
-    # turns use it; meanwhile the gate's refusal moves on down the chain with its reason
-    # shown, instead of the conversation silently becoming local for good.
-    for name in settings.external_chain(settings.AI_DEFAULT_EXTERNAL_PROVIDER):
-        if name in gates and settings.external(name).enabled:
-            return name, gates[name].default_model
-    return "ollama", ""
+# --- chat -------------------------------------------------------------------------------
+
+
+class ChatIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    conversation_id: uuid.UUID | None = None
+    message: str = Field(min_length=1, max_length=20_000)
+    agent: Literal["investments", "business", "general"] | None = None
+
+
+def _sse(event: str, data: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
 
 
 @router.post(
     "/chat",
-    response_class=ChatStreamingResponse,
-    status_code=200,  # explicit: the streaming class has no status_code default to inspect
+    response_class=StreamingResponse,
     responses={200: {"content": {"text/event-stream": {}}}, 404: {}, 429: {}, 503: {}},
 )
-async def chat(
-    body: ChatRequest,
+async def chat_turn(
+    body: ChatIn,
     request: Request,
-    current: CsrfProtected,
     db: DbSession,
+    current: CsrfProtected,
     settings: SettingsDep,
-) -> Response:
-    num_ctx = body.num_ctx or settings.CHAT_DEFAULT_NUM_CTX
-    if num_ctx > settings.CHAT_MAX_NUM_CTX:
-        raise HTTPException(
-            422,
-            f"num_ctx may not exceed {settings.CHAT_MAX_NUM_CTX}",
-        )
-
-    svc = ConversationService(db, current.user.id)
-    conv: Conversation | None = None
-    history: list[dict[str, str]] = []
+) -> StreamingResponse:
+    gateway = _gateway(request)
+    await _rate_limit(request, current.user.id, settings.AI_CHAT_REQUESTS_PER_MINUTE)
+    existing: Conversation | None = None
     if body.conversation_id is not None:
-        conv = await svc.get(body.conversation_id)
-        if conv is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "conversation not found")
-        history = await svc.history(conv)
-    new = [{"role": m.role, "content": m.content} for m in body.messages]
-    prompt = trim_history(history, settings.CHAT_HISTORY_MAX_MESSAGES) + new
-    context = conv.context if conv is not None else (body.context or "general")
-    if conv is not None and body.context and body.context != "general" and context == "general":
-        context = body.context  # becoming stricter applies to this turn already
-
-    gates = _gates(request, settings)
-    provider, model = _target(body, conv, gates, settings)
-    gate = gates.get(provider)
-    ollama = _ollama(request)
-    paused = bool(request.app.state.agent_paused.get("ollama"))
-    first_provider, first_model = provider, model
-    route_reason: str | None = None
-    remaining: tuple[str, ...] = ()
-
-    if gate is not None:
-        if body.model and not gate.allowed(model):
-            label = PROVIDER_LABELS[provider]
-            return JSONResponse(
-                {
-                    "detail": f"model {model!r} is not an allowed {label} model",
-                    "available": gate.models,
-                },
-                status_code=status.HTTP_404_NOT_FOUND,
-            )
         try:
-            installed: list[str] | None = [m.name for m in await _models_synced(request, db)]
-        except OllamaUnavailable:
-            installed = None
-        local_off = paused or not settings.AI_LOCAL_ENABLED
-        fallback = None if local_off else local_fallback_model(settings, installed)
-        pick = await choose(
-            gates,
-            settings.external_chain(provider),
-            model,
-            prompt,
-            context=context,
-            max_tokens=body.max_tokens,
-        )
-        decision = pick.decision
-        if pick.gate is not None:
-            # Possibly a later provider in the chain; the first one's refusal is the reason.
-            gate, remaining = pick.gate, pick.remaining
-            first_provider, first_model = gate.provider, pick.model
-            route_reason = pick.skipped_reason
-        else:
-            route_reason = decision.reason
-    else:
+            existing = await chat.get_conversation(db, current.user.id, body.conversation_id)
+        except chat.ConversationNotFound as exc:
+            raise HTTPException(404, {"code": exc.code, "message": str(exc)}) from None
+    state = request.app.state
+    maker = state.sessionmaker
+    queue: asyncio.Queue[tuple[str, dict[str, Any]] | None] = asyncio.Queue()
+
+    async def emit(event: str, data: dict[str, Any]) -> None:
+        await queue.put((event, data))
+
+    async def work() -> None:
+        token = await interactive.mark(state.redis, "chat", settings.AI_TIMEOUT_SECONDS * 4)
         try:
-            installed = [m.name for m in await _models_synced(request, db)]
-        except OllamaUnavailable as exc:
-            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, exc.message) from exc
-        if not model:
-            model = local_fallback_model(settings, installed) or ""
-        if model not in installed:
-            return JSONResponse(
-                {"detail": f"model {model!r} is not installed", "available": installed},
-                status_code=status.HTTP_404_NOT_FOUND,
-            )
-        fallback = model
-        decision = Decision(False)
-
-    if gate is not None and not decision.external:
-        if not fallback:
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                f"{PROVIDER_LABELS[provider]} is not used for this turn ({decision.reason}) "
-                + (
-                    "and local models are disabled"
-                    if not settings.AI_LOCAL_ENABLED
-                    else "and no local model is available"
-                ),
-            )
-        first_provider, first_model = "ollama", fallback
-
-    ticket: Ticket | None = None
-    if first_provider == "ollama":
-        if paused:
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE, "the ollama agent is paused by an admin"
-            )
-        limiter: GenerationLimiter = request.app.state.chat_limiter
-        try:
-            ticket = limiter.admit()
-        except QueueFull as exc:
-            raise HTTPException(
-                status.HTTP_429_TOO_MANY_REQUESTS,
-                "generation queue is full",
-                headers={"Retry-After": str(exc.retry_after)},
-            ) from exc
-    try:
-        conv, message_ids = await svc.store_turn(
-            conv, new, model=model, provider=provider, context=context
-        )
-        await db.commit()
-
-        options = chat_options(num_ctx, settings.CHAT_NUM_THREAD)
-        if body.temperature is not None:
-            options["temperature"] = body.temperature
-        if body.max_tokens is not None:
-            options["num_predict"] = body.max_tokens
-        stream = ChatStream(
-            ChatJob(
-                conversation_id=conv.id,
-                user_message_ids=message_ids,
-                model=first_model,
-                prompt=prompt,
-                options=options,
-                provider=first_provider,
-                requested_provider=provider,
-                requested_model=model,
-                fallback_model=fallback,
-                route_reason=route_reason,
-                filter_categories=tuple(decision.categories),
-                context=context,
-                alternates=remaining,
-                temperature=body.temperature,
-                max_tokens=body.max_tokens,
+            agent: AgentName | None = body.agent
+            if agent is None and existing is not None and existing.agent in CHAT_AGENTS:
+                agent = existing.agent
+            if agent is None:
+                agent = await chat.route(gateway, body.message, current.user.id)
+            assert agent is not None
+            conv, history = await chat.start(
+                maker,
                 user_id=current.user.id,
-                client=audit.ClientInfo.from_request(request),
-                reserved_micro=decision.reserved_micro,
-            ),
-            ollama=ollama,
-            maker=request.app.state.sessionmaker,
-            ticket=ticket,
-            timeout=settings.CHAT_TIMEOUT_SECONDS,
-            heartbeat=settings.CHAT_HEARTBEAT_SECONDS,
-            registry=request.app.state.registry,
-            limiter=request.app.state.chat_limiter,
-            external=gate.client if gate is not None else None,
-            usage=getattr(request.app.state, "ai_usage", None),
-            gates=gates,
-        )
-    except BaseException:
-        if ticket is not None:
-            ticket.release()
-        if gate is not None:
-            await gate.release(decision)
-        raise
-    # Image generation yields to a running chat (app/services/interactive.py).
-    redis = request.app.state.redis
-    token = await interactive.mark(redis, "chat", settings.CHAT_TIMEOUT_SECONDS)
-    return ChatStreamingResponse(stream, on_finish=lambda: interactive.clear(redis, token))
+                conversation_id=body.conversation_id,
+                agent=agent,
+                title=body.message.strip().splitlines()[0][:80],
+                model=settings.AI_MODEL_MAIN,
+            )
+            await emit("meta", {"conversation_id": str(conv.id), "agent": agent})
+            ctx = ToolContext(
+                settings=settings,
+                maker=maker,
+                user_id=current.user.id,
+                is_admin=current.user.role.name == ROLE_ADMIN,
+                agent=agent,
+                conversation_id=conv.id,
+                redis=state.redis,
+                adapters=dict(getattr(state, "trading_adapters", {})),
+            )
+            res = await chat.turn(
+                gateway,
+                default_registry(),
+                ctx,
+                conversation=conv,
+                history=history,
+                prompt=body.message,
+                agent=agent,
+                on_event=emit,
+            )
+            await emit(
+                "done",
+                {
+                    "conversation_id": str(res.conversation_id),
+                    "message_id": res.message_id,
+                    "cost_usd": str(res.cost_usd),
+                    "steps": res.steps,
+                    "stop_reason": res.stop_reason,
+                    "approvals": [str(a) for a in res.approvals],
+                },
+            )
+        except (GatewayError, chat.ConversationError) as exc:
+            await emit("error", {"code": exc.code, "message": str(exc)})
+        except Exception as exc:
+            log.error("ai_chat_failed", error=type(exc).__name__)
+            await emit("error", {"code": "ai_error", "message": "the AI request failed"})
+        finally:
+            await interactive.clear(state.redis, token)
+            await queue.put(None)
+
+    task = asyncio.create_task(work(), name="ai-chat-turn")
+    _RUNNING.add(task)  # keeps running (and saving) if the client goes away
+    task.add_done_callback(_RUNNING.discard)
+
+    async def events() -> AsyncIterator[str]:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), PING_SECONDS)
+            except TimeoutError:
+                yield ": ping\n\n"
+                continue
+            if item is None:
+                return
+            yield _sse(*item)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# --- conversations ----------------------------------------------------------------------
+
+
+class ConversationOut(BaseModel):
+    id: uuid.UUID
+    title: str
+    agent: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class MessageOut(BaseModel):
+    id: int
+    role: str
+    content: str
+    created_at: datetime
+    cost_usd: Decimal | None
+
+
+class ConversationDetail(ConversationOut):
+    messages: list[MessageOut]
 
 
 def _conv_out(c: Conversation) -> ConversationOut:
     return ConversationOut(
-        id=c.id,
-        title=c.title,
-        model=c.model,
-        provider=c.provider or "ollama",
-        context=c.context or "general",
-        created_at=c.created_at,
-        updated_at=c.updated_at,
+        id=c.id, title=c.title, agent=c.agent, created_at=c.created_at, updated_at=c.updated_at
     )
 
 
-@router.get("/conversations", response_model=ConversationPage)
+@router.get("/conversations", response_model=Page[ConversationOut])
 async def list_conversations(
     db: DbSession,
     current: Current,
-    limit: Annotated[int, Query(ge=1, le=100)] = 20,
-    offset: Annotated[int, Query(ge=0)] = 0,
-) -> ConversationPage:
-    items, total = await ConversationService(db, current.user.id).page(limit, offset)
-    return ConversationPage(
-        items=[_conv_out(c) for c in items], total=total, limit=limit, offset=offset
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> Page[ConversationOut]:
+    mine = Conversation.user_id == current.user.id
+    total = await db.scalar(select(func.count()).select_from(Conversation).where(mine))
+    rows = (
+        await db.scalars(
+            select(Conversation)
+            .where(mine)
+            .order_by(Conversation.updated_at.desc(), Conversation.id)
+            .limit(limit)
+            .offset(offset)
+        )
+    ).all()
+    return Page(
+        items=[_conv_out(c) for c in rows], total=int(total or 0), limit=limit, offset=offset
     )
 
 
@@ -514,11 +260,11 @@ async def list_conversations(
 async def get_conversation(
     conversation_id: uuid.UUID, db: DbSession, current: Current
 ) -> ConversationDetail:
-    svc = ConversationService(db, current.user.id)
-    conv = await svc.get(conversation_id)
-    if conv is None:  # someone else's id looks exactly like a missing one
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "conversation not found")
-    msgs = await svc.messages(conv.id)
+    try:
+        conv = await chat.get_conversation(db, current.user.id, conversation_id)
+    except chat.ConversationNotFound as exc:
+        raise HTTPException(404, {"code": exc.code, "message": str(exc)}) from None
+    rows: list[Message] = await chat.messages_of(db, conv.id)
     return ConversationDetail(
         **_conv_out(conv).model_dump(),
         messages=[
@@ -526,26 +272,170 @@ async def get_conversation(
                 id=m.id,
                 role=m.role,
                 content=m.content,
-                model=m.model,
-                status=m.status,
-                error=m.error,
-                prompt_tokens=m.prompt_tokens,
-                completion_tokens=m.completion_tokens,
-                duration_ms=m.duration_ms,
                 created_at=m.created_at,
-                provider=m.provider,
-                fallback_reason=m.fallback_reason,
                 cost_usd=m.cost_usd,
             )
-            for m in msgs
+            for m in rows
+            if chat.visible(m)
         ],
     )
 
 
-@router.delete("/conversations/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_conversation(
-    conversation_id: uuid.UUID, db: DbSession, current: CsrfProtected
-) -> None:
-    if not await ConversationService(db, current.user.id).delete(conversation_id):
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "conversation not found")
+# --- approvals --------------------------------------------------------------------------
+
+
+class ApprovalOut(BaseModel):
+    id: uuid.UUID
+    agent: str
+    action: str
+    summary: str
+    payload: dict[str, Any]
+    status: str
+    conversation_id: uuid.UUID | None
+    created_at: datetime
+    expires_at: datetime
+    decided_at: datetime | None
+    result: dict[str, Any] | None
+    error: str | None
+
+
+class DecisionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["approve", "reject"]
+    password: str | None = Field(default=None, max_length=1024)
+
+
+def _approval_out(a: Approval) -> ApprovalOut:
+    return ApprovalOut(
+        id=a.id,
+        agent=a.agent,
+        action=a.action,
+        summary=a.summary,
+        payload=a.payload,
+        status=a.status,
+        conversation_id=a.conversation_id,
+        created_at=a.created_at,
+        expires_at=a.expires_at,
+        decided_at=a.decided_at,
+        result=a.result,
+        error=a.error,
+    )
+
+
+@router.get("/approvals", response_model=list[ApprovalOut])
+async def list_approvals(
+    db: DbSession,
+    _: AdminRequired,
+    status: Literal["pending", "approved", "rejected", "executed", "failed", "expired"]
+    | None = "pending",
+    limit: int = Query(50, ge=1, le=200),
+) -> list[ApprovalOut]:
+    await approvals.expire(db)
     await db.commit()
+    q = select(Approval).order_by(Approval.created_at.desc()).limit(limit)
+    if status is not None:
+        q = q.where(Approval.status == status)
+    return [_approval_out(a) for a in (await db.scalars(q)).all()]
+
+
+@router.post("/approvals/{approval_id}", response_model=ApprovalOut)
+async def decide_approval(
+    approval_id: uuid.UUID,
+    body: DecisionIn,
+    request: Request,
+    db: DbSession,
+    admin: AdminRequired,
+    settings: SettingsDep,
+) -> ApprovalOut:
+    if body.action == "approve":
+        ok = bool(body.password) and await asyncio.to_thread(
+            verify_password, admin.user.password_hash, body.password or ""
+        )
+        if not ok:
+            raise HTTPException(
+                403, {"code": "reauth_failed", "message": "password re-authentication failed"}
+            )
+    state = request.app.state
+    deps = approvals.ExecDeps(
+        settings=settings,
+        redis=getattr(state, "redis", None),
+        adapters=dict(getattr(state, "trading_adapters", {})),
+    )
+    try:
+        row = await approvals.decide(
+            state.sessionmaker, deps, approval_id, admin.user.id, body.action
+        )
+    except approvals.ApprovalError as exc:
+        raise HTTPException(exc.status, {"code": exc.code, "message": str(exc)}) from None
+    audit.record(
+        db,
+        "ai_approval_decided",
+        audit.ClientInfo.from_request(request),
+        actor_user_id=admin.user.id,
+        details={"approval_id": str(row.id), "action": row.action, "status": row.status},
+    )
+    await db.commit()
+    return _approval_out(row)
+
+
+# --- usage ------------------------------------------------------------------------------
+
+
+class BudgetOut(BaseModel):
+    budget: str
+    spent_usd: Decimal
+    limit_usd: Decimal
+    remaining_usd: Decimal
+
+
+class UsageOut(BaseModel):
+    month_start: datetime
+    resets_at: datetime
+    spent_usd: Decimal
+    limit_usd: Decimal
+    remaining_usd: Decimal
+    calls: int
+    budgets: list[BudgetOut]
+    configured: bool
+
+
+@router.get("/usage", response_model=UsageOut)
+async def usage(
+    request: Request, db: DbSession, _: AdminRequired, settings: SettingsDep
+) -> UsageOut:
+    start = month_start()
+    rows = (
+        await db.execute(
+            select(Usage.budget, func.coalesce(func.sum(Usage.cost_usd), 0), func.count())
+            .where(Usage.at >= start)
+            .group_by(Usage.budget)
+        )
+    ).all()
+    spent = {b: Decimal(v) for b, v, _n in rows}
+    calls = sum(int(n) for _b, _v, n in rows)
+    total = sum(spent.values(), Decimal(0))
+    cap = settings.AI_MONTHLY_BUDGET_USD
+    budgets = [
+        BudgetOut(
+            budget=b,
+            spent_usd=spent.get(b, Decimal(0)),
+            limit_usd=lim,
+            remaining_usd=max(lim - spent.get(b, Decimal(0)), Decimal(0)),
+        )
+        for b, lim in settings.AI_AGENT_BUDGETS_USD.items()
+    ]
+    gw = getattr(request.app.state, "ai", None)
+    return UsageOut(
+        month_start=start,
+        resets_at=next_month_start(),
+        spent_usd=total,
+        limit_usd=cap,
+        remaining_usd=max(cap - total, Decimal(0)),
+        calls=calls,
+        budgets=budgets,
+        configured=bool(gw is not None and gw.configured),
+    )
+
+
+__all__ = ["router"]

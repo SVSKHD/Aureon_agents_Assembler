@@ -1,8 +1,8 @@
 """POST /api/v1/voice/intent: a transcript -> a navigation intent (docs/23-approval-engine.md).
 
 Admin only (with CSRF). Navigation only: the answer is `{intent, route, params, source, note}`
-and nothing is read or written besides an optional local Ollama call. It never approves,
-denies, merges or executes anything, whatever the words.
+and nothing is read or written besides an optional small Claude call (AI_MODEL_ROUTER).
+It never approves, denies, merges or executes anything, whatever the words.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.ai.voice import ClaudeVoiceClient
 from app.api.ui import ui_module
 from app.auth.deps import AdminRequired, SettingsDep
 from app.core.logging import get_logger
@@ -32,7 +33,7 @@ class VoiceOut(BaseModel):
     intent: str
     route: str | None
     params: dict[str, str]
-    source: Literal["grammar", "ollama", "none"]
+    source: Literal["grammar", "model", "none"]
     note: str | None
 
 
@@ -40,11 +41,11 @@ class VoiceOut(BaseModel):
 async def voice_intent(
     _admin: AdminRequired, request: Request, settings: SettingsDep, body: VoiceIn
 ) -> VoiceOut:
-    ollama: Any = (
-        getattr(request.app.state, "ollama", None)
-        if settings.VOICE_OLLAMA_MODEL and settings.AI_LOCAL_ENABLED
-        else None
+    gateway = getattr(request.app.state, "ai", None)
+    model = settings.AI_MODEL_ROUTER.strip()
+    client: Any = (
+        ClaudeVoiceClient(gateway) if gateway is not None and gateway.configured and model else None
     )
-    result = await voice.resolve(body.transcript, ollama=ollama, model=settings.VOICE_OLLAMA_MODEL)
+    result = await voice.resolve(body.transcript, client=client, model=model or None)
     log.info("voice_intent", intent=result.intent, source=result.source)  # never the text
     return VoiceOut(**result.as_dict())

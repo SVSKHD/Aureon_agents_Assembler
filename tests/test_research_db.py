@@ -9,7 +9,6 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-import httpx
 import pytest
 import respx
 from asgi_lifespan import LifespanManager
@@ -19,10 +18,11 @@ from redis.asyncio import Redis
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.agents.ollama.client import OllamaClient
 from app.agents.research import ai
 from app.agents.trading.base import BrokerAdapter
 from app.agents.trading.types import AdapterHealth, Candle, Timeframe, utc_now
+from app.ai.budget import MemoryUsageStore
+from app.ai.gateway import ClaudeGateway
 from app.auth.bootstrap import bootstrap_admin
 from app.core.config import Settings
 from app.main import create_app
@@ -44,6 +44,7 @@ from app.models.trading import (
 from app.services import research
 from app.workers.research import MARKET_DATA, RISK, SIGNAL, TECHNICAL, ResearchWorker
 from tests.conftest import TEST_REDIS_URL
+from tests.fake_claude import FakeClaude, text_reply
 
 pytestmark = pytest.mark.db
 PASSWORD = "correct horse battery staple"
@@ -154,7 +155,11 @@ async def env(db_clean: str, settings: Settings) -> AsyncIterator[Env]:
 
     await clean()
     s = Settings.model_validate(
-        {**settings.model_dump(), "DATABASE_URL": db_clean, "RESEARCH_AI_MODEL": "llama3:8b"}
+        {
+            **settings.model_dump(),
+            "DATABASE_URL": db_clean,
+            "ANTHROPIC_API_KEY": "sk-ant-test-xxxxxxxxxxxxxxxxxxxxxxxx",
+        }
     )
     e = Env(maker, s)
     admin = await bootstrap_admin(maker, "admin@spasta.online", PASSWORD)
@@ -483,27 +488,21 @@ async def test_backtest_and_explanations_via_api(env: Env) -> None:
         )
         assert ind.status_code == 200
 
-        # AI explanation: queued, then the agent writes ai_analyses (Ollama mocked).
+        # AI explanation: queued, then the agent writes ai_analyses (Claude faked).
         q = await c.post(f"/api/trading/backtests/{ids[0]}/explain", headers=h)
         assert q.status_code == 202 and q.json()["position"] == 1
-        chunks = [
-            {"message": {"content": "Mixed results with modest edge.\n"}, "done": False},
-            {"message": {"content": "Costs matter; no news was considered."}, "done": True},
-        ]
-        respx.post(f"{OLLAMA}/api/chat").mock(
-            return_value=httpx.Response(
-                200, content="\n".join(json.dumps(x) for x in chunks).encode()
-            )
+        fake = FakeClaude(
+            [text_reply("Mixed results with modest edge.\nCosts matter; no news was considered.")]
         )
         got = await redis.brpop([ai.QUEUE_KEY], timeout=1)
         assert got
         req = json.loads(got[1])
-        ollama = OllamaClient(OLLAMA, connect_timeout=1, read_timeout=5, cache_ttl=0)
-        aid = await ai.explain(env.maker, ollama, "llama3:8b", req["kind"], req["id"], limit_s=10)
-        await ollama.aclose()
+        gateway = ClaudeGateway(env.settings, MemoryUsageStore(), client=fake)
+        aid = await ai.explain(env.maker, gateway, req["kind"], req["id"])
         assert aid is not None
-        sent = json.loads(respx.calls.last.request.content)
-        assert sent["model"] == "llama3:8b" and "never invent" in sent["messages"][0]["content"]
+        sent = fake.calls[-1]
+        assert sent["model"] == "claude-opus-5-5"
+        assert "never invent" in sent["system"][0]["text"]
         lst = (await c.get("/api/trading/ai-analyses", params={"backtest_run_id": ids[0]})).json()
         assert lst[0]["summary"] == "Mixed results with modest edge."
 
@@ -525,7 +524,7 @@ async def test_backtest_and_explanations_via_api(env: Env) -> None:
 
 
 async def test_explain_needs_a_model(env: Env, settings: Settings) -> None:
-    s = Settings.model_validate({**env.settings.model_dump(), "RESEARCH_AI_MODEL": None})
+    s = Settings.model_validate({**env.settings.model_dump(), "ANTHROPIC_API_KEY": None})
     app: FastAPI = create_app(s)
     async with (
         LifespanManager(app) as mgr,

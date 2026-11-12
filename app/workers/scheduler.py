@@ -31,7 +31,6 @@ from sqlalchemy import delete, exists, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.agents.ollama.client import OllamaClient
 from app.agents.registry import GITHUB, SCHEDULER, AgentRegistry, Heartbeat
 from app.agents.trading.base import BrokerAdapter
 from app.agents.trading.dhan import build_dhan_adapter
@@ -39,6 +38,7 @@ from app.agents.trading.dhan.adapter import DhanAdapter
 from app.agents.trading.mt5 import build_mt5_adapter
 from app.agents.trading.mt5.adapter import MT5Adapter
 from app.agents.trading.types import Timeframe
+from app.ai.gateway import ClaudeGateway
 from app.core.config import Settings
 from app.core.logging import configure_logging, get_logger
 from app.db.session import build_engine, build_sessionmaker
@@ -78,7 +78,8 @@ MAX_BACKOFF_SECONDS = 3600
 class TaskContext:
     settings: Settings
     maker: async_sessionmaker[AsyncSession]
-    ollama: OllamaClient | None
+    # The Claude gateway (app/ai/gateway.py) for the scheduled reports; None in most tests.
+    ai: Any | None
     dhan: DhanAdapter | None = None
     mt5: MT5Adapter | None = None
     redis: Redis | None = None
@@ -130,17 +131,20 @@ async def purge_expired_sessions(ctx: TaskContext) -> dict[str, Any]:
     return {"sessions_deleted": res.rowcount}  # type: ignore[attr-defined]
 
 
-async def refresh_model_inventory(ctx: TaskContext) -> dict[str, Any]:
-    from app.services.chat import sync_inventory
+async def ai_daily_report(ctx: TaskContext) -> dict[str, Any]:
+    from app.ai.reports import run_report
 
-    if not ctx.settings.AI_LOCAL_ENABLED:
-        return {"skipped": "local models are disabled"}
-    if ctx.ollama is None:
-        raise RuntimeError("Ollama client not configured")
-    models = await ctx.ollama.list_models(force=True)
-    async with ctx.maker() as db, db.begin():
-        await sync_inventory(db, models)
-    return {"models": len(models)}
+    if ctx.ai is None:
+        raise RuntimeError("Claude gateway not configured")
+    return await run_report(ctx.ai, ctx.maker, ctx.settings, "daily")
+
+
+async def ai_weekly_review(ctx: TaskContext) -> dict[str, Any]:
+    from app.ai.reports import run_report
+
+    if ctx.ai is None:
+        raise RuntimeError("Claude gateway not configured")
+    return await run_report(ctx.ai, ctx.maker, ctx.settings, "weekly")
 
 
 def _dhan(ctx: TaskContext) -> DhanAdapter:
@@ -478,7 +482,8 @@ async def aureon_verify(ctx: TaskContext) -> dict[str, Any]:
 TASKS: dict[str, TaskFn] = {
     "purge_agent_history": purge_agent_history,
     "purge_expired_sessions": purge_expired_sessions,
-    "refresh_model_inventory": refresh_model_inventory,
+    "ai_daily_report": ai_daily_report,
+    "ai_weekly_review": ai_weekly_review,
     "dhan_refresh_instruments": dhan_refresh_instruments,
     "dhan_reconcile": dhan_reconcile,
     "dhan_backfill_candles": dhan_backfill_candles,
@@ -509,15 +514,24 @@ TASKS: dict[str, TaskFn] = {
 DEFAULT_JOBS: list[tuple[str, str, str]] = [
     ("purge-agent-history", "purge_agent_history", "17 3 * * *"),
     ("purge-expired-sessions", "purge_expired_sessions", "29 3 * * *"),
-    ("refresh-model-inventory", "refresh_model_inventory", "*/30 * * * *"),
     ("paper-process", "paper_process", "* * * * *"),
     ("paper-reconcile", "paper_reconcile", "*/15 * * * *"),
 ]
 
 
+# Jobs of removed features: paused on startup so an old row never fails every run.
+RETIRED_JOBS = ("refresh-model-inventory",)  # Ollama model inventory (Claude-only AI, docs/26)
+AI_REPORT_TIMEOUT_SECONDS = 1200
+
+
 def default_jobs(settings: Settings) -> list[tuple[str, str, str]]:
-    """Built-in jobs, plus the Dhan / MT5 jobs when those are configured."""
+    """Built-in jobs, plus the Dhan / MT5 / AI jobs when those are configured."""
     jobs = list(DEFAULT_JOBS)
+    if settings.anthropic_key:
+        if settings.AI_DAILY_REPORT_CRON:
+            jobs.append(("ai-daily-report", "ai_daily_report", settings.AI_DAILY_REPORT_CRON))
+        if settings.AI_WEEKLY_REVIEW_CRON:
+            jobs.append(("ai-weekly-review", "ai_weekly_review", settings.AI_WEEKLY_REVIEW_CRON))
     jobs.append(("approval-expire", "approval_expire", settings.APPROVALS_EXPIRE_CRON))
     if settings.INCIDENT_SCAN_CRON:
         jobs.append(("incident-scan", "incident_scan", settings.INCIDENT_SCAN_CRON))
@@ -591,7 +605,7 @@ class Scheduler:
         settings: Settings,
         maker: async_sessionmaker[AsyncSession],
         tasks: dict[str, TaskFn] | None = None,
-        ollama: OllamaClient | None = None,
+        ai: Any | None = None,
         dhan: DhanAdapter | None = None,
         mt5: MT5Adapter | None = None,
         redis: Redis | None = None,
@@ -602,7 +616,7 @@ class Scheduler:
         self.maker = maker
         self.tasks = TASKS if tasks is None else tasks
         self.registry = AgentRegistry(maker)
-        self.ctx = TaskContext(settings, maker, ollama, dhan, mt5, redis, github, http)
+        self.ctx = TaskContext(settings, maker, ai, dhan, mt5, redis, github, http)
         self.paused = False
         self.running_job: str | None = None
 
@@ -621,6 +635,20 @@ class Scheduler:
                     )
                     .on_conflict_do_nothing(index_elements=[ScheduledJob.id])
                 )
+            await db.execute(
+                update(ScheduledJob)
+                .where(ScheduledJob.id.in_(RETIRED_JOBS), ScheduledJob.paused.is_(False))
+                .values(paused=True)
+            )
+            # A report is up to AI_MAX_STEPS Claude calls: give it more than the default 300 s.
+            await db.execute(
+                update(ScheduledJob)
+                .where(
+                    ScheduledJob.id.in_(("ai-daily-report", "ai-weekly-review")),
+                    ScheduledJob.timeout_seconds < AI_REPORT_TIMEOUT_SECONDS,
+                )
+                .values(timeout_seconds=AI_REPORT_TIMEOUT_SECONDS)
+            )
             await self._prepare_instrument_refresh(db, now)
 
     async def _prepare_instrument_refresh(self, db: Any, now: datetime) -> None:
@@ -768,19 +796,14 @@ async def main() -> int:
     configure_logging(settings.LOG_LEVEL)
     engine = build_engine(settings)
     maker = build_sessionmaker(engine)
-    ollama = OllamaClient(
-        settings.OLLAMA_BASE_URL,
-        connect_timeout=settings.OLLAMA_CONNECT_TIMEOUT,
-        read_timeout=60,
-        cache_ttl=0,
-    )
+    gateway = ClaudeGateway.build(settings, maker)
     redis = Redis.from_url(settings.REDIS_URL)
     dhan = build_dhan_adapter(settings, redis, maker)
     mt5 = build_mt5_adapter(settings)
     gh_client = build_github_client(settings)
     http = httpx.AsyncClient(timeout=10.0)
     scheduler = Scheduler(
-        settings, maker, ollama=ollama, dhan=dhan, mt5=mt5, redis=redis, github=gh_client,
+        settings, maker, ai=gateway, dhan=dhan, mt5=mt5, redis=redis, github=gh_client,
         http=http,
     )  # fmt: skip
     stopping = asyncio.Event()
@@ -789,7 +812,11 @@ async def main() -> int:
         loop.add_signal_handler(sig, stopping.set)
     # A change to its keys from Spasta re-execs this worker (docs/settings.md).
     app_settings.start_worker_watch(
-        settings, maker, stopping, ("DHAN_", "GITHUB_", "DISCORD_", "MT5_", "AI_LOCAL_"), redis
+        settings,
+        maker,
+        stopping,
+        ("DHAN_", "GITHUB_", "DISCORD_", "MT5_", "ANTHROPIC_", "AI_"),
+        redis,
     )
 
     def state() -> tuple[str, dict[str, Any]]:
@@ -812,7 +839,7 @@ async def main() -> int:
         await scheduler.serve(stopping)
     finally:
         await hb.stop()
-        await ollama.aclose()
+        await gateway.aclose()
         if dhan is not None:
             await dhan.aclose()
         if mt5 is not None:

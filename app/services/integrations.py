@@ -2,14 +2,14 @@
 
 One summary of every external piece Aureon depends on, for an admin:
 
-| section        | source (nothing here writes, and only Ollama/Claude are probed live)      |
+| section        | source (nothing here writes; only the Claude CLI is probed live)          |
 |----------------|----------------------------------------------------------------------------|
 | mt5            | agents.agents `mt5-bot` heartbeat (= the bot export's generated_at)        |
 | dhan           | settings + `dhan-feed` agent + the `dhan-reconcile` job's last status      |
 | github         | settings + the `github` agent (written by the github_sync task)            |
 | webhook_worker | webhook secret + the `github-webhooks` agent + pending/failed deliveries   |
 | claude_cli     | the cached availability check (`claude --version`, only when enabled)       |
-| ollama         | GET /api/tags (cached) and whether every configured model is installed     |
+| claude         | the Claude API settings and this month's spend from ai.usage (no call)     |
 | discord        | whether DISCORD_WEBHOOK_URL is set (never its value)                       |
 | database       | the connected role: a superuser means the scoped roles are not in use     |
 | backups        | the backup status file written by scripts/ops/backup.sh                    |
@@ -32,7 +32,6 @@ from redis.asyncio import Redis
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.agents.ollama.client import OllamaClient
 from app.agents.registry import effective_state
 from app.core.config import Settings
 from app.integrations.claude_cli import ClaudeCLI
@@ -121,7 +120,6 @@ class IntegrationsSummary:
         self,
         settings: Settings,
         maker: async_sessionmaker[AsyncSession],
-        ollama: OllamaClient | None,
         claude: ClaudeCLI | None,
         *,
         now: datetime | None = None,
@@ -129,7 +127,6 @@ class IntegrationsSummary:
     ) -> None:
         self.settings = settings
         self.maker = maker
-        self.ollama = ollama
         self.claude = claude
         self.now = now or datetime.now(UTC)
         self.redis = redis
@@ -270,59 +267,22 @@ class IntegrationsSummary:
             "status": "ok" if a.available else "down",
         }
 
-    async def ollama_models(self) -> Section:
-        s = self.settings
-        wanted = {
-            "CODE_MODEL": s.CODE_MODEL,
-            "REPAIR_MODEL": s.REPAIR_MODEL,
-            "RESEARCH_AI_MODEL": s.RESEARCH_AI_MODEL,
-            "VOICE_OLLAMA_MODEL": s.VOICE_OLLAMA_MODEL,
-        }
-        if self.ollama is None:
-            return {"status": "down", "error": "no client"}
-        models = await self.ollama.list_models()
-        names = sorted(m.name for m in models)
-        have = set(names) | {n.removesuffix(":latest") for n in names}
-        missing = {k: v for k, v in wanted.items() if v and v not in have}
-        return {
-            "reachable": True,
-            "models": names,
-            "configured_models": {k: v for k, v in wanted.items() if v},
-            "missing": missing,
-            "max_concurrent": s.OLLAMA_MAX_CONCURRENT,
-            "status": "degraded" if missing or not names else "ok",
-        }
+    async def claude_api(self) -> Section:
+        """The Claude API (docs/26) from settings and ai.usage only: no call, no tokens."""
+        from app.ai.budget import PgUsageStore
 
-    async def ai_providers(self) -> Section:
-        """External AI providers from settings only (docs/26): no call is made, so the card
-        never spends tokens. The live check is /settings → <provider> → Test."""
         s = self.settings
-        providers: dict[str, Any] = {}
-        degraded = False
-        for p in ("openrouter", "anthropic", "gemini"):
-            cfg = s.external(p)
-            reason = s.external_unusable_reason(p)
-            unpriced = bool(cfg.default_model) and not cfg.priced(cfg.default_model)
-            providers[p] = {
-                "enabled": cfg.enabled,
-                "configured": bool(cfg.api_key),
-                "usable": reason is None and not unpriced,
-                "reason": reason or ("no_pricing" if unpriced else None),
-                "default_model": cfg.default_model or None,
-                "daily_limit_usd": str(cfg.daily_limit_usd),
-            }
-            degraded = degraded or (cfg.enabled and (reason is not None or unpriced))
-        any_on = any(v["enabled"] for v in providers.values())
+        if not s.anthropic_key:
+            return {"configured": False, "status": "not_configured"}
+        spend = await PgUsageStore(self.maker).spend()
+        cap = s.AI_MONTHLY_BUDGET_USD
         return {
-            "providers": providers,
-            "default_external_provider": s.AI_DEFAULT_EXTERNAL_PROVIDER,
-            "global_daily_limit_usd": (
-                str(s.AI_EXTERNAL_DAILY_LIMIT_USD)
-                if s.AI_EXTERNAL_DAILY_LIMIT_USD is not None
-                else None
-            ),
-            "local_default": True,
-            "status": "degraded" if degraded else ("ok" if any_on else "disabled"),
+            "configured": True,
+            "model_main": s.AI_MODEL_MAIN,
+            "model_router": s.AI_MODEL_ROUTER or None,
+            "month_spent_usd": str(spend.total),
+            "monthly_budget_usd": str(cap),
+            "status": "degraded" if spend.total >= cap else "ok",
         }
 
     async def discord(self) -> Section:
@@ -368,8 +328,7 @@ class IntegrationsSummary:
             ("github", self.github),
             ("webhook_worker", self.webhook_worker),
             ("claude_cli", self.claude_cli),
-            ("ollama", self.ollama_models),
-            ("ai_providers", self.ai_providers),
+            ("claude", self.claude_api),
             ("discord", self.discord),
             ("database", self.database),
             ("backups", self.backups),

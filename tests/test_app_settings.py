@@ -17,7 +17,7 @@ from app.integrations.claude_cli import DENIED_ENV_PREFIXES
 from app.services import app_settings as svc
 
 GH = "ghp_" + "A1b2C3d4E5f6G7h8I9j0" * 2
-OR_KEY = "sk-or-v1-" + "f" * 40
+AN_KEY = "sk-ant-api03-" + "f" * 40
 DISCORD = "https://discord.com/api/webhooks/123456/abcDEF_secret-token"
 
 
@@ -50,7 +50,8 @@ def test_secrets_and_credential_urls_need_reauth() -> None:
     for spec in svc.REGISTRY.values():
         if spec.secret or spec.kind == "url":
             assert spec.reauth, spec.key
-    assert not svc.REGISTRY["OPENROUTER_DEFAULT_MODEL"].reauth
+    assert not svc.REGISTRY["AI_MODEL_MAIN"].reauth
+    assert svc.REGISTRY["ANTHROPIC_API_KEY"].reauth
 
 
 # --- encryption ---------------------------------------------------------------------------
@@ -84,9 +85,9 @@ def test_missing_or_bad_master_key_refuses(key: str | None) -> None:
 @pytest.mark.parametrize(
     ("key", "raw", "want"),
     [
-        ("OPENROUTER_ENABLED", " Yes ", "true"),
-        ("OPENROUTER_DAILY_LIMIT_USD", "2.50", "2.50"),
-        ("OPENROUTER_ALLOWED_MODELS", " a/b , c/d ,", "a/b,c/d"),
+        ("AGENT_IMAGE_ENABLED", " Yes ", "true"),
+        ("AI_MONTHLY_BUDGET_USD", "2.50", "2.50"),
+        ("DHAN_INSTRUMENT_SEGMENTS", " NSE_EQ , IDX_I ,", "NSE_EQ,IDX_I"),
         ("GITHUB_CODING_REPO_ALLOWLIST", '[" o/r "]', '["o/r"]'),
         ("GITHUB_CODING_REPO_ALLOWLIST", "", "[]"),
         ("DHAN_BASE_URL", "https://api.dhan.co/v2", "https://api.dhan.co/v2"),
@@ -101,9 +102,9 @@ def test_normalize(key: str, raw: str, want: str) -> None:
 @pytest.mark.parametrize(
     ("key", "raw"),
     [
-        ("OPENROUTER_ENABLED", "maybe"),
-        ("OPENROUTER_DAILY_LIMIT_USD", "-1"),
-        ("OPENROUTER_DAILY_LIMIT_USD", "NaN"),
+        ("AGENT_IMAGE_ENABLED", "maybe"),
+        ("AI_MONTHLY_BUDGET_USD", "-1"),
+        ("AI_MONTHLY_BUDGET_USD", "NaN"),
         ("DHAN_BASE_URL", "http://evil.example/v2"),
         ("DHAN_FEED_QUEUE_MAX", "1.5"),
         ("GITHUB_CODING_REPO_ALLOWLIST", "o/r"),
@@ -124,20 +125,21 @@ def test_overlay_db_wins_and_parses_like_env(env: Settings) -> None:
         base,
         {
             "GITHUB_TOKEN": GH,
-            "OPENROUTER_API_KEY": OR_KEY,
-            "OPENROUTER_ENABLED": "true",
-            "OPENROUTER_ALLOWED_MODELS": "a/b,c/d",
+            "ANTHROPIC_API_KEY": AN_KEY,
+            "AGENT_IMAGE_ENABLED": "false",
+            "AI_AGENT_BUDGETS_USD": '{"chat": 5}',
             "GITHUB_CODING_REPO_ALLOWLIST": '["o/r"]',
-            "OPENROUTER_DAILY_LIMIT_USD": "2.5",
+            "AI_MONTHLY_BUDGET_USD": "2.5",
         },
     )
     assert out.GITHUB_TOKEN is not None and out.GITHUB_TOKEN.get_secret_value() == GH
-    assert out.OPENROUTER_API_KEY is not None
-    assert out.OPENROUTER_API_KEY.get_secret_value() == OR_KEY
-    assert out.OPENROUTER_ENABLED is True
-    assert out.OPENROUTER_ALLOWED_MODELS == ["a/b", "c/d"]
+    assert out.ANTHROPIC_API_KEY is not None
+    assert out.ANTHROPIC_API_KEY.get_secret_value() == AN_KEY
+    assert out.AGENT_IMAGE_ENABLED is False
+    assert str(out.AI_AGENT_BUDGETS_USD["chat"]) == "5"
+    assert str(out.AI_AGENT_BUDGETS_USD["investments"]) == "40"  # defaults kept
     assert out.GITHUB_CODING_REPO_ALLOWLIST == ["o/r"]
-    assert str(out.OPENROUTER_DAILY_LIMIT_USD) == "2.5"
+    assert str(out.AI_MONTHLY_BUDGET_USD) == "2.5"
     # Untouched fields, including bootstrap ones, are the env's.
     assert out.SECRET_KEY.get_secret_value() == base.SECRET_KEY.get_secret_value()
     assert out.DATABASE_URL.get_secret_value() == base.DATABASE_URL.get_secret_value()
@@ -173,7 +175,7 @@ def test_dhan_token_expiry_reads_the_jwt_exp() -> None:
 
 
 def test_changed_keys(env: Settings) -> None:
-    new = svc.overlay(env, {"GITHUB_TOKEN": GH, "OPENROUTER_DEFAULT_MODEL": "x/y"})
+    new = svc.overlay(env, {"GITHUB_TOKEN": GH, "AI_MODEL_MAIN": "claude-sonnet-5-5"})
     assert svc.changed_keys(env, new, ("GITHUB_",)) == ["GITHUB_TOKEN"]
     assert svc.changed_keys(env, new, ("DHAN_",)) == []
 
@@ -236,17 +238,35 @@ async def test_github_test_ok_and_rejected_never_echo_the_token(env: Settings) -
     assert not out.ok and GH not in out.detail
 
 
-async def test_openrouter_test_checks_key_and_default_model(env: Settings) -> None:
-    s = svc.overlay(env, {"OPENROUTER_API_KEY": OR_KEY, "OPENROUTER_DEFAULT_MODEL": "a/b"})
+async def test_ai_test_lists_models_and_checks_prices(
+    env: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.ai import gateway as gw_mod
+    from app.ai.budget import MemoryUsageStore
+    from tests.fake_claude import FakeClaude
 
-    def handler(req: httpx.Request) -> httpx.Response:
-        if req.url.path.endswith("/key"):
-            return httpx.Response(200, json={"data": {}})
-        return httpx.Response(200, json={"data": [{"id": "x/y"}]})
+    real = gw_mod.ClaudeGateway
 
-    async with _client(httpx.MockTransport(handler)) as http:
-        out = await svc.run_test("openrouter", s, http)
-    assert not out.ok and "not an OpenRouter model" in out.detail and OR_KEY not in out.detail
+    def factory(models: list[str]) -> object:
+        def build(settings: Settings, store: object) -> object:
+            return real(settings, MemoryUsageStore(), client=FakeClaude(models=models))
+
+        return build
+
+    s = svc.overlay(env, {"ANTHROPIC_API_KEY": AN_KEY})
+    async with _client(httpx.MockTransport(lambda r: httpx.Response(500))) as http:
+        monkeypatch.setattr(
+            gw_mod, "ClaudeGateway", factory(["claude-opus-5-5", "claude-haiku-5-5"])
+        )
+        out = await svc.run_test("ai", s, http)
+        assert out.ok and AN_KEY not in out.detail
+        monkeypatch.setattr(gw_mod, "ClaudeGateway", factory(["claude-opus-5-5"]))
+        out = await svc.run_test("ai", s, http)
+        assert not out.ok and "AI_MODEL_ROUTER" in out.detail
+        unpriced = svc.overlay(env, {"ANTHROPIC_API_KEY": AN_KEY, "AI_MODEL_MAIN": "claude-x"})
+        monkeypatch.setattr(gw_mod, "ClaudeGateway", factory(["claude-x", "claude-haiku-5-5"]))
+        out = await svc.run_test("ai", unpriced, http)
+        assert not out.ok and "no price" in out.detail
 
 
 async def test_dhan_and_discord_tests(env: Settings) -> None:
@@ -274,21 +294,9 @@ async def test_unset_credentials_fail_without_a_request(env: Settings) -> None:
         raise AssertionError("no request expected")
 
     async with _client(httpx.MockTransport(boom)) as http:
-        # "agents" holds no credential: its test only asks Ollama which models are installed.
-        for category in (c for c in svc.CATEGORIES if c != "agents"):
+        # "agents" holds no credential and has no connection test.
+        for category in svc.CATEGORIES:
             assert not (await svc.run_test(category, env, http)).ok
-
-
-async def test_agents_test_reports_missing_local_models(env: Settings) -> None:
-    def tags(req: httpx.Request) -> httpx.Response:
-        assert req.url.path == "/api/tags"
-        return httpx.Response(200, json={"models": [{"name": "qwen2.5:3b"}]})
-
-    async with _client(httpx.MockTransport(tags)) as http:
-        assert (await svc.run_test("agents", env, http)).ok
-        s = env.model_copy(update={"AGENT_VOICE_LOCAL_MODEL": "llama3.2:1b"})
-        out = await svc.run_test("agents", s, http)
-        assert not out.ok and "llama3.2:1b" in out.detail
 
 
 async def test_discord_payload_is_scrubbed_before_sending(monkeypatch: pytest.MonkeyPatch) -> None:

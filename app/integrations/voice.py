@@ -9,7 +9,8 @@ deterministic grammar maps it to one of five navigation intents:
     open_pr                /dev/prs/{number}
     show_agents            /dev/agents
 
-When the grammar finds nothing and VOICE_OLLAMA_MODEL is set, the local Ollama model may pick
+When the grammar finds nothing and a model client is given (the API passes a small Claude
+model, AI_MODEL_ROUTER), the model may pick
 one of the same intents; its answer is validated against the fixed list and the route is
 always built here, never taken from the model.
 
@@ -63,7 +64,7 @@ class VoiceResult:
     intent: Intent
     route: str | None
     params: dict[str, str]
-    source: Literal["grammar", "ollama", "none"]
+    source: Literal["grammar", "model", "none"]
     note: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -136,7 +137,7 @@ SYSTEM_PROMPT = (
 )
 
 
-async def _ask_ollama(client: ChatClient, model: str, text: str) -> tuple[str, str | None]:
+async def _ask_model(client: ChatClient, model: str, text: str) -> tuple[str, str | None]:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": text},
@@ -157,17 +158,17 @@ async def _ask_ollama(client: ChatClient, model: str, text: str) -> tuple[str, s
 async def resolve(
     transcript: str,
     *,
-    ollama: ChatClient | None = None,
+    client: ChatClient | None = None,
     model: str | None = None,
     wait_seconds: float = 10.0,
 ) -> VoiceResult:
     result = parse(transcript)
-    if result.intent != "unknown" or not (ollama and model):
+    if result.intent != "unknown" or not (client and model):
         return result
     text = normalize(transcript)
     try:
-        intent, ref = await asyncio.wait_for(_ask_ollama(ollama, model, text), wait_seconds)
-    except Exception:  # Ollama down, slow or nonsense: the grammar's answer stands
+        intent, ref = await asyncio.wait_for(_ask_model(client, model, text), wait_seconds)
+    except Exception:  # model down, slow, over budget or nonsense: the grammar's answer stands
         return result
     if intent not in INTENTS:
         return result
@@ -179,7 +180,7 @@ async def resolve(
         params["ref"] = ref
     if intent == "open_pr" and ref:
         params["number"] = str(int(ref))
-    return VoiceResult(intent, route, params, "ollama", result.note)  # type: ignore[arg-type]
+    return VoiceResult(intent, route, params, "model", result.note)  # type: ignore[arg-type]
 
 
 __all__ = ["INTENTS", "VoiceResult", "normalize", "parse", "resolve", "route_for"]

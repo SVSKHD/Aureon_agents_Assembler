@@ -87,9 +87,6 @@ def _s(
 
 
 CATEGORIES = (
-    "openrouter",
-    "anthropic",
-    "gemini",
     "ai",
     "agents",
     "dhan",
@@ -101,121 +98,38 @@ CATEGORIES = (
 REGISTRY: dict[str, Spec] = {
     s.key: s
     for s in (
-        *(
-            spec
-            for agent, label in (
-                ("NEWS", "News"),
-                ("VOICE", "Voice answers"),
-                ("RESEARCH", "Trading research"),
-            )
-            for spec in (
-                _s(f"AGENT_{agent}_ENABLED", "agents", "bool", f"{label}: enabled"),
-                _s(
-                    f"AGENT_{agent}_PROVIDER",
-                    "agents",
-                    "str",
-                    f"{label}: auto (the default external provider when allowed) | ollama"
-                    " | openrouter | anthropic | gemini",
-                ),
-                _s(
-                    f"AGENT_{agent}_MODEL",
-                    "agents",
-                    "str",
-                    f"{label}: external model (blank = that provider's default)",
-                ),
-                _s(f"AGENT_{agent}_LOCAL_MODEL", "agents", "str", f"{label}: local Ollama model"),
-            )
+        # --- Claude, the only AI provider (docs/26-ai-providers.md) ---
+        _s("ANTHROPIC_API_KEY", "ai", "secret", "Anthropic API key (console.anthropic.com)"),
+        _s("AI_MODEL_MAIN", "ai", "str", "Main Claude model (e.g. claude-opus-5-5)"),
+        _s(
+            "AI_MODEL_ROUTER",
+            "ai",
+            "str",
+            "Small model that picks the agent and maps voice commands (blank = off)",
         ),
+        _s("AI_EFFORT", "ai", "str", "Thinking effort: low | medium | high | xhigh | max"),
+        _s("AI_MONTHLY_BUDGET_USD", "ai", "decimal", "Monthly cap on all Claude spend (USD)"),
+        _s(
+            "AI_AGENT_BUDGETS_USD",
+            "ai",
+            "json_object",
+            'Monthly caps per budget (USD): {"investments": 40, "business": 30, "chat": 20, '
+            '"reserve": 10}',
+        ),
+        _s(
+            "AI_MODEL_PRICES",
+            "ai",
+            "json_object",
+            'Extra or override prices, USD per million tokens: {"<model>": {"input": .., '
+            '"output": .., "cache_read": ..}} (a model without a price is never called)',
+        ),
+        _s("AI_MAX_STEPS", "ai", "int", "Tool steps per answer (max model calls per turn)"),
+        _s("AI_TRADE_MAX_LOSS_INR", "ai", "decimal", "propose_trade: max loss per trade (INR)"),
+        _s("AI_TRADE_MAX_ORDER_INR", "ai", "decimal", "propose_trade: max order size (INR)"),
+        _s("AI_TRADE_MAX_PER_DAY", "ai", "int", "propose_trade: max proposals per day"),
+        _s("AI_DAILY_REPORT_CRON", "ai", "str", "Daily report schedule (IST cron; blank = off)"),
+        _s("AI_WEEKLY_REVIEW_CRON", "ai", "str", "Weekly review schedule (IST cron; blank = off)"),
         _s("AGENT_IMAGE_ENABLED", "agents", "bool", "Image generation: enabled"),
-        _s(
-            "OPENROUTER_IMAGE_MODEL",
-            "agents",
-            "str",
-            "OpenRouter image model (blank = local SD only; never personal/finance prompts)",
-        ),
-        _s(
-            "MODEL_ROUTER_EXTERNAL_TIMEOUT_SECONDS",
-            "agents",
-            "float",
-            "Agents: external timeout before local fallback (s)",
-        ),
-        _s("MODEL_ROUTER_LOCAL_QUEUE", "agents", "int", "Agents: local Ollama queue size"),
-        _s("OPENROUTER_ENABLED", "openrouter", "bool", "Allow external models via OpenRouter"),
-        _s("OPENROUTER_API_KEY", "openrouter", "secret", "OpenRouter API key"),
-        _s("OPENROUTER_DEFAULT_MODEL", "openrouter", "str", "Default OpenRouter model id"),
-        _s("OPENROUTER_DAILY_LIMIT_USD", "openrouter", "decimal", "Daily spend cap (USD)"),
-        _s("OPENROUTER_ALLOWED_MODELS", "openrouter", "csv", "Allowed model ids, comma-separated"),
-        _s(
-            "AI_RESEARCH_EXTERNAL_ALLOWED",
-            "openrouter",
-            "bool",
-            "Let research prompts go to external models",
-        ),
-        # --- direct provider APIs (docs/26-ai-providers.md) ---
-        *(
-            spec
-            for prefix, cat, label in (
-                ("ANTHROPIC", "anthropic", "Anthropic"),
-                ("GEMINI", "gemini", "Gemini"),
-            )
-            for spec in (
-                _s(f"{prefix}_ENABLED", cat, "bool", f"Allow external models via the {label} API"),
-                _s(f"{prefix}_API_KEY", cat, "secret", f"{label} API key"),
-                _s(f"{prefix}_DEFAULT_MODEL", cat, "str", f"Default {label} model id"),
-                _s(
-                    f"{prefix}_ALLOWED_MODELS",
-                    cat,
-                    "csv",
-                    "Allowed model ids, comma-separated",
-                ),
-                _s(f"{prefix}_DAILY_LIMIT_USD", cat, "decimal", "Daily spend cap (USD)"),
-                _s(
-                    f"{prefix}_MODEL_PRICES",
-                    cat,
-                    "json_object",
-                    'USD per million tokens: {"<model>": {"input": "..", "output": ".."}}'
-                    " (a model without a price is never used)",
-                ),
-                _s(f"{prefix}_TIMEOUT_SECONDS", cat, "float", f"{label} timeout (s)"),
-            )
-        ),
-        _s(
-            "AI_DEFAULT_EXTERNAL_PROVIDER",
-            "ai",
-            "str",
-            "Provider for new conversations and 'auto' agents: openrouter | anthropic | gemini",
-        ),
-        _s(
-            "AI_EXTERNAL_FALLBACK_PROVIDERS",
-            "ai",
-            "csv",
-            "External providers tried next, in order, before local (e.g. openrouter)",
-        ),
-        _s(
-            "AI_LOCAL_ENABLED",
-            "ai",
-            "bool",
-            "Use local Ollama models (off = external only; local-only prompts are refused)",
-        ),
-        _s(
-            "AI_EXTERNAL_DAILY_LIMIT_USD",
-            "ai",
-            "decimal",
-            "Daily cap on total external spend across providers (USD)",
-        ),
-        _s(
-            "AI_EXTERNAL_MAX_OUTPUT_TOKENS",
-            "ai",
-            "int",
-            "Output tokens per external call when the caller sets none",
-        ),
-        _s("AI_EXTERNAL_MAX_RETRIES", "ai", "int", "SDK retries per external call"),
-        _s(
-            "AI_EXTERNAL_REQUESTS_PER_MINUTE",
-            "ai",
-            "int",
-            "External calls per provider per minute (0 = no local limit)",
-        ),
         _s("DHAN_CLIENT_ID", "dhan", "secret", "Dhan client id"),
         _s("DHAN_API_KEY", "dhan", "secret", "Dhan API key (web.dhan.co, Access DhanHQ APIs)"),
         _s("DHAN_API_SECRET", "dhan", "secret", "Dhan API secret"),
@@ -733,8 +647,11 @@ class TestOutcome:
 async def run_test(category: str, settings: Settings, http: httpx.AsyncClient) -> TestOutcome:
     """Try the category's credential against its service. The detail is a status line,
     never a response body (bodies can echo what was sent)."""
+    test = _TESTS.get(category)
+    if test is None:
+        return TestOutcome(False, f"{category} has no connection test")
     try:
-        return await _TESTS[category](settings, http)
+        return await test(settings, http)
     except httpx.HTTPError as exc:
         return TestOutcome(False, f"request failed ({type(exc).__name__})")
 
@@ -747,77 +664,30 @@ def _status(resp: httpx.Response, what: str) -> TestOutcome:
     return TestOutcome(False, f"{what}: HTTP {resp.status_code}")
 
 
-async def _openrouter(s: Settings, http: httpx.AsyncClient) -> TestOutcome:
-    key = current_value(s, "OPENROUTER_API_KEY")
-    if not key:
-        return TestOutcome(False, "OPENROUTER_API_KEY is not set")
-    base = s.OPENROUTER_BASE_URL.rstrip("/")
-    headers = {"Authorization": f"Bearer {key}"}
-    # /key checks the key itself; /models (public) checks the default model exists.
-    who = await http.get(f"{base}/key", headers=headers, timeout=10)
-    if not who.is_success:
-        return _status(who, "OpenRouter key")
-    model = s.OPENROUTER_DEFAULT_MODEL.strip()
-    if model:
-        models = await http.get(f"{base}/models", headers=headers, timeout=15)
-        if not models.is_success:
-            return _status(models, "OpenRouter models")
-        ids = {m.get("id") for m in models.json().get("data", []) if isinstance(m, dict)}
-        if model not in ids:
-            return TestOutcome(False, "key OK; OPENROUTER_DEFAULT_MODEL is not an OpenRouter model")
-    return TestOutcome(True, "OpenRouter key OK" + (" and default model found" if model else ""))
-
-
-async def _external_models(s: Settings, provider: str, label: str) -> TestOutcome:
-    """List the provider's models with the key (no tokens are spent) and check the default
-    model exists and is priced. Errors are status lines from ProviderError, never bodies."""
-    from app.agents.providers.base import ProviderError
-    from app.services.inference import build_external
-
-    cfg = s.external(provider)
-    if not cfg.api_key:
-        return TestOutcome(False, f"{provider.upper()}_API_KEY is not set")
-    # Built even when disabled, so a key can be tested before it is switched on.
-    probe = s.model_copy(update={f"{provider.upper()}_ENABLED": True})
-    client = build_external(probe, provider)
-    if client is None:
-        return TestOutcome(False, f"{label} client could not be built")
-    try:
-        ids = set(await client.list_models())
-    except ProviderError as exc:
-        return TestOutcome(False, f"{label} key: {exc.message}")
-    finally:
-        await client.aclose()
-    model = cfg.default_model
-    if not model:
-        return TestOutcome(True, f"{label} key OK ({len(ids)} models); no default model set")
-    if model.removeprefix("models/") not in ids:
-        return TestOutcome(False, f"key OK; {provider.upper()}_DEFAULT_MODEL is not available")
-    if not cfg.priced(model):
-        return TestOutcome(
-            False, f"key OK; the default model has no price in {provider.upper()}_MODEL_PRICES"
-        )
-    return TestOutcome(True, f"{label} key OK and default model found")
-
-
-async def _anthropic(s: Settings, http: httpx.AsyncClient) -> TestOutcome:
-    return await _external_models(s, "anthropic", "Anthropic")
-
-
-async def _gemini(s: Settings, http: httpx.AsyncClient) -> TestOutcome:
-    return await _external_models(s, "gemini", "Gemini")
-
-
 async def _ai(s: Settings, http: httpx.AsyncClient) -> TestOutcome:
-    """The shared routing settings are coherent (no network call)."""
-    chain = s.external_chain(s.AI_DEFAULT_EXTERNAL_PROVIDER)
-    states = [(p, s.external_unusable_reason(p)) for p in chain]
-    order = " -> ".join(f"{p} ({r or 'usable'})" for p, r in states) + " -> local"
-    cap = s.AI_EXTERNAL_DAILY_LIMIT_USD
-    cap_text = f"global cap {cap} USD" if cap is not None else "global cap not set"
-    if all(r for _, r in states):
-        return TestOutcome(False, f"no external provider is usable: {order}")
-    return TestOutcome(True, f"order: {order}; {cap_text}")
+    """The Anthropic key lists models (GET /v1/models: no tokens are spent), and the main and
+    router models are available and priced."""
+    from app.ai.budget import MemoryUsageStore
+    from app.ai.gateway import ClaudeGateway, GatewayError
+
+    if not s.anthropic_key:
+        return TestOutcome(False, "ANTHROPIC_API_KEY is not set")
+    gw = ClaudeGateway(s, MemoryUsageStore())
+    try:
+        ids = set(await gw.probe())
+    except GatewayError as exc:
+        return TestOutcome(False, f"Anthropic key: {exc}")
+    finally:
+        await gw.aclose()
+    for name in ("AI_MODEL_MAIN", "AI_MODEL_ROUTER"):
+        model = str(getattr(s, name) or "").strip()
+        if not model:
+            continue
+        if model not in ids:
+            return TestOutcome(False, f"key OK; {name} {model} is not available to this key")
+        if s.claude_price(model) is None:
+            return TestOutcome(False, f"key OK; {name} {model} has no price in AI_MODEL_PRICES")
+    return TestOutcome(True, f"Anthropic key OK ({len(ids)} models); {s.AI_MODEL_MAIN} ready")
 
 
 async def _dhan(s: Settings, http: httpx.AsyncClient) -> TestOutcome:
@@ -867,25 +737,7 @@ async def _mt5(s: Settings, http: httpx.AsyncClient) -> TestOutcome:
     return TestOutcome(True, "MT5_INGEST_TOKEN is set (the bot proves it on its next push)")
 
 
-async def _agents(s: Settings, http: httpx.AsyncClient) -> TestOutcome:
-    """The agents' local models are installed in Ollama (GET /api/tags; nothing is pulled)."""
-    resp = await http.get(f"{s.OLLAMA_BASE_URL.rstrip('/')}/api/tags", timeout=10.0)
-    if resp.status_code != 200:
-        return TestOutcome(False, f"Ollama answered HTTP {resp.status_code}")
-    installed = {m.get("name") for m in resp.json().get("models", []) if isinstance(m, dict)}
-    names = (current_value(s, f"AGENT_{a}_LOCAL_MODEL") for a in ("NEWS", "VOICE", "RESEARCH"))
-    wanted: set[str] = {n for n in names if n}
-    missing = sorted(m for m in wanted if m not in installed)
-    if missing:
-        return TestOutcome(False, f"not installed in Ollama: {', '.join(missing)}")
-    return TestOutcome(True, f"local models installed: {', '.join(sorted(wanted))}")
-
-
 _TESTS: dict[str, Callable[[Settings, httpx.AsyncClient], Awaitable[TestOutcome]]] = {
-    "agents": _agents,
-    "openrouter": _openrouter,
-    "anthropic": _anthropic,
-    "gemini": _gemini,
     "ai": _ai,
     "dhan": _dhan,
     "github": _github,

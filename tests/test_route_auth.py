@@ -81,9 +81,10 @@ PUBLIC_UNSAFE = {"/api/auth/login", "/api/v1/github/webhooks", "/api/trading/mt5
 PUBLIC_RATE_LIMITED = {p for m, p in PUBLIC if p.startswith("/api/public/")}
 
 ADMIN = {
-    ("GET", "/api/v1/ai/usage"),
-    # Runtime routing check: one fixed public prompt (docs/26-ai-providers.md).
-    ("POST", "/api/v1/ai/route-check"),
+    # Claude gateway (docs/26-ai-providers.md): spend, and the agents' write requests.
+    ("GET", "/api/ai/usage"),
+    ("GET", "/api/ai/approvals"),
+    ("POST", "/api/ai/approvals/{approval_id}"),
     # DevOps dashboard (docs/32): admin only, like the GitHub data it is built from.
     ("GET", "/api/v1/github/actions/monitor/deploys/{run_id}/progress"),
     ("GET", "/api/v1/github/actions/monitor/deploys/{run_id}/logs"),

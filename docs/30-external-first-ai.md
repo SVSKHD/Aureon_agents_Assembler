@@ -1,3 +1,6 @@
+> **Superseded (2026-11-12):** the AI stack is Claude-only. Ollama, OpenRouter, Gemini and the
+> provider routing described here are removed. See [26-ai-providers.md](26-ai-providers.md).
+
 # 30 — External-first AI: Gemini, then OpenRouter, then local
 
 The local models (qwen2.5:3b) are not good enough to be the main model for chat and research

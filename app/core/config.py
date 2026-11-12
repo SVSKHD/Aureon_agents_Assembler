@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import json
 import re
-from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -40,38 +39,22 @@ def _secret_text(value: SecretStr | str | None) -> str:
     return raw.strip()
 
 
-_PROVIDER_PREFIX = {"openrouter": "OPENROUTER", "anthropic": "ANTHROPIC", "gemini": "GEMINI"}
-# Aureon's default external model (docs/26-ai-providers.md).
-GEMINI_PRIMARY_MODEL = "gemini-3.5-flash-lite"
-# Verified list prices, USD per million tokens (input, output), standard paid tier, from the
-# Gemini Developer API pricing page (ai.google.dev/gemini-api/docs/pricing, checked
-# 2026-11-11): gemini-3.5-flash-lite input $0.30 (text/image/video/audio), output $2.50
-# including thinking tokens; no free tier. Used only when the operator has not priced the
-# model in *_MODEL_PRICES: an operator price always wins. Caps are unaffected.
-BUILTIN_MODEL_PRICES: dict[str, dict[str, tuple[Decimal, Decimal]]] = {
-    "gemini": {GEMINI_PRIMARY_MODEL: (Decimal("0.30"), Decimal("2.50"))},
+# Claude list prices, USD per million tokens (input, output, cache read), from the Claude API
+# model table (checked 2026-11-12). A cache write is billed at 1.25x input (5-minute TTL).
+# Claude Haiku 5.5's prices are for prompts up to 100K tokens; above that 0.50 / 2.50.
+# AI_MODEL_PRICES overrides or adds a model; a model with no price is never called.
+CLAUDE_PRICES: dict[str, tuple[Decimal, Decimal, Decimal]] = {
+    "claude-opus-5-5": (Decimal("4.00"), Decimal("20.00"), Decimal("0.20")),
+    "claude-sonnet-5-5": (Decimal("2.00"), Decimal("10.00"), Decimal("0.20")),
+    "claude-haiku-5-5": (Decimal("0.10"), Decimal("0.50"), Decimal("0.01")),
 }
-
-
-@dataclass(frozen=True, slots=True)
-class ExternalConfig:
-    """One external provider's settings (Settings.external). `api_key` is the raw secret:
-    it goes into a client and nowhere else."""
-
-    provider: str
-    enabled: bool
-    api_key: str = field(repr=False)
-    base_url: str
-    default_model: str
-    models: tuple[str, ...]
-    daily_limit_usd: Decimal
-    timeout: float
-    # model -> (input, output) USD per million tokens; empty for OpenRouter (reports cost).
-    prices: dict[str, tuple[Decimal, Decimal]]
-    reports_cost: bool
-
-    def priced(self, model: str) -> bool:
-        return self.reports_cost or model.removeprefix("models/") in self.prices
+# The budgets a call is charged to, and their default monthly caps (USD).
+AI_AGENT_BUDGET_DEFAULTS: dict[str, Decimal] = {
+    "investments": Decimal("40"),
+    "business": Decimal("30"),
+    "chat": Decimal("20"),
+    "reserve": Decimal("10"),
+}
 
 
 class Environment(StrEnum):
@@ -98,8 +81,6 @@ class Settings(BaseSettings):
     MIGRATIONS_DATABASE_URL: SecretStr | None = None
     # redis://aureon-redis:6379/0
     REDIS_URL: str = "redis://aureon-redis:6379/0"
-    # http://<ollama-container>:11434 over the private Docker network
-    OLLAMA_BASE_URL: str = "http://ollama:11434"
     IMAGE_AGENT_PATH: Path = Path("/opt/image-agent")
     DATA_ROOT: Path = Path("/mnt/spasta-data")
     # File that must exist on the HDD; proves the 2 TB disk is mounted, not an empty mountpoint.
@@ -123,35 +104,6 @@ class Settings(BaseSettings):
     LOGIN_MAX_FAILURES: int = Field(default=5, ge=1)
     LOGIN_MAX_FAILURES_PER_IP: int = Field(default=20, ge=1)
     LOGIN_WINDOW_SECONDS: int = Field(default=900, ge=1)
-
-    # --- ollama / chat ---
-    # Simultaneous generations this API sends to Ollama (CPU-only box: keep at 1).
-    OLLAMA_MAX_CONCURRENT: int = Field(default=1, ge=1)
-    # Requests allowed to wait for a slot; beyond this, POST /api/chat returns 429.
-    OLLAMA_MAX_QUEUE: int = Field(default=3, ge=0)
-    OLLAMA_QUEUE_RETRY_AFTER: int = Field(default=15, ge=1)
-    OLLAMA_CONNECT_TIMEOUT: float = Field(default=5.0, gt=0)
-    # Max silence between streamed chunks; covers a cold model load on CPU.
-    OLLAMA_READ_TIMEOUT: float = Field(default=300.0, gt=0)
-    OLLAMA_MODEL_CACHE_SECONDS: float = Field(default=60.0, ge=0)
-    # Whole chat request budget, including time spent queued.
-    CHAT_TIMEOUT_SECONDS: float = Field(default=900.0, gt=0)
-    # SSE keep-alive comment interval (Cloudflare drops idle streams after ~100 s).
-    CHAT_HEARTBEAT_SECONDS: float = Field(default=15.0, gt=0)
-    CHAT_DEFAULT_NUM_CTX: int = Field(default=4096, ge=256)
-    CHAT_MAX_NUM_CTX: int = Field(default=8192, ge=256)
-    # Model the SPA preselects (listed first in GET /api/models, `default_model`) and the API
-    # loads at startup (CHAT_WARMUP). Empty = none: the first installed model.
-    CHAT_DEFAULT_MODEL: str = ""
-    CHAT_WARMUP: bool = True
-    # CPU threads per generation (Ollama `num_thread`); 0 = Ollama decides.
-    CHAT_NUM_THREAD: int = Field(default=0, ge=0, le=256)
-    # Stored turns re-sent per request: system messages plus the newest N others (the new
-    # turns are always sent). 0 = the whole conversation. Less history = less prompt to
-    # process on a CPU before the first token.
-    CHAT_HISTORY_MAX_MESSAGES: int = Field(default=0, ge=0)
-    # Ollama `keep_alive` for API chats ("24h", "30m", "-1" = forever); empty = Ollama default.
-    OLLAMA_KEEP_ALIVE: str = Field(default="", pattern=r"^(|-1|0|[0-9]{1,6}[smh]?)$")
 
     # --- imaging (docs/04-imaging.md) ---
     # "subprocess" runs IMAGE_AGENT_COMMAND; "stub" writes a placeholder PNG (tests/dev only).
@@ -453,8 +405,7 @@ class Settings(BaseSettings):
     # Backtests
     BACKTEST_MAX_GRID: int = Field(default=50, ge=1, le=500)
     BACKTEST_MAX_BARS: int = Field(default=200_000, ge=100)
-    # AI research agent: Ollama only, explanation only.
-    RESEARCH_AI_MODEL: str | None = None
+    # AI research agent (explanations only), through the Claude gateway (app/ai).
     RESEARCH_AI_QUEUE_MAX: int = Field(default=20, ge=1, le=1000)
     RESEARCH_AI_TIMEOUT_SECONDS: float = Field(default=600.0, gt=0)
 
@@ -659,13 +610,10 @@ class Settings(BaseSettings):
     DISCORD_MAX_ATTEMPTS: int = Field(default=3, ge=1, le=10)
     DISCORD_REQUEST_SECONDS: float = Field(default=5.0, gt=0, le=60)
     DISCORD_RETRY_BASE_SECONDS: float = Field(default=1.0, ge=0, le=60)
-    # Voice navigation (POST /api/v1/voice/intent): an optional local Ollama model used only
-    # when the deterministic grammar finds no intent. Unset = grammar only.
-    VOICE_OLLAMA_MODEL: str | None = None
 
     # --- Incidents + self-repair (docs/21-self-repair.md) ---
-    # Local Ollama model for repair patches. Unset / empty = repairs disabled (tasks stay
-    # queued with the reason). .env.example suggests a Qwen coder model.
+    # Model id recorded on repair tasks. Repairs have no model client since the AI stack is
+    # Claude-only (docs/26): they stay queued with the reason until a Claude path is added.
     REPAIR_MODEL: str | None = None
     # The CODE_REPOS entry repairs work in, and its GitHub "owner/repo" (must also be in the
     # GitHub allowlist). Either unset = repairs disabled.
@@ -728,107 +676,41 @@ class Settings(BaseSettings):
         default_factory=lambda: ["spasta.online"]
     )
 
-    # --- OpenRouter (docs/25-openrouter.md): opt-in external inference for chat. Off by default;
-    # local Ollama stays the default and the fallback. A data-classification filter decides per
-    # request whether anything may leave the server (app/services/chat_filter.py).
-    OPENROUTER_ENABLED: bool = False
-    # Server-side only. Never logged, never returned, never given to the SPA (no VITE_ var).
-    OPENROUTER_API_KEY: SecretStr | None = None
-    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
-    # The model new conversations use when OpenRouter is usable (always allowed).
-    OPENROUTER_DEFAULT_MODEL: str = ""
-    # Comma list of extra OpenRouter model ids the picker offers. Empty = only the default.
-    OPENROUTER_ALLOWED_MODELS: Annotated[list[str], NoDecode] = Field(default_factory=list)
-    # USD per UTC day, from OpenRouter's reported cost. 0 = no budget: every call stays local.
-    OPENROUTER_DAILY_LIMIT_USD: Decimal = Field(default=Decimal("0"), ge=0, le=Decimal("10000"))
-    # Connect timeout and the longest silence allowed between streamed chunks.
-    OPENROUTER_TIMEOUT_SECONDS: float = Field(default=60.0, gt=0, le=600)
-    # Research / AI trading explanations stay on local Ollama unless this is true (and even
-    # then the content filter still applies).
-    AI_RESEARCH_EXTERNAL_ALLOWED: bool = False
-    # Local Ollama models (chat, agents, research, voice, coding, repairs). False = external
-    # providers only: Ollama is never called, the readiness check skips it, and a request the
-    # classification filter keeps local is refused (it is never sent out instead).
-    AI_LOCAL_ENABLED: bool = True
-
-    # --- Direct Anthropic and Gemini APIs (docs/26-ai-providers.md). Same rules as OpenRouter:
-    # off by default, server-side keys, a model allowlist, a daily USD cap (0 = no budget), and
-    # the same classification gate. Neither reports a cost, so a model is usable only when it is
-    # priced: in *_MODEL_PRICES (USD per million tokens), or in BUILTIN_MODEL_PRICES above
-    # (only gemini-3.5-flash-lite, verified; an operator price wins):
-    #   {"<model id>": {"input": "<usd>", "output": "<usd>"}}
-    ANTHROPIC_ENABLED: bool = False
+    # --- Claude, the only AI provider (docs/26-ai-providers.md, app/ai/gateway.py) ---
+    # Server-side only: never logged, never returned. Unset = every AI feature is off.
     ANTHROPIC_API_KEY: SecretStr | None = None
-    ANTHROPIC_BASE_URL: str = "https://api.anthropic.com"
-    ANTHROPIC_DEFAULT_MODEL: str = ""
-    ANTHROPIC_ALLOWED_MODELS: Annotated[list[str], NoDecode] = Field(default_factory=list)
-    ANTHROPIC_DAILY_LIMIT_USD: Decimal = Field(default=Decimal("0"), ge=0, le=Decimal("10000"))
-    ANTHROPIC_TIMEOUT_SECONDS: float = Field(default=60.0, gt=0, le=600)
-    ANTHROPIC_MODEL_PRICES: Annotated[dict[str, dict[str, Decimal]], NoDecode] = Field(
+    AI_MODEL_MAIN: str = "claude-opus-5-5"
+    # Picks the agent when a request names none, and voice navigation. Empty = off.
+    AI_MODEL_ROUTER: str = "claude-haiku-5-5"
+    # Thinking depth on every call (Opus 5.5 always thinks; effort is the control).
+    AI_EFFORT: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
+    AI_MAX_OUTPUT_TOKENS: int = Field(default=16000, ge=256, le=128000)
+    AI_TIMEOUT_SECONDS: float = Field(default=120.0, gt=0, le=1800)
+    # SDK retries with exponential backoff on connection errors, 408/409/429 and 5xx.
+    AI_MAX_RETRIES: int = Field(default=3, ge=0, le=8)
+    # Month-to-date caps (Asia/Kolkata calendar month). A call that could exceed one is refused.
+    AI_MONTHLY_BUDGET_USD: Decimal = Field(default=Decimal("100"), ge=0, le=Decimal("100000"))
+    AI_AGENT_BUDGETS_USD: Annotated[dict[str, Decimal], NoDecode] = Field(
+        default_factory=lambda: dict(AI_AGENT_BUDGET_DEFAULTS)
+    )
+    # {"<model>": {"input": usd, "output": usd, "cache_read": usd}} per million tokens.
+    AI_MODEL_PRICES: Annotated[dict[str, dict[str, Decimal]], NoDecode] = Field(
         default_factory=dict
     )
-    GEMINI_ENABLED: bool = False
-    GEMINI_API_KEY: SecretStr | None = None
-    GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com"
-    # Gemini 3.5 Flash-Lite is Aureon's primary external model. Still off until GEMINI_ENABLED,
-    # a key and a GEMINI_DAILY_LIMIT_USD above 0 are set.
-    GEMINI_DEFAULT_MODEL: str = GEMINI_PRIMARY_MODEL
-    GEMINI_ALLOWED_MODELS: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: [GEMINI_PRIMARY_MODEL]
-    )
-    GEMINI_DAILY_LIMIT_USD: Decimal = Field(default=Decimal("0"), ge=0, le=Decimal("10000"))
-    GEMINI_TIMEOUT_SECONDS: float = Field(default=60.0, gt=0, le=600)
-    GEMINI_MODEL_PRICES: Annotated[dict[str, dict[str, Decimal]], NoDecode] = Field(
-        default_factory=dict
-    )
-    # Shared by every external provider:
-    # - the provider new conversations and "auto" agents use when it is usable;
-    AI_DEFAULT_EXTERNAL_PROVIDER: Literal["openrouter", "anthropic", "gemini"] = "gemini"
-    # - the external providers tried next, in order, when the first one refuses (not usable,
-    #   unpriced, capped, rate-limited) or fails; local Ollama only after all of them
-    #   (e.g. "openrouter"). Empty = no second external provider. The classification filter
-    #   is never bypassed: data that must stay local goes to no external provider at all.
-    AI_EXTERNAL_FALLBACK_PROVIDERS: Annotated[list[str], NoDecode] = Field(default_factory=list)
-    # - a cap on today's total external spend across providers (unset = per-provider caps only);
-    AI_EXTERNAL_DAILY_LIMIT_USD: Decimal | None = Field(default=None, ge=0, le=Decimal("10000"))
-    # - output tokens asked for when the caller sets none (Anthropic requires a value); also
-    #   the worst case reserved against the budget before a priced call starts;
-    AI_EXTERNAL_MAX_OUTPUT_TOKENS: int = Field(default=4096, ge=64, le=64000)
-    # - SDK retries before the first byte (connection errors, 408/409/429/5xx);
-    AI_EXTERNAL_MAX_RETRIES: int = Field(default=1, ge=0, le=5)
-    # - calls per provider per minute from this server (0 = no local limit).
-    AI_EXTERNAL_REQUESTS_PER_MINUTE: int = Field(default=30, ge=0, le=10000)
-
-    # --- Model routing for the agents (docs/model-routing.md, app/services/model_router.py) ---
-    # Per agent (default provider "gemini": Gemini 3.5 Flash-Lite first): enabled, provider
-    # ("auto" = AI_DEFAULT_EXTERNAL_PROVIDER when the gate allows,
-    # else local; "ollama" = always local; "openrouter" | "anthropic" | "gemini" = prefer that
-    # provider, still gated and with local fallback), the external model ("" = that
-    # provider's default model) and the local Ollama model.
-    AGENT_NEWS_ENABLED: bool = True
-    AGENT_NEWS_PROVIDER: Literal["auto", "ollama", "openrouter", "anthropic", "gemini"] = "gemini"
-    AGENT_NEWS_MODEL: str = ""
-    AGENT_NEWS_LOCAL_MODEL: str = "qwen2.5:3b"
-    AGENT_VOICE_ENABLED: bool = True
-    AGENT_VOICE_PROVIDER: Literal["auto", "ollama", "openrouter", "anthropic", "gemini"] = "gemini"
-    AGENT_VOICE_MODEL: str = ""
-    AGENT_VOICE_LOCAL_MODEL: str = "qwen2.5:3b"
-    AGENT_RESEARCH_ENABLED: bool = True
-    AGENT_RESEARCH_PROVIDER: Literal["auto", "ollama", "openrouter", "anthropic", "gemini"] = (
-        "gemini"
-    )
-    AGENT_RESEARCH_MODEL: str = ""
-    AGENT_RESEARCH_LOCAL_MODEL: str = "qwen2.5:3b"
+    AI_MAX_STEPS: int = Field(default=8, ge=1, le=20)
+    # One tool result is cut to about this many tokens (4 characters each) before Claude sees it.
+    AI_TOOL_RESULT_MAX_TOKENS: int = Field(default=2000, ge=100, le=20000)
+    AI_CHAT_REQUESTS_PER_MINUTE: int = Field(default=10, ge=1, le=600)
+    AI_CONVERSATION_MAX_MESSAGES: int = Field(default=200, ge=10, le=5000)
+    # Hard limits on propose_trade, checked in Python before an approval row exists (INR).
+    AI_TRADE_MAX_LOSS_INR: Decimal = Field(default=Decimal("2000"), gt=0)
+    AI_TRADE_MAX_ORDER_INR: Decimal = Field(default=Decimal("100000"), gt=0)
+    AI_TRADE_MAX_PER_DAY: int = Field(default=3, ge=0, le=100)
+    AI_APPROVAL_TTL_HOURS: float = Field(default=24.0, gt=0, le=24 * 30)
+    # Scheduled reports (scheduler timezone, Asia/Kolkata). Empty = off.
+    AI_DAILY_REPORT_CRON: str = "30 8 * * *"
+    AI_WEEKLY_REVIEW_CRON: str = "0 10 * * 0"
     AGENT_IMAGE_ENABLED: bool = True
-    # Image generation is local SD 1.5. An OpenRouter image model is used only when this is
-    # set AND the prompt passes the filter (never personal or finance content). Off by default.
-    OPENROUTER_IMAGE_MODEL: str = ""
-    # An agent's OpenRouter call that takes longer than this falls back to local.
-    MODEL_ROUTER_EXTERNAL_TIMEOUT_SECONDS: float = Field(default=10.0, gt=0, le=120)
-    # Local agent calls waiting for Ollama beyond this many are refused (the caller falls back
-    # to rules); chat has its own queue. Market data and risk checks never use Ollama.
-    MODEL_ROUTER_LOCAL_QUEUE: int = Field(default=2, ge=0, le=20)
-    MODEL_ROUTER_LOCAL_TIMEOUT_SECONDS: float = Field(default=120.0, gt=0, le=900)
 
     # --- Production integration (docs/24-production-integration.md) ---
     # Alerts: open incidents (severity >= warning), stale heartbeats, failed/old backups and
@@ -870,72 +752,20 @@ class Settings(BaseSettings):
         return url or None
 
     @property
-    def openrouter_key(self) -> str:
-        s = self.OPENROUTER_API_KEY
-        return s.get_secret_value().strip() if s else ""
+    def anthropic_key(self) -> str:
+        return _secret_text(self.ANTHROPIC_API_KEY)
 
-    @property
-    def openrouter_models(self) -> list[str]:
-        """The OpenRouter model ids a conversation may use: the default, then the allowlist."""
-        return list(self.external("openrouter").models)
+    def claude_price(self, model: str) -> tuple[Decimal, Decimal, Decimal] | None:
+        """(input, output, cache read) USD per million tokens, or None (never called)."""
+        own = self.AI_MODEL_PRICES.get(model)
+        if own is not None:
+            return own["input"], own["output"], own.get("cache_read", own["input"] / 10)
+        return CLAUDE_PRICES.get(model)
 
-    def openrouter_unusable_reason(self) -> str | None:
-        """None when OpenRouter may be tried at all; else why not (a fallback reason code)."""
-        return self.external_unusable_reason("openrouter")
-
-    # --- external providers, one view per provider (docs/26-ai-providers.md) ---
-
-    def external(self, provider: str) -> ExternalConfig:
-        """The provider's settings as one value. KeyError for an unknown provider."""
-        prefix = _PROVIDER_PREFIX[provider]
-
-        def get(name: str) -> Any:
-            return getattr(self, f"{prefix}_{name}")
-
-        default = str(get("DEFAULT_MODEL") or "").strip()
-        extra = (m.strip() for m in get("ALLOWED_MODELS"))
-        models = tuple(dict.fromkeys(m for m in (default, *extra) if m))
-        prices: dict[str, tuple[Decimal, Decimal]] = {}
-        if provider != "openrouter":  # OpenRouter reports the cost itself
-            prices.update(BUILTIN_MODEL_PRICES.get(provider, {}))
-            for model, p in (get("MODEL_PRICES") or {}).items():
-                prices[model.removeprefix("models/")] = (p["input"], p["output"])
-        return ExternalConfig(
-            provider=provider,
-            enabled=bool(get("ENABLED")),
-            api_key=_secret_text(get("API_KEY")),
-            base_url=str(get("BASE_URL")),
-            default_model=default,
-            models=models,
-            daily_limit_usd=get("DAILY_LIMIT_USD"),
-            timeout=float(get("TIMEOUT_SECONDS")),
-            prices=prices,
-            reports_cost=provider == "openrouter",
-        )
-
-    def external_unusable_reason(self, provider: str) -> str | None:
-        """None when the provider may be tried at all; else why not (a fallback reason)."""
-        cfg = self.external(provider)
-        if not cfg.enabled:
-            return "disabled"
-        if not cfg.api_key or not cfg.default_model:
-            return "not_configured"
-        if cfg.daily_limit_usd <= 0:
-            return "no_budget"
-        if self.AI_EXTERNAL_DAILY_LIMIT_USD is not None and self.AI_EXTERNAL_DAILY_LIMIT_USD <= 0:
-            return "no_budget"
-        return None
-
-    @field_validator("GEMINI_DEFAULT_MODEL")
-    @classmethod
-    def _gemini_default(cls, v: str) -> str:
-        """Blank (an .env copied from an older template) = the primary model."""
-        return v.strip() or GEMINI_PRIMARY_MODEL
-
-    @field_validator("ANTHROPIC_MODEL_PRICES", "GEMINI_MODEL_PRICES", mode="before")
+    @field_validator("AI_MODEL_PRICES", mode="before")
     @classmethod
     def _prices(cls, v: object) -> object:
-        """`{"model": {"input": usd_per_mtok, "output": usd_per_mtok}}`, from JSON or a dict."""
+        """`{"model": {"input": usd, "output": usd, "cache_read"?: usd}}`, JSON or a dict."""
         if v is None or v == "":
             return {}
         if isinstance(v, str):
@@ -949,13 +779,42 @@ class Settings(BaseSettings):
         for model, price in v.items():
             if not isinstance(model, str) or not model.strip() or not isinstance(price, dict):
                 raise ValueError("each entry must be model -> {input, output}")
+            if "input" not in price or "output" not in price:
+                raise ValueError("each price needs numeric input and output")
             try:
-                pair = {k: Decimal(str(price[k])) for k in ("input", "output")}
-            except (KeyError, ArithmeticError, ValueError) as exc:
+                keys = [k for k in ("input", "output", "cache_read") if k in price]
+                pair = {k: Decimal(str(price[k])) for k in keys}
+            except (ArithmeticError, ValueError) as exc:
                 raise ValueError("each price needs numeric input and output") from exc
             if any(not d.is_finite() or d < 0 for d in pair.values()):
                 raise ValueError("prices must be numbers >= 0")
             out[model.strip()] = pair
+        return out
+
+    @field_validator("AI_AGENT_BUDGETS_USD", mode="before")
+    @classmethod
+    def _agent_budgets(cls, v: object) -> object:
+        """`{"investments": 40, ...}`; agents left out keep their default cap."""
+        if v is None or v == "":
+            return dict(AI_AGENT_BUDGET_DEFAULTS)
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except ValueError as exc:
+                raise ValueError("must be a JSON object") from exc
+        if not isinstance(v, dict):
+            raise ValueError("must be a JSON object of agent -> USD")
+        out = dict(AI_AGENT_BUDGET_DEFAULTS)
+        for k, amount in v.items():
+            if k not in AI_AGENT_BUDGET_DEFAULTS:
+                raise ValueError(f"unknown agent {k!r} ({', '.join(AI_AGENT_BUDGET_DEFAULTS)})")
+            try:
+                d = Decimal(str(amount))
+            except ArithmeticError as exc:
+                raise ValueError("budgets must be numbers") from exc
+            if not d.is_finite() or d < 0:
+                raise ValueError("budgets must be numbers >= 0")
+            out[k] = d
         return out
 
     @property
@@ -1086,10 +945,6 @@ class Settings(BaseSettings):
         "INCIDENT_RESTART_CONTAINERS",
         "CLAUDE_CLI_ENV_PASSTHROUGH",
         "CLAUDE_REVIEW_INTERNAL_DOMAINS",
-        "OPENROUTER_ALLOWED_MODELS",
-        "ANTHROPIC_ALLOWED_MODELS",
-        "GEMINI_ALLOWED_MODELS",
-        "AI_EXTERNAL_FALLBACK_PROVIDERS",
         "CF_ACCESS_AUD",
         "CF_ACCESS_BYPASS_PATHS",
         "DEVOPS_ONESHOT_SERVICES",
@@ -1100,23 +955,6 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             return [o.strip() for o in v.split(",") if o.strip()]
         return v
-
-    @field_validator("AI_EXTERNAL_FALLBACK_PROVIDERS")
-    @classmethod
-    def _fallback_providers(cls, v: list[str]) -> list[str]:
-        out: list[str] = []
-        for p in (x.strip().lower() for x in v):
-            if p not in _PROVIDER_PREFIX:
-                raise ValueError(f"unknown provider {p!r} (openrouter | anthropic | gemini)")
-            if p not in out:
-                out.append(p)
-        return out
-
-    def external_chain(self, first: str) -> list[str]:
-        """The external providers to try, in order: `first`, then the fallback list."""
-        chain = [first] if first in _PROVIDER_PREFIX else []
-        chain += [p for p in self.AI_EXTERNAL_FALLBACK_PROVIDERS if p not in chain]
-        return chain
 
     @field_validator("SECRET_KEY")
     @classmethod

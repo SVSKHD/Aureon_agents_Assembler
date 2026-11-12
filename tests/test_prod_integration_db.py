@@ -42,7 +42,6 @@ pytestmark = pytest.mark.db
 FIX = Path(__file__).parent / "fixtures" / "mt5" / "status.json"
 LOGIN = "51234567"
 PASSWORD = "correct horse battery staple"
-OLLAMA_TAGS = "http://ollama.test:11434/api/tags"
 
 
 @dataclass
@@ -127,8 +126,7 @@ async def test_mt5_export_to_api_positions_and_stream(env: Env) -> None:
             )
         )  # fmt: skip
     app = create_app(s)
-    with respx.mock(assert_all_called=False) as mock:
-        mock.get(OLLAMA_TAGS).mock(return_value=httpx.Response(200, json={"models": []}))
+    with respx.mock(assert_all_called=False):
         async with LifespanManager(app) as mgr:
             c = await _login(mgr.app)
             try:
@@ -193,8 +191,7 @@ async def test_mt5_export_to_api_positions_and_stream(env: Env) -> None:
         assert agent is not None
         agent.last_heartbeat_at = datetime.now(UTC) - timedelta(minutes=10)
     app = create_app(s)
-    with respx.mock(assert_all_called=False) as mock:
-        mock.get(OLLAMA_TAGS).mock(return_value=httpx.Response(200, json={"models": []}))
+    with respx.mock(assert_all_called=False):
         async with LifespanManager(app) as mgr:
             c = await _login(mgr.app)
             card = (await c.get("/api/v1/system/integrations")).json()
@@ -224,10 +221,7 @@ async def test_integrations_card_sections_and_auth(env: Env) -> None:
         db.add(Agent(id="github-webhooks", name="w", kind="integration", state="idle",
                      last_heartbeat_at=datetime.now(UTC)))  # fmt: skip
     app = create_app(s)
-    with respx.mock(assert_all_called=False) as mock:
-        mock.get(OLLAMA_TAGS).mock(
-            return_value=httpx.Response(200, json={"models": [{"name": "qwen2.5-coder:7b"}]})
-        )
+    with respx.mock(assert_all_called=False):
         async with LifespanManager(app) as mgr:
             anon = AsyncClient(transport=ASGITransport(app=mgr.app), base_url="https://test")
             assert (await anon.get("/api/v1/system/integrations")).status_code == 401
@@ -241,7 +235,7 @@ async def test_integrations_card_sections_and_auth(env: Env) -> None:
     assert r.status_code == 200
     body = r.json()
     sec = body["integrations"]
-    assert set(sec) == {"mt5", "dhan", "github", "webhook_worker", "claude_cli", "ollama",
+    assert set(sec) == {"mt5", "dhan", "github", "webhook_worker", "claude_cli", "claude",
                         "discord", "database", "backups"}  # fmt: skip
     assert sec["mt5"]["status"] == "not_configured"
     assert sec["dhan"]["status"] == "not_configured"
@@ -250,13 +244,11 @@ async def test_integrations_card_sections_and_auth(env: Env) -> None:
     assert sec["webhook_worker"]["status"] == "ok" and sec["webhook_worker"]["pending"] == 0
     assert sec["discord"]["configured"] is True
     assert "secret-token" not in r.text  # the webhook URL is a secret
-    assert sec["ollama"]["models"] == ["qwen2.5-coder:7b"]
-    assert sec["ollama"]["missing"] == {"REPAIR_MODEL": "qwen2.5-coder:14b"}
-    assert sec["ollama"]["status"] == "degraded"
+    assert sec["claude"] == {"configured": False, "status": "not_configured"}
     # The test DB runs as a superuser: the card says the scoped roles are not in use.
     assert sec["database"]["superuser"] is True and sec["database"]["status"] == "degraded"
     assert sec["backups"]["status"] == "ok" and sec["backups"]["age_hours"] < 1
-    assert set(body["problems"]) == {"ollama", "database"}
+    assert set(body["problems"]) == {"database"}
 
 
 # --- alerts -------------------------------------------------------------------------------

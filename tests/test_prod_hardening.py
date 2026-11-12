@@ -230,7 +230,7 @@ def test_worker_healthcheck(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
 async def test_registry_heartbeat_touches_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from app.agents.registry import OLLAMA, Heartbeat
+    from app.agents.registry import CLAUDE, Heartbeat
 
     f = tmp_path / "hb"
     monkeypatch.setenv("AUREON_HEARTBEAT_FILE", str(f))
@@ -246,9 +246,9 @@ async def test_registry_heartbeat_touches_file(
         async def register(self, *_: Any) -> bool:
             raise ConnectionError
 
-    await Heartbeat(Broken(), OLLAMA, 1, lambda: ("idle", {})).beat()  # type: ignore[arg-type]
+    await Heartbeat(Broken(), CLAUDE, 1, lambda: ("idle", {})).beat()  # type: ignore[arg-type]
     assert not f.exists()  # DB down: no liveness claim
-    await Heartbeat(Reg(), OLLAMA, 1, lambda: ("idle", {})).beat()  # type: ignore[arg-type]
+    await Heartbeat(Reg(), CLAUDE, 1, lambda: ("idle", {})).beat()  # type: ignore[arg-type]
     assert f.exists()
 
 

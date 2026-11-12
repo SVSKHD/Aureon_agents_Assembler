@@ -33,8 +33,8 @@ async def _retire(*clients: Any) -> None:
 def apply(app: FastAPI, new: Settings) -> list[str]:
     """Swap `new` in; returns the registry keys that changed."""
     from app.agents.trading.dhan import build_dhan_adapter
+    from app.ai.gateway import ClaudeGateway
     from app.integrations.github import build_github_client
-    from app.services.inference import build_external, build_openrouter
 
     state = app.state
     old: Settings = state.settings
@@ -44,15 +44,10 @@ def apply(app: FastAPI, new: Settings) -> list[str]:
     if not changed:
         return changed
     retired: list[Any] = []
-    if any(k.startswith("OPENROUTER_") for k in changed):
-        retired.append(state.openrouter)
-        state.openrouter = build_openrouter(new)
-    # Direct provider clients hold the key, prices, timeout, retries and output default.
-    shared = any(k.startswith(("AI_EXTERNAL_MAX_",)) for k in changed)
-    for provider in ("anthropic", "gemini"):
-        if shared or any(k.startswith(f"{provider.upper()}_") for k in changed):
-            retired.append(getattr(state, provider, None))
-            setattr(state, provider, build_external(new, provider))
+    if any(k.startswith(("ANTHROPIC_", "AI_")) for k in changed):
+        # The gateway holds the key and reads its limits from the settings it was built with.
+        retired.append(getattr(state, "ai", None))
+        state.ai = ClaudeGateway.build(new, state.sessionmaker)
     if "GITHUB_TOKEN" in changed:
         retired.append(state.github)
         state.github = build_github_client(new)
@@ -100,9 +95,7 @@ async def close_clients(app: FastAPI) -> None:
         state.trading_adapters.get("dhan"),
         state.trading_adapters.get("mt5"),
         state.github,
-        state.openrouter,
-        getattr(state, "anthropic", None),
-        getattr(state, "gemini", None),
+        getattr(state, "ai", None),
     ):
         if client is not None:
             with contextlib.suppress(Exception):

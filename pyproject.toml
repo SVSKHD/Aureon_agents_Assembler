@@ -25,10 +25,9 @@ dependencies = [
     "pandas>=2.2,<4",
     "python-multipart>=0.0.9",
     "pyjwt[crypto]>=2.8",
-    # Direct AI provider APIs (docs/26-ai-providers.md). Official SDKs; anthropic 2.x sends
-    # anthropic-version 2026-10-21 and runs on httpx2.
+    # Claude, the only AI provider (docs/26-ai-providers.md). anthropic 2.x sends
+    # anthropic-version 2026-10-21 and runs on httpx2. Imported only by app/ai/gateway.py.
     "anthropic>=2.4,<3",
-    "google-genai>=2.34,<3",
 ]
 
 [project.optional-dependencies]

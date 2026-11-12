@@ -85,7 +85,7 @@ def scrub(value: Any) -> Any:
 
 def scrub_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
     """Chat messages with known secret values and credential shapes removed from their text,
-    applied to every prompt before it reaches a model (OpenRouter or Ollama)."""
+    for any text bound for a model (the Claude gateway redacts through app/ai/redact.py)."""
     return [
         {**m, "content": _scrub_text(m["content"])} if isinstance(m.get("content"), str) else m
         for m in messages

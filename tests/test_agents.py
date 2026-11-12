@@ -33,9 +33,7 @@ from app.workers.scheduler import Scheduler, TaskContext, backoff, next_fire
 
 pytestmark = pytest.mark.db
 PASSWORD = "correct horse battery staple"
-OLLAMA = "http://ollama.test:11434"
 DOCKER = "http://docker.test:2375"
-TAGS = {"models": [{"name": "qwen2.5:7b", "size": 1, "details": {}}]}
 
 
 class Env:
@@ -129,32 +127,30 @@ def make_env(db_clean: str, settings: Settings, tmp_path: Path) -> EnvFactory:
 # --- registry -----------------------------------------------------------------------------
 
 
-async def test_api_registers_ollama_agent_and_heartbeats(make_env: EnvFactory) -> None:
+async def test_api_registers_claude_agent_and_heartbeats(make_env: EnvFactory) -> None:
     async with make_env(AGENT_HEARTBEAT_SECONDS=0.1) as env:
-        agent = await env.wait_agent("ollama")
-        assert agent["state"] == "idle" and agent["kind"] == "llm"
-        assert (
-            agent["details"]["capacity"]
-            == env.settings.OLLAMA_MAX_CONCURRENT + env.settings.OLLAMA_MAX_QUEUE
-        )
+        agent = await env.wait_agent("claude")
+        # No ANTHROPIC_API_KEY in the test settings: registered, reported as disabled.
+        assert agent["kind"] == "llm" and agent["details"]["configured"] is False
+        assert agent["details"]["model_main"] == env.settings.AI_MODEL_MAIN
         first = agent["last_heartbeat_at"]
         await asyncio.sleep(0.3)
-        assert (await env.wait_agent("ollama"))["last_heartbeat_at"] > first
+        assert (await env.wait_agent("claude"))["last_heartbeat_at"] > first
         listing = (await env.user.get("/api/agents")).json()["agents"]
-        assert [a["id"] for a in listing] == ["ollama"]
+        assert [a["id"] for a in listing] == ["claude"]
     # Shutdown marks it stopped.
     engine = create_async_engine(env.settings.DATABASE_URL.get_secret_value())
     async with engine.connect() as conn:
-        state = (await conn.execute(select(Agent.state).where(Agent.id == "ollama"))).scalar()
+        state = (await conn.execute(select(Agent.state).where(Agent.id == "claude"))).scalar()
     await engine.dispose()
     assert state == "stopped"
 
 
 async def test_stale_agent_is_reported(make_env: EnvFactory) -> None:
     async with make_env(AGENT_HEARTBEAT_SECONDS=3600, AGENT_STALE_SECONDS=30) as env:
-        await env.wait_agent("ollama")
+        await env.wait_agent("claude")
         await env.exec(update(Agent).values(last_heartbeat_at=func.now() - timedelta(minutes=5)))
-        agent = (await env.user.get("/api/agents/ollama")).json()
+        agent = (await env.user.get("/api/agents/claude")).json()
         assert agent["state"] == "stale" and agent["reported_state"] == "idle"
         assert agent["seconds_since_heartbeat"] >= 299
 
@@ -165,82 +161,64 @@ async def test_unknown_agent_404(make_env: EnvFactory) -> None:
         assert (await env.post("admin", "/api/agents/nope/pause")).status_code == 404
 
 
-@respx.mock
-async def test_pause_resume_ollama_is_admin_only_audited_and_blocks_chat(
+async def test_pause_resume_claude_is_admin_only_audited_and_blocks_chat(
     make_env: EnvFactory,
 ) -> None:
-    respx.get(f"{OLLAMA}/api/tags").mock(return_value=httpx.Response(200, json=TAGS))
-    done = {"model": "qwen2.5:7b", "message": {"content": ""}, "done": True, "eval_count": 1}
-    respx.post(f"{OLLAMA}/api/chat").mock(
-        return_value=httpx.Response(
-            200,
-            content=json.dumps({"message": {"content": "hi"}}).encode()
-            + b"\n"
-            + json.dumps(done).encode()
-            + b"\n",
-        )
-    )
-    chat = {"model": "qwen2.5:7b", "messages": [{"role": "user", "content": "secret prompt"}]}
+    chat = {"message": "secret prompt", "agent": "general"}
 
     async with make_env() as env:
-        await env.wait_agent("ollama")
-        assert (await env.post("user", "/api/agents/ollama/pause")).status_code == 403
-        assert (await env.admin.post("/api/agents/ollama/pause")).status_code == 403  # CSRF
+        await env.wait_agent("claude")
+        assert (await env.post("user", "/api/agents/claude/pause")).status_code == 403
+        assert (await env.admin.post("/api/agents/claude/pause")).status_code == 403  # CSRF
 
-        r = await env.post("admin", "/api/agents/ollama/pause")
+        r = await env.post("admin", "/api/agents/claude/pause")
         assert r.status_code == 200 and r.json()["state"] == "paused"
-        blocked = await env.post("user", "/api/chat", json=chat)
-        assert blocked.status_code == 503 and "paused" in blocked.json()["detail"]
+        blocked = await env.post("user", "/api/ai/chat", json=chat)
+        assert blocked.status_code == 503 and blocked.json()["detail"]["code"] == "ai_paused"
 
-        assert (await env.post("admin", "/api/agents/ollama/resume")).json()["paused"] is False
-        ok = await env.post("user", "/api/chat", json=chat)
-        assert ok.status_code == 200 and "event: done" in ok.text
+        assert (await env.post("admin", "/api/agents/claude/resume")).json()["paused"] is False
+        # Resumed: the next refusal is the missing key, not the pause.
+        after = await env.post("user", "/api/ai/chat", json=chat)
+        assert after.status_code == 503
+        assert after.json()["detail"]["code"] == "ai_not_configured"
 
         events = await env.scalar(select(func.array_agg(AuditEvent.event_type)))
         assert "agent_paused" in events and "agent_resumed" in events
 
-        # The chat turn is recorded as an ollama run, without the prompt text.
-        runs = (await env.user.get("/api/agents/ollama/runs")).json()
-        assert runs["total"] == 1
-        run = runs["items"][0]
-        assert (run["task"], run["status"]) == ("chat", "succeeded")
-        assert "secret prompt" not in json.dumps(run)
-        assert run["duration_ms"] is not None
-
 
 async def test_pause_reaches_agent_via_heartbeat(make_env: EnvFactory) -> None:
     async with make_env(AGENT_HEARTBEAT_SECONDS=0.05) as env:
-        await env.wait_agent("ollama")
+        await env.wait_agent("claude")
         # Paused directly in the DB (e.g. from another API process): the heartbeat picks it up.
-        await env.exec(update(Agent).where(Agent.id == "ollama").values(paused=True))
+        await env.exec(update(Agent).where(Agent.id == "claude").values(paused=True))
         for _ in range(50):
-            if env.app.state.agent_paused.get("ollama"):
+            if env.app.state.agent_paused.get("claude"):
                 break
             await asyncio.sleep(0.05)
-        assert env.app.state.agent_paused["ollama"] is True
+        assert env.app.state.agent_paused["claude"] is True
 
 
 async def test_logs_are_admin_only_and_filterable(make_env: EnvFactory) -> None:
     async with make_env() as env:
-        await env.wait_agent("ollama")
+        await env.wait_agent("claude")
         reg = AgentRegistry(env.maker)
-        run_id = await reg.start_run("ollama", "probe")
-        await reg.log("ollama", "info", "hello", run_id=run_id, n=1)
-        await reg.log("ollama", "error", "boom")
+        run_id = await reg.start_run("claude", "probe")
+        await reg.log("claude", "info", "hello", run_id=run_id, n=1)
+        await reg.log("claude", "error", "boom")
         await reg.finish_run(run_id, "failed", error="boom", details={"x": 1})
 
-        assert (await env.user.get("/api/agents/ollama/logs")).status_code == 403
-        logs = (await env.admin.get("/api/agents/ollama/logs")).json()
+        assert (await env.user.get("/api/agents/claude/logs")).status_code == 403
+        logs = (await env.admin.get("/api/agents/claude/logs")).json()
         assert logs["total"] == 2 and logs["items"][0]["message"] == "boom"
-        errors = (await env.admin.get("/api/agents/ollama/logs?level=error")).json()
+        errors = (await env.admin.get("/api/agents/claude/logs?level=error")).json()
         assert errors["total"] == 1
-        by_run = (await env.admin.get(f"/api/agents/ollama/logs?run_id={run_id}")).json()
+        by_run = (await env.admin.get(f"/api/agents/claude/logs?run_id={run_id}")).json()
         assert by_run["items"][0]["context"] == {"n": 1}
 
-        failed = (await env.user.get("/api/agents/ollama/runs?status=failed")).json()
+        failed = (await env.user.get("/api/agents/claude/runs?status=failed")).json()
         assert failed["items"][0]["details"] == {"x": 1}
         assert failed["items"][0]["duration_ms"] >= 0
-        detail = (await env.user.get("/api/agents/ollama")).json()
+        detail = (await env.user.get("/api/agents/claude")).json()
         assert detail["runs_last_24h"] == {"failed": 1}
 
 
@@ -444,7 +422,6 @@ async def test_default_jobs_and_builtin_tasks(make_env: EnvFactory) -> None:
         assert {j["id"] for j in jobs} == {
             "purge-agent-history",
             "purge-expired-sessions",
-            "refresh-model-inventory",
             "paper-process",
             "paper-reconcile",
             "incident-scan",
@@ -507,10 +484,6 @@ async def test_scheduler_api_admin_only_and_audited(make_env: EnvFactory) -> Non
 
 @respx.mock
 async def test_system_status(make_env: EnvFactory) -> None:
-    respx.get(f"{OLLAMA}/api/tags").mock(return_value=httpx.Response(200, json=TAGS))
-    respx.get(f"{OLLAMA}/api/ps").mock(
-        return_value=httpx.Response(200, json={"models": [{"name": "qwen2.5:7b"}]})
-    )
     docker = respx.get(f"{DOCKER}/containers/json").mock(
         return_value=httpx.Response(
             200,
@@ -548,7 +521,7 @@ async def test_system_status(make_env: EnvFactory) -> None:
         assert host["disks"]["hdd"]["path"] == str(env.settings.DATA_ROOT)
         assert body["postgres"]["ok"] and body["postgres"]["connections"] >= 1
         assert body["redis"]["ok"]
-        assert body["ollama"]["loaded_models"] == ["qwen2.5:7b"]
+        assert "ollama" not in body
         assert body["imaging"]["worker"] == "absent" and body["imaging"]["ok"] is False
         assert body["docker"]["ok"] and len(body["docker"]["containers"]) == 2
         assert docker.calls[0].request.url.params["all"] == "1"
@@ -559,8 +532,6 @@ async def test_system_status(make_env: EnvFactory) -> None:
 
 @respx.mock
 async def test_system_status_reports_problems(make_env: EnvFactory) -> None:
-    respx.get(f"{OLLAMA}/api/tags").mock(side_effect=httpx.ConnectError("down"))
-    respx.get(f"{OLLAMA}/api/ps").mock(side_effect=httpx.ConnectError("down"))
     respx.get(f"{DOCKER}/containers/json").mock(
         return_value=httpx.Response(
             200,
@@ -579,11 +550,6 @@ async def test_system_status_reports_problems(make_env: EnvFactory) -> None:
         os.utime(f, (old, old))
         body = (await env.admin.get("/api/system/status")).json()
         assert body["status"] == "degraded"
-        assert body["ollama"] == {
-            "ok": False,
-            "error": "OllamaUnavailable",
-            "latency_ms": body["ollama"]["latency_ms"],
-        }
         assert sorted(body["docker"]["not_running_or_unhealthy"]) == [
             "aureon-api",
             "aureon-imaging",

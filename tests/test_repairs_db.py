@@ -62,6 +62,12 @@ diff --git a/app/services/paper.py b/app/services/paper.py
 ```"""
 
 
+@pytest.fixture(autouse=True)
+def _repair_model_wired(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Production has no repair model client (Claude-only AI); these tests bring a fake."""
+    monkeypatch.setattr(repairs, "MODEL_CLIENT_WIRED", True)
+
+
 @pytest.fixture
 def code_repo(tmp_path: Path) -> Path:
     r = tmp_path / "aureon"

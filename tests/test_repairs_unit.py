@@ -150,7 +150,10 @@ def test_processor_captures_exc_info() -> None:
     SINK.clear()
 
 
-def test_disabled_reason(settings: Settings) -> None:
+def test_disabled_reason(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    # No repair model client is wired since the AI stack became Claude-only.
+    assert "Claude-only" in (repairs.disabled_reason(settings) or "")
+    monkeypatch.setattr(repairs, "MODEL_CLIENT_WIRED", True)
     assert "REPAIR_MODEL" in (repairs.disabled_reason(settings) or "")
     s = settings.model_copy(update={"REPAIR_MODEL": "m", "REPAIR_REPO": "x"})
     assert "REPAIR_REPO" in (repairs.disabled_reason(s) or "")
