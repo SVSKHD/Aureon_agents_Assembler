@@ -11,7 +11,7 @@ top, through the same pydantic validators .env goes through, so a DB value is pa
 like the env var it replaces. `get_settings()` returns the overlay once it is installed.
 
 RELOAD. A write publishes on Redis (CHANNEL). The API swaps `app.state.settings` and rebuilds
-the clients that hold a credential (OpenRouter, Anthropic, Gemini, GitHub, Dhan) in place.
+the clients that hold a credential (Claude, GitHub, Dhan) in place.
 Workers build their clients once at startup, so a worker whose keys changed shuts down
 gracefully and re-executes itself in the same container (`run_worker`): no container
 restart, no `docker compose` call.
@@ -496,6 +496,145 @@ async def effective(maker: async_sessionmaker[AsyncSession], env: Settings) -> S
     except Exception as exc:  # DB down at boot: run on .env, the watcher catches up
         log.warning("app_settings_unavailable", error=type(exc).__name__)
         return env
+
+
+# --- diagnostics --------------------------------------------------------------------------
+
+Issue = Literal["db_undecryptable", "db_rejected", "db_ignored", "stale", "shadows_env"]
+
+
+@dataclass(frozen=True, slots=True)
+class KeyReport:
+    """One key's value at each layer, as masks only."""
+
+    key: str
+    category: str
+    is_secret: bool
+    env_masked: str | None  # .env (or the default)
+    env_source: Literal["env", "default", "unset"]
+    db_present: bool
+    db_masked: str | None  # the decrypted DB value; None when absent or undecryptable
+    db_version: int | None
+    db_updated_at: datetime | None
+    expected_masked: str | None  # what a reload would give now (.env + DB)
+    expected_source: Literal["db", "env", "default", "unset"]
+    live_masked: str | None  # what this process is running with
+    issues: tuple[Issue, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Diagnosis:
+    encryption_ready: bool
+    encryption_problem: str | None
+    master_keys: int
+    rows: int
+    unknown_rows: tuple[str, ...]  # rows for keys no longer in the registry (ignored)
+    undecryptable: tuple[str, ...]
+    rejected: tuple[str, ...]  # rows whose value fails validation on its own
+    overlay_ok: bool  # False = every DB value is ignored and .env alone applies
+    overlay_fields: tuple[str, ...]
+    stale: tuple[str, ...]  # live value differs from what a reload would give
+    keys: tuple[KeyReport, ...]
+
+
+def _env_source(env: Settings, key: str) -> Literal["env", "default", "unset"]:
+    if current_value(env, key) is None:
+        return "unset"
+    return "env" if key in env.model_fields_set else "default"
+
+
+def _rejected_fields(exc: ValidationError) -> tuple[str, ...]:
+    return tuple(sorted({str(e["loc"][0]) for e in exc.errors() if e.get("loc")}))
+
+
+def diagnose(env: Settings, live: Settings, rows: Iterable[AppSetting]) -> Diagnosis:
+    """Every layer a value passes through (.env, the encrypted DB row, the overlay, this
+    process's live settings) and where they disagree. Masks and key names only."""
+    rows = list(rows)
+    try:
+        cipher: Cipher | None = Cipher(env.SETTINGS_MASTER_KEY)
+        problem = None
+    except SettingsError as exc:
+        cipher, problem = None, exc.detail
+    master = current_value(env, "SETTINGS_MASTER_KEY") or ""
+    unknown = tuple(sorted(r.key for r in rows if r.key not in REGISTRY))
+    known = {r.key: r for r in rows if r.key in REGISTRY}
+
+    decrypted: dict[str, str] = {}
+    undecryptable: list[str] = []
+    for key, stored in known.items():
+        if cipher is None:
+            undecryptable.append(key)
+            continue
+        try:
+            decrypted[key] = cipher.decrypt(stored.value_encrypted)
+        except InvalidToken:
+            undecryptable.append(key)
+
+    rejected: list[str] = []
+    for key, value in decrypted.items():
+        try:
+            overlay(env, {key: value})
+        except ValidationError:
+            rejected.append(key)
+    overlay_fields: tuple[str, ...] = ()
+    try:
+        expected = overlay(env, decrypted)
+        overlay_ok = True
+    except ValidationError as exc:
+        expected, overlay_ok, overlay_fields = env, False, _rejected_fields(exc)
+
+    reports: list[KeyReport] = []
+    stale: list[str] = []
+    for key, spec in REGISTRY.items():
+        row = known.get(key)
+        env_value = current_value(env, key)
+        db_value = decrypted.get(key)
+        expected_value = current_value(expected, key)
+        live_value = current_value(live, key)
+        issues: list[Issue] = []
+        if row is not None and key not in decrypted:
+            issues.append("db_undecryptable")
+        if key in rejected:
+            issues.append("db_rejected")
+        elif db_value is not None and not overlay_ok:
+            issues.append("db_ignored")
+        if live_value != expected_value:
+            issues.append("stale")
+            stale.append(key)
+        if db_value is not None and env_value is not None and db_value != env_value:
+            issues.append("shadows_env")
+        env_src = _env_source(env, key)
+        reports.append(
+            KeyReport(
+                key=key,
+                category=spec.category,
+                is_secret=spec.secret,
+                env_masked=mask(env_value, spec.secret),
+                env_source=env_src,
+                db_present=row is not None,
+                db_masked=mask(db_value, spec.secret),
+                db_version=row.version if row is not None else None,
+                db_updated_at=as_utc(row.updated_at) if row is not None else None,
+                expected_masked=mask(expected_value, spec.secret),
+                expected_source="db" if overlay_ok and db_value is not None else env_src,
+                live_masked=mask(live_value, spec.secret),
+                issues=tuple(issues),
+            )
+        )
+    return Diagnosis(
+        encryption_ready=cipher is not None,
+        encryption_problem=problem,
+        master_keys=len([k for k in master.split(",") if k.strip()]),
+        rows=len(rows),
+        unknown_rows=unknown,
+        undecryptable=tuple(sorted(undecryptable)),
+        rejected=tuple(sorted(rejected)),
+        overlay_ok=overlay_ok,
+        overlay_fields=overlay_fields,
+        stale=tuple(stale),
+        keys=tuple(reports),
+    )
 
 
 async def publish(redis: Redis, keys: Iterable[str]) -> None:

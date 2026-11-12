@@ -9,11 +9,14 @@ Every write and test is audited by key name, rate limited per admin, and fails c
 from __future__ import annotations
 
 import asyncio
+import os
+import socket
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 import httpx
 import structlog
+from cryptography.fernet import InvalidToken
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
@@ -169,6 +172,21 @@ def _cipher(settings: Settings) -> svc.Cipher:
         raise _error(503, exc.code, exc.detail) from exc
 
 
+def _decryptable(rows: dict[str, AppSetting], env: Settings) -> set[str]:
+    """Keys whose DB row this server can read; the others are ignored by the overlay."""
+    cipher = svc.cipher_for(env)
+    if cipher is None:
+        return set()
+    out = set()
+    for key, row in rows.items():
+        try:
+            cipher.decrypt(row.value_encrypted)
+        except InvalidToken:
+            continue
+        out.add(key)
+    return out
+
+
 def _source(key: str, row: AppSetting | None, env: Settings) -> Source:
     if row is not None:
         return "db"
@@ -225,12 +243,157 @@ async def list_settings(request: Request, _: AdminRequired, db: DbSession) -> Se
     rows = {r.key: r for r in (await db.scalars(select(AppSetting))).all()}
     live: Settings = state.settings
     env: Settings = state.env_settings
+    # A row the server cannot decrypt is not in effect: don't call it "db".
+    readable = _decryptable(rows, env)
     return SettingsOut(
         categories=list(svc.CATEGORIES),
-        settings=[_describe(s, rows.get(k), live, env) for k, s in svc.REGISTRY.items()],
+        settings=[
+            _describe(s, rows.get(k) if k in readable else None, live, env)
+            for k, s in svc.REGISTRY.items()
+        ],
         tests=await _test_results(request),
         encryption_ready=svc.cipher_for(env) is not None,
     )
+
+
+# --- diagnostics --------------------------------------------------------------------------
+
+
+class KeyDiagnosisOut(BaseModel):
+    key: str
+    category: str
+    is_secret: bool
+    env_masked: str | None
+    env_source: Literal["env", "default", "unset"]
+    db_present: bool
+    db_masked: str | None
+    db_version: int | None
+    db_updated_at: datetime | None
+    expected_masked: str | None
+    expected_source: Source
+    live_masked: str | None
+    issues: list[Literal["db_undecryptable", "db_rejected", "db_ignored", "stale", "shadows_env"]]
+
+
+class AiRuntimeOut(BaseModel):
+    configured: bool
+    key_masked: str | None
+    matches_settings: bool  # the gateway holds the key the live settings name
+    model_main: str
+    model_router: str
+
+
+class ServerOut(BaseModel):
+    host: str
+    pid: int
+    environment: str
+
+
+class DiagnosticsOut(BaseModel):
+    checked_at: datetime
+    server: ServerOut
+    encryption_ready: bool
+    encryption_problem: str | None
+    master_keys: int
+    database_ok: bool
+    database_error: str | None
+    rows: int
+    unknown_rows: list[str]
+    undecryptable: list[str]
+    rejected: list[str]
+    overlay_ok: bool
+    overlay_fields: list[str]
+    stale: list[str]
+    ai: AiRuntimeOut
+    keys: list[KeyDiagnosisOut]
+
+
+def _ai_runtime(state: object, live: Settings) -> AiRuntimeOut:
+    gateway = getattr(state, "ai", None)
+    held = gateway.settings.anthropic_key if gateway is not None else ""
+    return AiRuntimeOut(
+        configured=bool(gateway is not None and gateway.configured),
+        key_masked=svc.mask(held or None, True),
+        matches_settings=held == live.anthropic_key,
+        model_main=live.AI_MODEL_MAIN,
+        model_router=live.AI_MODEL_ROUTER,
+    )
+
+
+@router.get("/diagnostics", response_model=DiagnosticsOut)
+async def diagnostics(request: Request, _: AdminRequired) -> DiagnosticsOut:
+    """Where every value comes from, layer by layer (.env, the encrypted DB row, what a reload
+    would give, what this process runs with) and where they disagree. Masks only."""
+    state = request.app.state
+    live: Settings = state.settings
+    env: Settings = state.env_settings
+    rows: list[AppSetting] = []
+    db_error = None
+    try:
+        async with state.sessionmaker() as db:
+            rows = list((await db.scalars(select(AppSetting))).all())
+    except Exception as exc:  # the report still shows .env and the live process
+        db_error = type(exc).__name__
+    d = svc.diagnose(env, live, rows)
+    return DiagnosticsOut(
+        checked_at=datetime.now(UTC),
+        server=ServerOut(
+            host=socket.gethostname(), pid=os.getpid(), environment=live.DEVOPS_ENVIRONMENT
+        ),
+        encryption_ready=d.encryption_ready,
+        encryption_problem=d.encryption_problem,
+        master_keys=d.master_keys,
+        database_ok=db_error is None,
+        database_error=db_error,
+        rows=d.rows,
+        unknown_rows=list(d.unknown_rows),
+        undecryptable=list(d.undecryptable),
+        rejected=list(d.rejected),
+        overlay_ok=d.overlay_ok,
+        overlay_fields=list(d.overlay_fields),
+        stale=list(d.stale),
+        ai=_ai_runtime(state, live),
+        keys=[
+            KeyDiagnosisOut(
+                key=k.key,
+                category=k.category,
+                is_secret=k.is_secret,
+                env_masked=k.env_masked,
+                env_source=k.env_source,
+                db_present=k.db_present,
+                db_masked=k.db_masked,
+                db_version=k.db_version,
+                db_updated_at=k.db_updated_at,
+                expected_masked=k.expected_masked,
+                expected_source=k.expected_source,
+                live_masked=k.live_masked,
+                issues=list(k.issues),
+            )
+            for k in d.keys
+        ],
+    )
+
+
+class ReloadOut(BaseModel):
+    changed: list[str]
+
+
+@router.post("/reload", response_model=ReloadOut, dependencies=[Depends(write_limited)])
+async def reload_settings(request: Request, admin: AdminRequired, db: DbSession) -> ReloadOut:
+    """Re-read .env + the DB now and rebuild the clients whose keys changed (the Claude
+    gateway included), here and in the workers. For when diagnostics shows stale keys."""
+    app = request.app
+    changed = await app_settings_runtime.reload(app)
+    await svc.publish(app.state.redis, changed or list(svc.REGISTRY))
+    audit.record(
+        db,
+        "settings_reloaded",
+        ClientInfo.from_request(request),
+        actor_user_id=admin.user.id,
+        details={"changed": changed},
+    )
+    await db.commit()
+    return ReloadOut(changed=changed)
 
 
 async def _apply_and_publish(request: Request, key: str) -> SettingOut:
