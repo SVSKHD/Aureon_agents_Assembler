@@ -146,3 +146,28 @@ def test_digest_is_keyed_and_stable(env: Settings) -> None:
     other = env.model_copy(update={"SECRET_KEY": SecretStr("another-secret-key-" * 3)})
     assert a != svc.digest(other, "ANTHROPIC_API_KEY", KEY_A)
     assert svc.digest(env, "ANTHROPIC_API_KEY", None) is None
+
+
+def test_a_report_keeps_its_load_time(env: Settings) -> None:
+    loaded = datetime(2026, 11, 12, 9, 0, tzinfo=UTC)
+    snap = svc.applied_snapshot(env, "scheduler", ("DHAN_",), loaded)
+    assert snap["applied_at"] == loaded.isoformat()
+    # A replaced container's report must expire soon after it stops re-reporting.
+    assert svc.REPORT_EVERY_SECONDS * 2 < svc.APPLIED_TTL <= 3600
+
+
+async def test_keep_reporting_repeats_until_stopped() -> None:
+    import asyncio
+
+    stop = asyncio.Event()
+    sent: list[int] = []
+
+    async def send() -> None:
+        sent.append(1)
+        if len(sent) == 3:
+            stop.set()
+        if len(sent) == 2:
+            raise RuntimeError("redis down")  # one failed report never ends the loop
+
+    await asyncio.wait_for(svc.keep_reporting(send, stop, every=0.01), timeout=2)
+    assert len(sent) == 3

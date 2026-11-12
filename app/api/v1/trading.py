@@ -56,6 +56,8 @@ from app.schemas.trading import (
     BacktestRequest,
     BacktestRunOut,
     BacktestTradeOut,
+    BrokerOut,
+    BrokerSegmentOut,
     CandleOut,
     ExecutionOut,
     ExplainQueued,
@@ -494,6 +496,40 @@ async def quotes(
 
 
 # --- stored data --------------------------------------------------------------------------
+
+
+BROKER_LABELS: dict[Broker, str] = {Broker.DHAN: "Dhan", Broker.MT5: "MT5"}
+
+
+@router.get("/brokers", response_model=list[BrokerOut])
+async def brokers(request: Request, db: DbSession, _: Current) -> list[BrokerOut]:
+    """Every broker Aureon knows, whether its read-only adapter is running, and how many
+    active instruments it has per segment: what the instrument browser can be scoped to."""
+    rows = (
+        await db.execute(
+            select(Instrument.broker, Instrument.segment, func.count())
+            .where(Instrument.is_active.is_(True))
+            .group_by(Instrument.broker, Instrument.segment)
+        )
+    ).all()
+    adapters = _adapters(request)
+    out = []
+    for b in Broker:
+        segs = sorted(
+            (BrokerSegmentOut(segment=seg, instruments=n) for br, seg, n in rows
+             if br == b.value and seg),
+            key=lambda x: x.segment,
+        )  # fmt: skip
+        out.append(
+            BrokerOut(
+                broker=b,
+                label=BROKER_LABELS.get(b, b.value.upper()),
+                configured=adapters.get(b.value) is not None,
+                instruments=sum(n for br, _seg, n in rows if br == b.value),
+                segments=segs,
+            )
+        )
+    return out
 
 
 @router.get("/instruments", response_model=Page[InstrumentOut])

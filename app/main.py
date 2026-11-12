@@ -66,9 +66,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app_settings.install(live)
         app.state.settings = live
         # What this process loaded, for /settings/diagnostics: in the background, never
-        # holding up startup (Redis may be slow or down).
+        # holding up startup (Redis may be slow or down), re-sent every few minutes.
         settings_report = asyncio.create_task(
-            app_settings_runtime.report(app), name="app-settings-report"
+            app_settings_runtime.keep_reporting(app), name="app-settings-report"
         )
         app.state.http = http
         app.state.health = HealthService(settings, engine, redis, http)
