@@ -86,7 +86,10 @@ async def test_chat_streams_saves_and_replays(make_env: EnvFactory) -> None:  # 
         kinds = [k for k, _ in ev]
         assert kinds[0] == "meta" and kinds[-1] == "done"
         assert ("tool", {"name": "get_portfolio_summary", "status": "ok"}) in ev
+        # The answer streams as text events, and comes once more whole in `done`.
+        assert "".join(d["delta"] for k, d in ev if k == "text") == "No accounts yet."
         done = ev[-1][1]
+        assert done["text"] == "No accounts yet."
         conv = done["conversation_id"]
         assert Decimal(done["cost_usd"]) > 0 and done["steps"] == 2
 
