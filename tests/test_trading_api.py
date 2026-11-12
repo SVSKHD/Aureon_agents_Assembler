@@ -488,3 +488,41 @@ async def test_every_trading_endpoint_requires_auth(make_env: EnvFactory) -> Non
             assert (await anon.get(f"/api/trading/{path}")).status_code == 401, path
         await anon.aclose()
         assert BrokerAccount.__table__.c.mode.server_default is not None
+
+
+async def test_brokers_lists_instrument_counts_per_segment(make_env: EnvFactory) -> None:
+    async with make_env() as env:
+        async with env.maker() as db, db.begin():
+            for n, (seg, active) in enumerate(
+                [("NSE_EQ", True), ("NSE_EQ", True), ("NSE_FNO", True), ("BSE_EQ", False)]
+            ):
+                db.add(
+                    Instrument(
+                        broker="dhan",
+                        broker_instrument_id=f"{seg}:{n}",
+                        symbol=f"S{n}",
+                        segment=seg,
+                        instrument_type="EQUITY",
+                        currency="INR",
+                        lot_size=Decimal(1),
+                        tick_size=Decimal("0.05"),
+                        is_active=active,
+                    )
+                )
+        res = await env.user.get("/api/trading/brokers")
+        assert res.status_code == 200
+        by = {b["broker"]: b for b in res.json()}
+        assert set(by) == {"dhan", "mt5"}
+        # Inactive (expired, delisted) instruments are not counted.
+        assert by["dhan"]["instruments"] == 3
+        assert by["dhan"]["segments"] == [
+            {"segment": "NSE_EQ", "instruments": 2},
+            {"segment": "NSE_FNO", "instruments": 1},
+        ]
+        assert by["mt5"]["instruments"] == 0 and by["mt5"]["segments"] == []
+        # The server-side filters the browser now uses.
+        page = (await env.user.get("/api/trading/instruments?broker=dhan&segment=NSE_FNO")).json()
+        assert page["total"] == 1
+        anon = AsyncClient(transport=ASGITransport(app=env.app), base_url="https://test")
+        async with anon:
+            assert (await anon.get("/api/trading/brokers")).status_code == 401

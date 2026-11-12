@@ -217,6 +217,22 @@ class OptionChainOut(_FromAttrs):
 # --- stored data --------------------------------------------------------------------------
 
 
+class BrokerSegmentOut(BaseModel):
+    segment: str
+    instruments: int
+
+
+class BrokerOut(BaseModel):
+    """One broker the instrument browser can be scoped to. `configured` means its read-only
+    adapter is running here; a broker can still have stored instruments without it."""
+
+    broker: Broker
+    label: str
+    configured: bool
+    instruments: int
+    segments: list[BrokerSegmentOut]
+
+
 class InstrumentOut(_FromAttrs):
     id: int
     broker: str
