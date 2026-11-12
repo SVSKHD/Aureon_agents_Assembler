@@ -42,6 +42,8 @@ dev = [
     "types-croniter",
     "pandas-stubs",
     "pyyaml>=6.0",
+    # The vendored Aureon v1.63 client the compatibility tests drive (tests/fixtures).
+    "requests>=2.31",
 ]
 
 [build-system]
