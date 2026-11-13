@@ -105,7 +105,7 @@ Workers build their clients once at startup. Each one watches the keys it uses:
 |--------|------|
 | `scheduler` | `DHAN_*`, `GITHUB_*`, `DISCORD_*`, `MT5_*` |
 | `dhan-feed` | `DHAN_*` |
-| `research-worker` | `OPENROUTER_*`, `AI_RESEARCH_*` |
+| `research-worker` | `DHAN_*` (a new Dhan login reaches chart history), `MT5_*`, `ANTHROPIC_*`, `AI_*` |
 | `coding-worker`, `github-webhook-worker` | `GITHUB_*` |
 
 When one of its keys changes, the worker stops gracefully (the same path as SIGTERM) and

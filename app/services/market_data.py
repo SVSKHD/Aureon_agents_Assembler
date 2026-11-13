@@ -21,7 +21,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import case, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -165,8 +165,10 @@ async def enqueue_backfill(
 
 
 async def claim_backfill(maker: async_sessionmaker[AsyncSession]) -> uuid.UUID | None:
-    """Oldest queued request → running (SKIP LOCKED). A request left running for over an hour
-    by a stopped worker goes back to the queue first."""
+    """Next queued request → running (SKIP LOCKED): a person's own request (a chart waiting on
+    screen) before the scheduled universe/system backfill, then oldest first. Without this a
+    chart opened after the nightly universe run waits behind thousands of bulk requests. A
+    request left running for over an hour by a stopped worker goes back to the queue first."""
     async with maker() as db, db.begin():
         await db.execute(
             update(CandleBackfillRequest)
@@ -179,7 +181,10 @@ async def claim_backfill(maker: async_sessionmaker[AsyncSession]) -> uuid.UUID |
         row = await db.scalar(
             select(CandleBackfillRequest)
             .where(CandleBackfillRequest.status == "queued")
-            .order_by(CandleBackfillRequest.created_at)
+            .order_by(
+                case((CandleBackfillRequest.source == "user", 0), else_=1),
+                CandleBackfillRequest.created_at,
+            )
             .limit(1)
             .with_for_update(skip_locked=True)
         )

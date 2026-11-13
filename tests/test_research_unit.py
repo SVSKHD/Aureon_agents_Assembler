@@ -16,6 +16,7 @@ import pytest
 from app.agents.research import backtest as bt
 from app.agents.research import indicators as ind
 from app.agents.research import strategies as st
+from app.core.config import Settings
 from app.services.research import TickAggregator, grid_params
 
 T0 = datetime(2026, 11, 2, 9, 0, tzinfo=UTC)
@@ -301,3 +302,17 @@ def test_tick_aggregator_emits_complete_minutes() -> None:
     assert bar.volume == Decimal(15)  # 1000 → 1015 within the minute
     assert agg.add(p("04:00:50", "500", 1031)) == []  # late tick for an emitted minute
     assert agg.add({"segment": "NSE_EQ", "security_id": "1", "ltp": None}) == []
+
+
+def test_research_worker_reloads_on_broker_logins(settings: Settings) -> None:
+    """Its Dhan/MT5 adapters are built once at startup: a new Dhan login (DHAN_SESSION_TOKEN,
+    renewed daily) or MT5 change must re-exec it, or chart history stays queued forever."""
+    from app.services import app_settings as svc
+    from app.workers import research as worker
+
+    assert {"DHAN_", "MT5_"} <= set(worker.RELOAD_PREFIXES)
+    old = svc.overlay(settings, {"DHAN_CLIENT_ID": "1100"})
+    new = svc.overlay(
+        settings, {"DHAN_CLIENT_ID": "1100", "DHAN_SESSION_TOKEN": "fresh-login-token"}
+    )
+    assert "DHAN_SESSION_TOKEN" in svc.changed_keys(old, new, worker.RELOAD_PREFIXES)
