@@ -11,6 +11,8 @@ Checked in the API lifespan (docs/16-production-hardening.md, "Production checkl
 7. MT5_INGEST_TOKEN, when set, is >= 32 chars, not a placeholder, and not the same value as
    another credential (MT5_STATUS_TOKEN, SECRET_KEY, GITHUB_WEBHOOK_SECRET, ...): one shared
    value would let whoever holds the other credential push as the bot, and vice versa.
+   MT5_RECORDS_TOKEN (docs/36) gets the same checks, and must also differ from
+   MT5_INGEST_TOKEN and the Aureon role tokens.
 """
 
 from __future__ import annotations
@@ -70,6 +72,55 @@ def ingest_token_problems(settings: Settings) -> list[str]:
         return []
     return [
         p for p in (ingest_token_strength_problem(tok), ingest_token_reuse_problem(settings)) if p
+    ]
+
+
+# Credentials the MT5 records token (docs/36) must never equal: everything the ingest token
+# must differ from, the ingest token itself, and the Aureon V1.6.3 role tokens.
+RECORDS_TOKEN_DISTINCT_FROM = (
+    *INGEST_TOKEN_DISTINCT_FROM,
+    "MT5_INGEST_TOKEN",
+    "AUREON_API_READ_TOKEN",
+    "AUREON_API_WRITE_TOKEN",
+    "AUREON_API_COLLECTOR_TOKEN",
+    "AUREON_API_GUARD_TOKEN",
+    "AUREON_API_SERVICE_TOKEN",
+    "AUREON_API_ADMIN_TOKEN",
+    "AUREON_API_SVC_TOKEN",
+)
+
+
+def records_token_strength_problem(token: str) -> str | None:
+    """Same bar as MT5_INGEST_TOKEN: >= 32 characters and not a placeholder."""
+    if len(token) < MIN_SECRET_LEN:
+        return f"MT5_RECORDS_TOKEN is shorter than {MIN_SECRET_LEN} characters"
+    if any(m in token.lower() for m in PLACEHOLDER_MARKERS):
+        return "MT5_RECORDS_TOKEN is a placeholder"
+    return None
+
+
+def records_token_reuse_problem(settings: Settings) -> str | None:
+    """MT5_RECORDS_TOKEN shares its value with another credential (names it, never the value)."""
+    tok = settings.MT5_RECORDS_TOKEN.get_secret_value() if settings.MT5_RECORDS_TOKEN else ""
+    if not tok:
+        return None
+    for name in RECORDS_TOKEN_DISTINCT_FROM:
+        other = getattr(settings, name, None)
+        raw = other.get_secret_value() if isinstance(other, SecretStr) else other
+        if not isinstance(raw, str) or not raw:
+            continue
+        values = raw.split(",") if name == "SETTINGS_MASTER_KEY" else [raw]
+        if any(v.strip() == tok for v in values):
+            return f"MT5_RECORDS_TOKEN must not reuse the value of {name}"
+    return None
+
+
+def records_token_problems(settings: Settings) -> list[str]:
+    tok = settings.MT5_RECORDS_TOKEN.get_secret_value() if settings.MT5_RECORDS_TOKEN else ""
+    if not tok:
+        return []
+    return [
+        p for p in (records_token_strength_problem(tok), records_token_reuse_problem(settings)) if p
     ]
 
 
@@ -156,6 +207,7 @@ def production_problems(settings: Settings) -> list[str]:
     except RuntimeError as exc:
         problems.append(f"data root: {exc}")
     problems.extend(ingest_token_problems(settings))
+    problems.extend(records_token_problems(settings))
     problems.extend(aureon_token_problems(settings))
     if bool((settings.CF_ACCESS_TEAM_DOMAIN or "").strip()) != bool(settings.CF_ACCESS_AUD):
         problems.append("CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD must be set together")

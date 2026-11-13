@@ -226,6 +226,7 @@ def test_default_tools_match_the_plan(settings: Settings) -> None:
         "get_dhan_screener_results",
         "get_mt5_bot_status",
         "get_mt5_recent_signals",
+        "mt5_records_summary",
         "propose_trade",
         *suggest,
     }

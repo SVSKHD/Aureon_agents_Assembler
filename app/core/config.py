@@ -358,6 +358,23 @@ class Settings(BaseSettings):
     def mt5_ingest_enabled(self) -> bool:
         return bool(self.MT5_INGEST_TOKEN and self.MT5_INGEST_TOKEN.get_secret_value())
 
+    # --- MT5 records API (aureon.mt5.records/v1 + aureon.mt5.bars/v1, docs/36-mt5-records.md) ---
+    # Bearer token the bot (aureon_mt5_2026 1.7.x) sends to POST /api/trading/mt5/records and
+    # POST /api/trading/mt5/bars. Unset = both routes answer 503. Single purpose: it must differ
+    # from MT5_INGEST_TOKEN and every other credential (checked per request, at startup in prod
+    # and on a managed-settings write). Body limits reuse MT5_INGEST_MAX_(DECOMPRESSED_)BYTES.
+    MT5_RECORDS_TOKEN: SecretStr | None = None
+    # Rows per POST /records (more = 422; the bot splits its queue into batches).
+    MT5_RECORDS_MAX_BATCH: int = Field(default=500, ge=1, le=5000)
+    # Write requests per minute for the token (both routes together); more answer 429.
+    MT5_RECORDS_RATE_PER_MINUTE: int = Field(default=60, ge=1, le=6000)
+    # mt5.records retention by utc_time; 0 keeps forever. mt5.bars is never purged.
+    MT5_RECORDS_RETENTION_DAYS: int = Field(default=0, ge=0, le=36500)
+
+    @property
+    def mt5_records_enabled(self) -> bool:
+        return bool(self.MT5_RECORDS_TOKEN and self.MT5_RECORDS_TOKEN.get_secret_value())
+
     # --- Aureon V1.6.3 database API (docs/34-aureon-v163.md) ---
     # One bearer token per role, least privilege; unset = that role is off. The Windows box
     # holds only COLLECTOR and/or GUARD; READ/WRITE are for reporting clients; ADMIN clears a

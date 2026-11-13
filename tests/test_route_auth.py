@@ -27,6 +27,9 @@ PUBLIC = {
     ("POST", "/api/v1/github/webhooks"),
     # MT5 bot push: machine-to-machine, bearer MT5_INGEST_TOKEN instead (docs/12 §3).
     ("POST", "/api/trading/mt5/ingest"),
+    # MT5 records API writes (1.7.x bot): bearer MT5_RECORDS_TOKEN instead (docs/36).
+    ("POST", "/api/trading/mt5/records"),
+    ("POST", "/api/trading/mt5/bars"),
     # Dhan login callback: only redirects the browser to the SPA with the tokenId; the
     # exchange is POST /consume (admin + CSRF + a login started from that session).
     ("GET", "/api/v1/dhan/auth/callback"),
@@ -76,7 +79,13 @@ AUREON_MACHINE = {
     ("POST", "/api/v1/ingest/trade_event"),
 }
 # Public routes that change state, each with its own authentication.
-PUBLIC_UNSAFE = {"/api/auth/login", "/api/v1/github/webhooks", "/api/trading/mt5/ingest"}
+PUBLIC_UNSAFE = {
+    "/api/auth/login",
+    "/api/v1/github/webhooks",
+    "/api/trading/mt5/ingest",
+    "/api/trading/mt5/records",
+    "/api/trading/mt5/bars",
+}
 # Public routes that must carry the per-IP limiter dependency.
 PUBLIC_RATE_LIMITED = {p for m, p in PUBLIC if p.startswith("/api/public/")}
 

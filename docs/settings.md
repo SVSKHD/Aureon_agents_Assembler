@@ -21,7 +21,7 @@ Only the keys in `REGISTRY` (`app/services/app_settings.py`) can be set. Keys ma
 | Gemini     | the same keys with the `GEMINI_` prefix |
 | AI         | `AI_DEFAULT_EXTERNAL_PROVIDER`, `AI_EXTERNAL_FALLBACK_PROVIDERS` ([30](30-external-first-ai.md)), `AI_EXTERNAL_DAILY_LIMIT_USD`, `AI_EXTERNAL_MAX_OUTPUT_TOKENS`, `AI_EXTERNAL_MAX_RETRIES`, `AI_EXTERNAL_REQUESTS_PER_MINUTE` |
 | Discord    | `DISCORD_WEBHOOK_URL` (secret, re-auth) |
-| MT5        | `MT5_INGEST_TOKEN` (secret, re-auth) |
+| MT5        | `MT5_INGEST_TOKEN` (secret, re-auth), `MT5_RECORDS_TOKEN` (secret, re-auth), `MT5_RECORDS_MAX_BATCH`, `MT5_RECORDS_RATE_PER_MINUTE`, `MT5_RECORDS_RETENTION_DAYS` ([36](36-mt5-records.md#7-settings)) |
 
 **Bootstrap keys are `.env` only.** These are `DATABASE_URL`, `MIGRATIONS_DATABASE_URL`, `SECRET_KEY`,
 `SETTINGS_MASTER_KEY`, `REDIS_URL`, `TRADING_LIVE_ENABLED` and `PHASE_G_APPROVED`. The API

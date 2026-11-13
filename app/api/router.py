@@ -24,6 +24,7 @@ from app.api.v1 import (
     images,
     market,
     mt5_push,
+    mt5_records,
     paper,
     public,
     repairs,
@@ -44,6 +45,7 @@ api_router.include_router(agents.router)
 api_router.include_router(trading.router)
 api_router.include_router(market.router)  # /api/trading screener, watchlists (docs/35)
 api_router.include_router(mt5_push.router)  # /api/trading/mt5/ingest (bearer) + dashboard reads
+api_router.include_router(mt5_records.router)  # records/bars (bearer), dataset (docs/36)
 api_router.include_router(paper.router)
 api_router.include_router(code.router)
 api_router.include_router(public.router)

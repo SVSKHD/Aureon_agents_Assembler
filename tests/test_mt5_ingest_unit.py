@@ -446,7 +446,8 @@ def test_access_and_csrf_exemption_is_exactly_the_ingest_path(settings: Settings
         "/API/trading/mt5/ingest",
     ):
         assert not is_machine_path(p), p
-    # Only the ingest route lacks both a session and CSRF among the /api/trading routes.
+    # Only the bot's bearer routes lack both a session and CSRF among the /api/trading routes:
+    # the push/v1 ingest, and the records API writes (docs/36, bearer MT5_RECORDS_TOKEN).
     no_session = sorted(
         (m, r.path)
         for r in api_routes(create_app(settings))
@@ -454,7 +455,11 @@ def test_access_and_csrf_exemption_is_exactly_the_ingest_path(settings: Settings
         for m in r.methods
         if "get_current" not in r.deps
     )
-    assert no_session == [("POST", "/api/trading/mt5/ingest")]
+    assert no_session == [
+        ("POST", "/api/trading/mt5/bars"),
+        ("POST", "/api/trading/mt5/ingest"),
+        ("POST", "/api/trading/mt5/records"),
+    ]
 
 
 async def test_access_middleware_lets_only_ingest_through(settings: Settings) -> None:

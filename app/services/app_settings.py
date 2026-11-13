@@ -54,8 +54,11 @@ from app.core.config import Settings, get_env_settings, jwt_expiry, set_effectiv
 from app.core.logging import register_secret_values
 from app.core.prod_checks import (
     INGEST_TOKEN_DISTINCT_FROM,
+    RECORDS_TOKEN_DISTINCT_FROM,
     ingest_token_reuse_problem,
     ingest_token_strength_problem,
+    records_token_reuse_problem,
+    records_token_strength_problem,
 )
 from app.models.app_settings import AppSetting
 
@@ -240,6 +243,21 @@ REGISTRY: dict[str, Spec] = {
         ),
         _s("DISCORD_WEBHOOK_URL", "discord", "secret", "Discord webhook URL"),
         _s("MT5_INGEST_TOKEN", "mt5", "secret", "Token the MT5 bot pushes with"),
+        # --- MT5 records API (docs/36-mt5-records.md) ---
+        _s(
+            "MT5_RECORDS_TOKEN",
+            "mt5",
+            "secret",
+            "Token the MT5 bot (1.7.x) sends records and bars with (differs from every other)",
+        ),
+        _s("MT5_RECORDS_MAX_BATCH", "mt5", "int", "MT5 records: rows per request"),
+        _s("MT5_RECORDS_RATE_PER_MINUTE", "mt5", "int", "MT5 records: write requests per minute"),
+        _s(
+            "MT5_RECORDS_RETENTION_DAYS",
+            "mt5",
+            "int",
+            "MT5 records: keep this many days (0 = forever; bars are never purged)",
+        ),
     )
 }
 
@@ -353,6 +371,8 @@ def normalize(spec: Spec, raw: str) -> str:
     if spec.key == "MT5_INGEST_TOKEN" and (problem := ingest_token_strength_problem(value)):
         # Same bar as the ENV=prod checklist; a managed value never bypasses it.
         raise SettingsError("invalid_value", problem)
+    if spec.key == "MT5_RECORDS_TOKEN" and (problem := records_token_strength_problem(value)):
+        raise SettingsError("invalid_value", problem)
     if spec.key == "DISCORD_WEBHOOK_URL":
         parts = urlsplit(value)
         if (
@@ -398,6 +418,10 @@ def checked_overlay(env: Settings, overrides: Mapping[str, str], key: str) -> Se
     # One value must never serve as two credentials (the MT5 ingest token vs any other).
     if key in ("MT5_INGEST_TOKEN", *INGEST_TOKEN_DISTINCT_FROM) and (
         problem := ingest_token_reuse_problem(merged)
+    ):
+        raise SettingsError("invalid_value", problem)
+    if key in ("MT5_RECORDS_TOKEN", *RECORDS_TOKEN_DISTINCT_FROM) and (
+        problem := records_token_reuse_problem(merged)
     ):
         raise SettingsError("invalid_value", problem)
     return merged

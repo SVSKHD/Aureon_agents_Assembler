@@ -761,3 +761,42 @@ See [25-openrouter.md](25-openrouter.md) and "Prompt 0" above.
   git ops) merge first. Until they do, the non-DB chain test
   (`test_the_chain_is_linear_and_every_revision_has_a_downgrade`) fails on this branch.
 
+
+## 36 — MT5 records API (aureon.mt5.records/v1, aureon.mt5.bars/v1)
+
+See [36-mt5-records.md](36-mt5-records.md).
+
+- **D-36-1: "a table named mt5" = tables in the existing schema `mt5`.** `mt5.records` (every
+  record the 1.7.x bot writes) and `mt5.bars` (closed candles, kept forever). Migration 0031 is
+  additive; push/v1's tables and `POST /api/trading/mt5/ingest` are untouched.
+- **D-36-2: envelope columns + JSONB payload.** The seven keys every `store.py` row carries are
+  columns (indexed by kind/symbol/account with utc_time desc); everything else is `payload`
+  with a GIN `jsonb_path_ops` index (the `label` filter uses `@>`). Unknown kinds matching
+  `^[a-z_]{1,32}$` are accepted, so the bot can add kinds without a server change.
+- **D-36-3: its own token.** `MT5_RECORDS_TOKEN`, single purpose, same checks as the ingest
+  token (constant-time compare, per-request reuse/strength check, prod checklist, managed
+  setting) and additionally distinct from `MT5_INGEST_TOKEN` and the Aureon role tokens. The
+  ingest token's own checks were not changed.
+- **D-36-4: per-row validation, idempotent by record_id.** A bad row is listed in `rejected`
+  and never fails the batch; `ON CONFLICT (record_id) DO NOTHING`; a resend counts as
+  `duplicate`. Envelope problems (schema id, batch size, not JSON) are 422 for the whole
+  request. NaN/Infinity and NUL characters are refused (JSONB would reject them).
+- **D-36-5: bars upsert only when something changed.** `ON CONFLICT DO UPDATE ... WHERE` any
+  value `IS DISTINCT FROM` the stored one; the answer separates inserted / updated / unchanged
+  (`xmax = 0` for inserts).
+- **D-36-6: 415 for the content type too.** Push/v1 only checks the encoding; the records
+  routes also require `Content-Type: application/json`, as the prompt asked.
+- **D-36-7: Access exemption by path AND method.** `GET /api/trading/mt5/records` is a session
+  read on the same path as the machine POST, so the in-app Access middleware exempts only POST
+  on the two exact paths (`MACHINE_POST_PATHS`). No nginx or Cloudflare change: like push/v1,
+  the bot uses the Tailscale hostname.
+- **D-36-8: dataset maths are pure and match labels.py.** EMAs are recomputed from the stored
+  closes (not the bot's ema columns), the bad-tick guard judges a wick against the ATR of the
+  bars before it, and the first trend of a series is not a cross, exactly as the bot's
+  `labels.prepare()/run()`; on the bot's XAUUSD M30 sample both find the same 76 crosses.
+  Outcomes carry the `y_` prefix; the open cross is excluded; `DEFINITIONS_VERSION` names the
+  definitions.
+- **D-36-9: one purge job.** `MT5_RECORDS_RETENTION_DAYS` (0 = forever) is applied by the
+  existing `mt5-ingest-purge` job, which is now also created when the records token is set and
+  the retention is > 0. Its push/v1 part runs exactly as before (by its own retention
+  settings); the records part runs only when the retention is > 0.
