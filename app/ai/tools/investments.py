@@ -25,6 +25,7 @@ from app.models.trading import (
     ScreenerResult,
     ScreenerRun,
 )
+from app.services import mt5_records
 
 AGENTS = frozenset({"investments", "report"})
 MAX_ROWS = 25
@@ -200,6 +201,57 @@ async def get_mt5_recent_signals(ctx: ToolContext, args: dict[str, Any]) -> str:
     return f"Live signals, last {days} days (newest first):\n" + "\n".join(lines)
 
 
+def _when(t: datetime | None) -> str:
+    return f"{t:%Y-%m-%d %H:%M} UTC" if t else "never"
+
+
+async def mt5_records_summary(ctx: ToolContext, args: dict[str, Any]) -> str:
+    """Aggregates over the 1.7.x bot's records (mt5.records) and bars (mt5.bars), never rows."""
+    days = int(args.get("days") or 7)
+    async with ctx.maker() as db:
+        symbol = await mt5_records.resolve_symbol(db, str(args.get("symbol") or ""))
+        s = await mt5_records.summary(db, symbol, days)
+    if not s["records_total"] and not s["bars_newest"]:
+        return f"No MT5 bot records or bars stored for {symbol} yet."
+    side = s["crosses_by_side"]
+    tag = s["crosses_by_tag"]
+    crosses = sum(side.values())
+    labels = ", ".join(f"{lb} {n}" for lb, n in s["labels"][:12]) or "none"
+    closed = s["positions_closed"]
+    win = f"{s['positions_won']} won" + (
+        f" ({100 * s['positions_won'] / closed:.0f}%)" if closed else ""
+    )
+    ds = s["dataset_rows"]
+    widened = (
+        f"{s['dataset_widened']} of {ds} completed crosses widened "
+        f"({100 * s['dataset_widened'] / ds:.0f}%)"
+        if ds
+        else "no completed cross in the period"
+    )
+    lag = (
+        f", {int((s['now'] - s['newest_utc_time']).total_seconds() // 60)} min ago"
+        if s["newest_utc_time"]
+        else ""
+    )
+    # Account logins go through the redactor: Claude sees [ACCOUNT_ID], never the number.
+    accounts = ", ".join(ctx.redactor.text(f"login {a}") for a in s["accounts"])
+    text = (
+        f"MT5 bot records for {symbol}, last {days} days (since {_when(s['since'])}):\n"
+        f"- crosses: {crosses} (long {side.get('long', 0)}, short {side.get('short', 0)}"
+        + (f", unknown {side['unknown']}" if side.get("unknown") else "")
+        + f"); above 200 {tag.get('above 200', 0)}, below 200 {tag.get('below 200', 0)}\n"
+        f"- labels: {labels}\n"
+        f"- positions: {s['positions_opened']} opened, {closed} closed, {win}, "
+        f"total result {_n(s['result_total'])}\n"
+        f"- SL changes: {s['sl_changes']}\n"
+        f"- cross dataset ({mt5_records.DEFAULT_TIMEFRAME}, y_widened): {widened}\n"
+        f"- freshness: newest record {_when(s['newest_utc_time'])}{lag}, received "
+        f"{_when(s['newest_received_at'])}; newest {mt5_records.DEFAULT_TIMEFRAME} bar "
+        f"{_when(s['bars_newest'])}" + (f"\n- accounts: {accounts}" if accounts else "")
+    )
+    return ctx.redactor.text(text)
+
+
 async def _proposals_today(ctx: ToolContext) -> int:
     local = datetime.now(UTC).astimezone(IST)
     start = local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(UTC)
@@ -298,6 +350,23 @@ TOOLS = [
         "The Aureon MT5 bot's recent live signals with the decision taken and trade result.",
         obj({"days": {"type": "integer", "minimum": 1, "maximum": 30}}),
         get_mt5_recent_signals,
+        "read",
+        AGENTS,
+    ),
+    Tool(
+        "mt5_records_summary",
+        "Aggregates from the MT5 bot's own records and bars for one symbol: crosses by side "
+        "and by above/below EMA 200, counts per label, positions opened/closed with wins and "
+        "total result, SL changes, the share of completed EMA 8/32 crosses that widened, and "
+        "data freshness. Read-only, never raw rows.",
+        obj(
+            {
+                "symbol": {"type": "string", "minLength": 1, "maxLength": 64},
+                "days": {"type": "integer", "minimum": 1, "maximum": 90},
+            },
+            ["symbol"],
+        ),
+        mt5_records_summary,
         "read",
         AGENTS,
     ),

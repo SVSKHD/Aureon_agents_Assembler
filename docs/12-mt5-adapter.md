@@ -162,6 +162,12 @@ Tests: `tests/test_mt5_ingest_unit.py` (no DB: token, caps incl. gzip bomb, 415/
 the route, classification, stale detection, exact-path exemption, prod check, jobs) and `tests/test_mt5_ingest_db.py`
 (storage, failures lifecycle, watch/purge jobs, every read endpoint, the SSE `mt5` event).
 
+## 4. Records API (1.7.x bot)
+
+The newer bot (`aureon_mt5_2026` 1.7.x) stores its records and long-history bars through a
+separate, additive API with its own token: [36-mt5-records.md](36-mt5-records.md). Push/v1
+above is unchanged.
+
 ## Deploy and validate (pull mode)
 
 ### Bot (Windows box, after #37 is merged)

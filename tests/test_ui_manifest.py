@@ -61,6 +61,8 @@ SENSITIVE: list[tuple[str, str, set[str]]] = [
     ("POST", "/api/v1/github/repositories/{owner}/{repo}/force-push", {"hidden"}),
     ("POST", "/api/v1/github/webhooks", {"hidden"}),
     ("POST", "/api/trading/mt5/ingest", {"hidden"}),
+    ("POST", "/api/trading/mt5/records", {"hidden"}),
+    ("POST", "/api/trading/mt5/bars", {"hidden"}),
     ("POST", "/api/v1/ingest/bars", {"hidden"}),
     ("PATCH", "/api/v1/ingest/trade/{tid}", {"hidden"}),
     ("POST", "/api/v1/admin/risk/clear", {"hidden"}),

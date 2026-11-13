@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased: MT5 records API (bot 1.7.x)
+
+- New, additive API for the `aureon_mt5_2026` 1.7.x bot ([docs/36-mt5-records.md](docs/36-mt5-records.md)):
+  `POST /api/trading/mt5/records` (`aureon.mt5.records/v1`, per-row validation, idempotent by
+  `record_id`) and `POST /api/trading/mt5/bars` (`aureon.mt5.bars/v1`, upsert that corrects
+  resent bars), both on a new single-purpose bearer `MT5_RECORDS_TOKEN`, gzip, body caps, rate
+  limit, hidden from the UI manifest.
+- Session reads: `GET /api/trading/mt5/records` (filters, keyset paging), `/records/stats`,
+  `GET /api/trading/mt5/bars` (json/csv) and `GET /api/trading/mt5/dataset/crosses`: one row
+  per completed EMA 8/32 cross with features and `y_` outcomes, using the bot's `labels.py`
+  definitions (json/csv/jsonl).
+- Claude tool `mt5_records_summary(symbol, days)` (aggregates only, account login redacted).
+- Settings (managed): `MT5_RECORDS_TOKEN`, `MT5_RECORDS_MAX_BATCH` (500),
+  `MT5_RECORDS_RATE_PER_MINUTE` (60), `MT5_RECORDS_RETENTION_DAYS` (0 = keep forever).
+- Migration 0031 (additive): `mt5.records`, `mt5.bars`. Push/v1 (`/api/trading/mt5/ingest`)
+  and its tables are unchanged.
+
 ## Unreleased: Claude is the only AI provider
 
 - New `app/ai/` package ([docs/26-ai-providers.md](docs/26-ai-providers.md)). `gateway.py`

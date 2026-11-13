@@ -14,9 +14,9 @@ dependencies, the label from the summary or function name.
 
 Safety floor (cannot be lowered by explicit metadata): routes that touch secrets, settings,
 LIVE mode, approvals, merges/pushes/deploys or order execution are `approval` or `hidden`;
-machine endpoints (webhooks, the MT5 push) and auth flows are `hidden`; any other unsafe
-method is at least `confirm`. `hidden` routes never appear in the manifest, and admin-only
-routes appear only for admins.
+machine endpoints (webhooks, the MT5 push, the MT5 records/bars writes) and auth flows are
+`hidden`; any other unsafe method is at least `confirm`. `hidden` routes never appear in the
+manifest, and admin-only routes appear only for admins.
 
 `describe_routes(app)` is the single source for the OpenAPI extension, the manifest and the
 schema hash.
@@ -55,6 +55,7 @@ SAFETY_RULES: tuple[tuple[str, str, Danger, str], ...] = (
     # Machine-to-machine and auth flows: never a UI button.
     ("*", r"^/api/v1/github/webhooks$", "hidden", "machine endpoint (HMAC)"),
     ("*", r"^/api/trading/mt5/ingest$", "hidden", "machine endpoint (bearer)"),
+    ("POST", r"^/api/trading/mt5/(records|bars)$", "hidden", "machine endpoint (bearer)"),
     (
         "*",
         r"^/api/v1/(ingest|admin/risk|admin/review|aureon|status$|signals|decisions|trades$|chart$|review|risk$)",

@@ -7,6 +7,8 @@ GitHub webhook receiver (HMAC-verified itself), `/api/public/*` (rate-limited, r
 `/api/health` (the on-box container healthchecks, which never pass through Cloudflare).
 One machine-to-machine route is also exempt, by EXACT path only (MACHINE_PATHS): the MT5 bot's
 `POST /api/trading/mt5/ingest`, which arrives over Tailscale and carries its own bearer token.
+The 1.7.x bot's `POST /api/trading/mt5/records` and `POST /api/trading/mt5/bars` are exempt
+by exact path AND method (MACHINE_POST_PATHS): GET on those paths stays behind Access.
 
 Verification: RS256 only; the signing key is looked up by `kid` in the team's JWKS at
 `https://<team>/cdn-cgi/access/certs` (cached for CF_ACCESS_CERTS_TTL_SECONDS; an unknown
@@ -59,6 +61,12 @@ def team_origin(team_domain: str) -> str:
 # Exact paths (no prefix match, no trailing slash) that authenticate themselves and never
 # carry an Access JWT: the MT5 bot's push (bearer MT5_INGEST_TOKEN, docs/12-mt5-adapter.md).
 MACHINE_PATHS: frozenset[str] = frozenset({"/api/trading/mt5/ingest"})
+# Exact paths exempt for POST only: the MT5 bot's records and bars writes (bearer
+# MT5_RECORDS_TOKEN, docs/36-mt5-records.md). GET on the same paths is a session read for
+# Spasta and keeps the Access check.
+MACHINE_POST_PATHS: frozenset[str] = frozenset(
+    {"/api/trading/mt5/records", "/api/trading/mt5/bars"}
+)
 # The Aureon V1.6.3 database API (docs/34-aureon-v163.md): every route under these patterns
 # authenticates itself with a role bearer token (app/aureon/auth.py) and is reached by the
 # Windows collector/guard over Tailscale, without an Access JWT. Full-path regexes, anchored.
@@ -80,6 +88,11 @@ MACHINE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 
 def is_machine_path(path: str) -> bool:
     return path in MACHINE_PATHS or any(p.match(path) for p in MACHINE_PATTERNS)
+
+
+def is_machine_request(method: str, path: str) -> bool:
+    """is_machine_path, plus the POST-only machine paths."""
+    return is_machine_path(path) or (method.upper() == "POST" and path in MACHINE_POST_PATHS)
 
 
 def is_bypassed(path: str, prefixes: Sequence[str]) -> bool:
@@ -208,7 +221,11 @@ class CloudflareAccessMiddleware:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         path = scope.get("path", "")
-        if scope["type"] != "http" or is_machine_path(path) or is_bypassed(path, self.bypass):
+        if (
+            scope["type"] != "http"
+            or is_machine_request(str(scope.get("method", "")), path)
+            or is_bypassed(path, self.bypass)
+        ):
             await self.app(scope, receive, send)
             return
         token = ""

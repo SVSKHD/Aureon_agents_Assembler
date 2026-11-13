@@ -63,6 +63,7 @@ from app.services import (
     incidents,
     market_data,
     mt5_ingest,
+    mt5_records,
     mt5_sync,
     news,
     paper,
@@ -267,8 +268,13 @@ async def mt5_ingest_watch(ctx: TaskContext) -> dict[str, Any]:
 
 
 async def mt5_ingest_purge(ctx: TaskContext) -> dict[str, Any]:
-    """Push mode retention: candles, events, push ids, resolved failures."""
-    return await mt5_ingest.purge(ctx.maker, ctx.settings)
+    """Push mode retention: candles, events, push ids, resolved failures. Also mt5.records
+    when MT5_RECORDS_RETENTION_DAYS > 0 (docs/36; 0 keeps them forever, bars never go)."""
+    s = ctx.settings
+    out: dict[str, Any] = await mt5_ingest.purge(ctx.maker, s)
+    if s.MT5_RECORDS_RETENTION_DAYS > 0:
+        out["mt5_records"] = await mt5_records.purge(ctx.maker, s)
+    return out
 
 
 def _adapters(ctx: TaskContext) -> dict[str, BrokerAdapter]:
@@ -587,6 +593,10 @@ def default_jobs(settings: Settings) -> list[tuple[str, str, str]]:
         jobs.append(("mt5-sync-status", "mt5_sync_status", settings.MT5_SYNC_CRON))
     if settings.mt5_ingest_enabled:
         jobs.append(("mt5-ingest-watch", "mt5_ingest_watch", settings.MT5_INGEST_WATCH_CRON))
+    # One purge job for push/v1 retention and, when configured, mt5.records retention.
+    if settings.mt5_ingest_enabled or (
+        settings.mt5_records_enabled and settings.MT5_RECORDS_RETENTION_DAYS > 0
+    ):
         jobs.append(("mt5-ingest-purge", "mt5_ingest_purge", settings.MT5_INGEST_PURGE_CRON))
     if settings.NEWS_FEED_URLS:
         jobs.append(("news-pull", "news_pull", settings.NEWS_PULL_CRON))

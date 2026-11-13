@@ -393,3 +393,71 @@ class Mt5Candle(Base):
     volume: Mapped[Decimal | None] = mapped_column(QTY)
     ema: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
     received_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
+
+
+# --- mt5 records API (migration 0031, docs/36-mt5-records.md) ---------------------------
+
+BAR_PRICE = Numeric(18, 6)
+
+
+class Mt5Record(Base):
+    """Everything the MT5 bot (aureon_mt5_2026 1.7.x) records, once each (PK = its record_id).
+    The seven envelope keys are columns; every other key of the row is `payload`.
+    Kept forever unless MT5_RECORDS_RETENTION_DAYS > 0."""
+
+    __tablename__ = "records"
+    __table_args__ = (
+        Index("ix_mt5_records_kind_utc_time", "kind", text("utc_time DESC")),
+        Index("ix_mt5_records_symbol_utc_time", "symbol", text("utc_time DESC")),
+        Index("ix_mt5_records_account_login_utc_time", "account_login", text("utc_time DESC")),
+        Index(
+            "ix_mt5_records_payload",
+            "payload",
+            postgresql_using="gin",
+            postgresql_ops={"payload": "jsonb_path_ops"},
+        ),
+        Index("ix_mt5_records_received_at", "received_at"),
+        {"schema": "mt5"},
+    )
+
+    record_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(Text)
+    symbol: Mapped[str | None] = mapped_column(Text)
+    account_login: Mapped[int | None] = mapped_column(BigInteger)
+    utc_time: Mapped[datetime] = mapped_column(TS)
+    server_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    bot_version: Mapped[str] = mapped_column(Text)
+    bot_id: Mapped[str] = mapped_column(Text, server_default=text("'aureon_mt5_2026'"))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
+    batch_id: Mapped[uuid.UUID] = mapped_column()
+    received_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
+
+
+class Mt5Bar(Base):
+    """Closed candles from the bot, kept long term (never purged). `ts` = bar open time, UTC.
+    Separate from mt5.candles, which belongs to push/v1 and is purged after
+    MT5_CANDLE_RETENTION_DAYS."""
+
+    __tablename__ = "bars"
+    __table_args__ = (
+        PrimaryKeyConstraint("symbol", "timeframe", "ts", name="pk_bars"),
+        Index("ix_mt5_bars_timeframe_ts", "timeframe", "ts"),
+        {"schema": "mt5"},
+    )
+
+    symbol: Mapped[str] = mapped_column(Text)
+    timeframe: Mapped[str] = mapped_column(Text)
+    ts: Mapped[datetime] = mapped_column(TS)
+    server_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    open: Mapped[Decimal] = mapped_column(BAR_PRICE)
+    high: Mapped[Decimal] = mapped_column(BAR_PRICE)
+    low: Mapped[Decimal] = mapped_column(BAR_PRICE)
+    close: Mapped[Decimal] = mapped_column(BAR_PRICE)
+    tick_volume: Mapped[int | None] = mapped_column(BigInteger)
+    spread: Mapped[int | None] = mapped_column(Integer)
+    ema8: Mapped[Decimal | None] = mapped_column(BAR_PRICE)
+    ema32: Mapped[Decimal | None] = mapped_column(BAR_PRICE)
+    ema200: Mapped[Decimal | None] = mapped_column(BAR_PRICE)
+    atr14: Mapped[Decimal | None] = mapped_column(BAR_PRICE)
+    source: Mapped[str] = mapped_column(Text, server_default=text("'bot'"))
+    received_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
