@@ -772,6 +772,26 @@ async def test_backfill_worker_fetches_only_missing_bars(make_env: EnvFactory) -
         assert start2 == rows[-1].ts
 
 
+async def test_backfill_claims_user_requests_before_bulk(make_env: EnvFactory) -> None:
+    """A chart waiting on screen is not stuck behind the nightly universe backfill."""
+    async with make_env() as env:
+        bulk = await env.instrument("BULK")
+        mine = await env.instrument("MINE")
+        async with env.maker() as db, db.begin():
+            await market_data.enqueue_backfill(
+                db, [bulk], Timeframe.D1, 20, env.settings, source="universe"
+            )
+        async with env.maker() as db, db.begin():
+            await market_data.enqueue_backfill(db, [mine], Timeframe.D1, 20, env.settings)
+        first = await market_data.claim_backfill(env.maker)
+        second = await market_data.claim_backfill(env.maker)
+        async with env.maker() as db:
+            a = await db.get(CandleBackfillRequest, first)
+            b = await db.get(CandleBackfillRequest, second)
+        assert a is not None and a.instrument_id == mine and a.source == "user"
+        assert b is not None and b.instrument_id == bulk
+
+
 async def test_backfill_dhan_failures(make_env: EnvFactory) -> None:
     async with make_env(CANDLE_BACKFILL_MAX_ATTEMPTS=2) as env:
         iid = await env.instrument("FAIL")

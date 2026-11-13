@@ -57,6 +57,11 @@ BACKFILL = AgentSpec("candle-backfill", "Candle history agent (Dhan, rate limite
 SPECS = (MARKET_DATA, TECHNICAL, SIGNAL, RISK, BACKTEST, AI_RESEARCH, SCREENER, BACKFILL)
 SPECS_BY_ID = {s.id: s for s in SPECS}
 TICK_CHANNEL = "dhan:ticks"
+# Settings this worker re-execs on. Its Dhan and MT5 adapters are built once, at startup, from
+# the values then: without DHAN_ here a Dhan login made after the worker started (the session
+# token is a managed setting, renewed daily) never reaches it, and every chart-history request
+# stays queued ("Dhan is not configured") or runs on yesterday's expired token.
+RELOAD_PREFIXES = ("DHAN_", "MT5_", "ANTHROPIC_", "AI_")
 
 
 @dataclass
@@ -397,7 +402,7 @@ async def main() -> int:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
     # A change to its keys from Spasta re-execs this worker (docs/settings.md).
-    app_settings.start_worker_watch(settings, maker, stop, ("ANTHROPIC_", "AI_"), redis)
+    app_settings.start_worker_watch(settings, maker, stop, RELOAD_PREFIXES, redis)
 
     beats = []
     for spec in SPECS:
