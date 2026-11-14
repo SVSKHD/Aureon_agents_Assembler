@@ -26,7 +26,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.research import indicators as ind
-from app.agents.trading.base import BrokerAdapter, NotSupported
+from app.agents.trading.base import BrokerAdapter, BrokerRejected, NotSupported
 from app.agents.trading.types import Timeframe
 from app.core.config import Settings
 from app.core.logging import get_logger
@@ -252,6 +252,9 @@ async def run_backfill(
         rows = await adapter.candles(inst.broker_instrument_id, tf, start, now)
     except NotSupported as exc:
         return await finish("failed", error=str(exc)[:1000])
+    except BrokerRejected as exc:
+        # The broker refused this request itself: the same request again cannot succeed.
+        return await finish("failed", error=f"{type(exc).__name__}: {exc}"[:1000])
     except Exception as exc:
         err = f"{type(exc).__name__}: {exc}"[:1000]
         # Auth, rate-limit and network failures alike: retried up to the attempt cap (an
