@@ -26,6 +26,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import pandas as pd
@@ -34,6 +35,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.research import indicators as ind
+from app.agents.research import stock_rankings as rank
 from app.agents.research import stock_signals as engine
 from app.agents.trading.types import Timeframe
 from app.core.config import Settings
@@ -109,6 +111,19 @@ async def universe(db: AsyncSession, settings: Settings) -> list[int]:
         )
     ).all()
     return list(keep)[: settings.STOCK_SIGNALS_MAX_UNIVERSE]
+
+
+async def benchmark_id(db: AsyncSession, settings: Settings) -> int | None:
+    """The relative-strength benchmark (Nifty 50 by default), when the master has it."""
+    if not settings.STOCK_SIGNALS_BENCHMARK:
+        return None
+    found: int | None = await db.scalar(
+        select(Instrument.id).where(
+            Instrument.broker == "dhan",
+            Instrument.broker_instrument_id == settings.STOCK_SIGNALS_BENCHMARK,
+        )
+    )
+    return found
 
 
 # --- runs -------------------------------------------------------------------------------------
@@ -223,6 +238,17 @@ def _frame(bars: Sequence[Bar]) -> pd.DataFrame:
     return ind.frame(bars) if bars else ind.frame([])
 
 
+Scored = tuple[engine.Reading, rank.Features | None]
+
+
+def _f(d: Any) -> float | None:
+    return None if d is None else float(d)
+
+
+def min_bar_turnover(tf: Timeframe, settings: Settings) -> float:
+    return settings.STOCK_SIGNALS_MIN_DAILY_TURNOVER / BARS_PER_DAY[tf]
+
+
 def _evaluate_chunk(
     bars: dict[int, list[Bar]],
     intraday: dict[int, list[Bar]] | None,
@@ -230,13 +256,27 @@ def _evaluate_chunk(
     boundary: datetime,
     p: engine.Params,
     holidays: Sequence[Any],
-) -> dict[int, engine.Reading]:
-    out = {}
+    nifty: pd.DataFrame | None = None,
+    weights: dict[str, float] | None = None,
+) -> dict[int, Scored]:
+    out: dict[int, Scored] = {}
     for iid, rows in bars.items():
         vw = None
         if intraday is not None and intraday.get(iid):
             vw = engine.daily_vwap(_frame(intraday[iid]))
-        out[iid] = engine.evaluate(_frame(rows), tf, boundary, p, day_vwap=vw, holidays=holidays)
+        df = _frame(rows)
+        r = engine.evaluate(df, tf, boundary, p, day_vwap=vw, holidays=holidays)
+        feats = None
+        if r.state is not engine.State.UNAVAILABLE:
+            feats = rank.features(
+                engine.closed_only(df.sort_index(), tf, boundary),
+                ema_fast=_f(r.ema_fast),
+                ema_slow=_f(r.ema_slow),
+                vwap=_f(r.vwap),
+                nifty=nifty,
+                weights=weights or rank.DEFAULT_WEIGHTS,
+            )
+        out[iid] = (r, feats)
     return out
 
 
@@ -245,12 +285,21 @@ async def _store(
     run_id: uuid.UUID,
     insts: dict[int, Instrument],
     tf: Timeframe,
-    readings: dict[int, engine.Reading],
+    readings: dict[int, Scored],
     result: RunResult,
+    min_turnover: float = 0.0,
 ) -> None:
     now = datetime.now(UTC)
-    for iid, r in readings.items():
+    for iid, (r, feats) in readings.items():
         result.counts[r.state.value] = result.counts.get(r.state.value, 0) + 1
+        metrics: dict[str, Any] = r.metrics()
+        score = None
+        if feats is not None:
+            liquid = feats.turnover is not None and feats.turnover >= min_turnover
+            metrics |= {**feats.as_json(), "liquid": liquid}
+            score = Decimal(str(feats.score)) if feats.score is not None else None
+            if not liquid:
+                result.counts["illiquid"] = result.counts.get("illiquid", 0) + 1
         event_id = None
         if r.is_cross and r.crossed_ts is not None and r.crossed_at is not None:
             inst = insts[iid]
@@ -271,7 +320,8 @@ async def _store(
                 "confirm_vwap": r.confirm_vwap,
                 "candle_close_at": r.candle_close_at,
                 "data_as_of": r.candle_close_at,
-                "metrics": r.metrics(),
+                "metrics": metrics,
+                "trend_score": score,
                 "run_id": run_id,
             }
             ins = insert(StockSignalEvent).values(values)
@@ -325,7 +375,8 @@ async def _store(
             vwap_applicable=r.vwap_applicable,
             event_id=event_id,
             reason=(r.reason or None) and r.reason[:200],
-            metrics=r.metrics(),
+            metrics=metrics,
+            trend_score=score,
             evaluated_at=now,
             state_changed_at=now,
             run_id=run_id,
@@ -351,6 +402,7 @@ async def _store(
                     "event_id": ins.excluded.event_id,
                     "reason": ins.excluded.reason,
                     "metrics": ins.excluded.metrics,
+                    "trend_score": ins.excluded.trend_score,
                     "evaluated_at": ins.excluded.evaluated_at,
                     "run_id": ins.excluded.run_id,
                 },
@@ -384,7 +436,9 @@ async def execute_run(
     try:
         async with maker() as db:
             ids = await universe(db, settings)
-        requested = await _request_history(maker, ids, tf, settings) if ids else 0
+            bench = await benchmark_id(db, settings)
+        fetch = [*ids, bench] if ids and bench is not None else ids
+        requested = await _request_history(maker, fetch, tf, settings) if ids else 0
         deadline = clock() + timedelta(seconds=settings.STOCK_SIGNALS_FETCH_TIMEOUT_SECONDS)
         waited_out = False
         while ids and await _open_requests(maker, ids, tf):
@@ -396,6 +450,13 @@ async def execute_run(
         p = params(settings)
         hol = list(settings.DHAN_MARKET_HOLIDAYS)
         lookback = settings.STOCK_SIGNALS_LOOKBACK_BARS
+        nifty = None
+        if bench is not None:
+            async with maker() as db:
+                got = (await load_bars(db, [bench], tf, lookback, boundary))[bench]
+            nifty = engine.closed_only(_frame(got).sort_index(), tf, boundary) if got else None
+        weights = settings.STOCK_SIGNALS_SCORE_WEIGHTS
+        min_turnover = min_bar_turnover(tf, settings)
         for i in range(0, len(ids), CHUNK):
             chunk = ids[i : i + CHUNK]
             async with maker() as db:
@@ -412,10 +473,10 @@ async def execute_run(
                     ).all()
                 }
             readings = await asyncio.to_thread(
-                _evaluate_chunk, bars, intraday, tf, boundary, p, hol
+                _evaluate_chunk, bars, intraday, tf, boundary, p, hol, nifty, weights
             )
             async with maker() as db, db.begin():
-                await _store(db, run_id, insts, tf, readings, result)
+                await _store(db, run_id, insts, tf, readings, result, min_turnover)
 
         c = result.counts
         async with maker() as db, db.begin():

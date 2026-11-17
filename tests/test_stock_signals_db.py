@@ -249,3 +249,38 @@ async def test_purge_keeps_recent_events(make_env: EnvFactory) -> None:  # noqa:
         async with env.maker() as db:
             st = await db.get(StockSignalState, (iid, "15m"))
         assert st is not None and st.event_id is None  # the state stays, its link is cleared
+
+
+async def test_rankings_use_the_latest_run_and_skip_illiquid(make_env: EnvFactory) -> None:  # noqa: F811
+    async with make_env(**SIGNALS, STOCK_SIGNALS_MIN_DAILY_TURNOVER=25_000) as env:
+        times = session(DAYS[0]) + session(DAYS[1]) + session(DAYS[2]) + session(DAYS[3])[:7]
+        n = len(times)
+        shapes = {
+            "UP": (np.linspace(100, 160, n), 100.0),
+            "DOWN": (np.linspace(160, 100, n), 100.0),
+            "SLOWUP": (np.linspace(100, 104, n), 100.0),
+            "THIN": (np.linspace(100, 200, n), 1.0),  # 100-200 INR a bar: illiquid
+        }
+        ids = {}
+        for sym, (closes, vol) in shapes.items():
+            ids[sym] = await env.instrument(sym)
+            await put(env, ids[sym], times, [float(c) for c in closes], [vol] * n)
+        out = await run_at(env, ist(DAYS[3], 11, 0))
+        assert out.counts.get("illiquid") == 1
+
+        from app.services import stock_rankings as rk
+
+        async with env.maker() as db:
+            gain = await rk.movers(db, "15m", "gainers")
+            lose = await rk.movers(db, "15m", "losers")
+            bull = await rk.trending(db, "15m", "bullish")
+            bear = await rk.trending(db, "15m", "bearish")
+            cov = await rk.coverage(db, "15m")
+        assert [r["symbol"] for r in gain] == ["UP", "SLOWUP"]  # THIN is left out
+        assert gain[0]["change_pct"] > gain[1]["change_pct"] > 0
+        assert [r["symbol"] for r in lose] == ["DOWN"]
+        assert bull and bull[0]["symbol"] == "UP" and bull[0]["trend_score"] > 50
+        assert [r["symbol"] for r in bear] == ["DOWN"] and bear[0]["trend_score"] < 50
+        assert cov["universe_size"] == 4 and cov["illiquid"] == 1
+        assert cov["data_as_of"] == ist(DAYS[3], 11, 0)
+        assert "relative" in gain[0]["missing_features"]  # no Nifty 50 in this master
