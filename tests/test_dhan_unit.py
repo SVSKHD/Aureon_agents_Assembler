@@ -14,7 +14,7 @@ import httpx
 import pytest
 import respx
 
-from app.agents.trading.base import BrokerError, CredentialsExpired, NotSupported
+from app.agents.trading.base import BrokerError, BrokerRejected, CredentialsExpired, NotSupported
 from app.agents.trading.dhan import parse
 from app.agents.trading.dhan.adapter import DhanAdapter, StaticResolver
 from app.agents.trading.dhan.client import DhanApiError, DhanClient
@@ -434,6 +434,53 @@ async def test_daily_candles_use_exclusive_to_date() -> None:
     assert (body["fromDate"], body["toDate"]) == ("2012-01-10", "2012-01-13")
     assert "expiryCode" not in body  # equity: no expiry
     assert [c.ts.date() for c in out] == [date(2012, 1, 10), date(2012, 1, 11)]
+
+
+@respx.mock
+async def test_history_piece_with_no_data_is_empty_not_a_failure() -> None:
+    """DH-907 on the years before a stock listed must not throw away the years after."""
+    adapter, _ = make_adapter()
+    no_data = httpx.Response(
+        400,
+        json={
+            "errorType": "Data_Error",
+            "errorCode": "DH-907",
+            "errorMessage": "System is unable to fetch data due to incorrect parameters "
+            "or no data present",
+        },
+    )
+    route = respx.post(f"{BASE}/charts/historical").mock(
+        side_effect=[no_data, no_data, httpx.Response(200, json=fx("daily.json"))]
+    )
+    out = await adapter.candles(
+        "NSE_EQ:3499",
+        Timeframe.D1,
+        datetime(2010, 1, 10, tzinfo=UTC),
+        datetime(2012, 1, 12, tzinfo=UTC),
+    )
+    assert route.call_count == 3  # one call per one-year piece: DH-907 is never retried
+    assert [c.ts.date() for c in out] == [date(2012, 1, 10), date(2012, 1, 11)]
+
+    # Every piece empty: no candles, still not an error.
+    respx.post(f"{BASE}/charts/intraday").mock(return_value=no_data)
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    assert (
+        await adapter.candles("NSE_EQ:3499", Timeframe.M5, start, start + timedelta(days=2)) == []
+    )
+
+
+@respx.mock
+async def test_bad_history_request_is_rejected_without_retry() -> None:
+    adapter, _ = make_adapter()
+    route = respx.post(f"{BASE}/charts/intraday").mock(
+        return_value=httpx.Response(
+            400, json={"errorCode": "DH-905", "errorMessage": "Missing required fields"}
+        )
+    )
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    with pytest.raises(BrokerRejected, match="DH-905"):
+        await adapter.candles("NSE_EQ:3499", Timeframe.M5, start, start + timedelta(days=2))
+    assert route.call_count == 1
 
 
 @respx.mock

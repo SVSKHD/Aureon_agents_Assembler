@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.agents.research import indicators as ind
 from app.agents.research import screener as eng
-from app.agents.trading.base import BrokerAdapter, BrokerError, NotSupported
+from app.agents.trading.base import BrokerAdapter, BrokerError, BrokerRejected, NotSupported
 from app.agents.trading.types import AdapterHealth, Candle, Timeframe, utc_now
 from app.auth.bootstrap import bootstrap_admin
 from app.auth.security import hash_password
@@ -815,6 +815,16 @@ async def test_backfill_dhan_failures(make_env: EnvFactory) -> None:
         assert rid is not None
         ns = FakeDhan([], fail=NotSupported("dhan", "candles", "no 1h for this segment"))
         assert await market_data.run_backfill(env.maker, ns, rid, env.settings) == "failed"
+        # The broker refused the request itself (DH-905/907): failed at once with its reason.
+        async with env.maker() as db, db.begin():
+            await market_data.enqueue_backfill(db, [iid], Timeframe.D1, 30, env.settings)
+        rid = await market_data.claim_backfill(env.maker)
+        assert rid is not None
+        bad = FakeDhan([], fail=BrokerRejected("Dhan DH-905: Missing required fields"))
+        assert await market_data.run_backfill(env.maker, bad, rid, env.settings) == "failed"
+        async with env.maker() as db:
+            req = await db.get(CandleBackfillRequest, rid)
+            assert req is not None and req.attempts == 1 and "DH-905" in (req.error or "")
         # No Dhan adapter at all.
         async with env.maker() as db, db.begin():
             await market_data.enqueue_backfill(db, [iid], Timeframe.M5, 2, env.settings)

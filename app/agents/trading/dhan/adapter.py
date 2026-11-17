@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import csv
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, ClassVar, Protocol
 
@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.trading.base import BrokerAdapter, BrokerError, CredentialsExpired, NotSupported
 from app.agents.trading.dhan import parse
-from app.agents.trading.dhan.client import DhanClient
+from app.agents.trading.dhan.client import NO_DATA, DhanClient, DhanRejected
 from app.agents.trading.dhan.parse import IST, DhanRef
 from app.agents.trading.types import (
     AccountInfo,
@@ -208,8 +208,10 @@ class DhanAdapter(BrokerAdapter):
                 base["expiryCode"] = 0
             while d0 < d_end:
                 d1 = min(d0 + timedelta(days=DAILY_CHUNK_DAYS), d_end)
-                payload = await self.client.historical_daily(
-                    {**base, "fromDate": d0.isoformat(), "toDate": d1.isoformat()}
+                payload = await _or_no_data(
+                    self.client.historical_daily(
+                        {**base, "fromDate": d0.isoformat(), "toDate": d1.isoformat()}
+                    )
                 )
                 for c in parse.candles(payload):
                     got[c.ts] = c
@@ -219,13 +221,15 @@ class DhanAdapter(BrokerAdapter):
             t_end = end.astimezone(IST)
             while t0 < t_end:
                 t1 = min(t0 + timedelta(days=INTRADAY_MAX_DAYS), t_end)
-                payload = await self.client.intraday(
-                    {
-                        **base,
-                        "interval": INTRADAY_INTERVAL[timeframe],
-                        "fromDate": t0.strftime("%Y-%m-%d %H:%M:%S"),
-                        "toDate": t1.strftime("%Y-%m-%d %H:%M:%S"),
-                    }
+                payload = await _or_no_data(
+                    self.client.intraday(
+                        {
+                            **base,
+                            "interval": INTRADAY_INTERVAL[timeframe],
+                            "fromDate": t0.strftime("%Y-%m-%d %H:%M:%S"),
+                            "toDate": t1.strftime("%Y-%m-%d %H:%M:%S"),
+                        }
+                    )
                 )
                 for c in parse.candles(payload):
                     got[c.ts] = c
@@ -271,6 +275,18 @@ class DhanAdapter(BrokerAdapter):
             "subscribe_ticks",
             "live ticks come from the dhan-feed worker (app/workers/dhan_feed.py)",
         )
+
+
+async def _or_no_data(call: Awaitable[dict[str, Any]]) -> dict[str, Any]:
+    """One piece of a history range. Dhan answers DH-907 for a piece with no bars (before
+    the instrument listed, or a holiday stretch): that piece is empty, not the whole range
+    failed, so the pieces that do have bars are kept."""
+    try:
+        return await call
+    except DhanRejected as exc:
+        if exc.code == NO_DATA:
+            return {}
+        raise
 
 
 class MasterStats:

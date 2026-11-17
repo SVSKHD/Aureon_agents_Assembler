@@ -30,7 +30,7 @@ from typing import Any
 
 import httpx
 
-from app.agents.trading.base import BrokerError, CredentialsExpired
+from app.agents.trading.base import BrokerError, BrokerRejected, CredentialsExpired
 from app.agents.trading.ratelimit import BrokerRateLimiter, Window
 from app.core.logging import get_logger
 
@@ -70,6 +70,10 @@ def assert_read_only(method: str, path: str) -> None:
 
 RETRY_CODES = {"DH-904", "805", "DH-908", "DH-909"}
 MAX_ATTEMPTS = 3
+# Dhan refused the request itself: DH-905 bad input, DH-907 bad parameters or no data
+# present (a history range before the instrument existed). Never retried.
+REJECTED_CODES = {"DH-905", "DH-907"}
+NO_DATA = "DH-907"
 
 
 class DhanApiError(BrokerError):
@@ -77,6 +81,10 @@ class DhanApiError(BrokerError):
         super().__init__(f"Dhan {code or http_status}: {message}"[:300])
         self.code = code
         self.http_status = http_status
+
+
+class DhanRejected(DhanApiError, BrokerRejected):
+    """A DhanApiError whose code says the same request can never succeed."""
 
 
 def new_request_id() -> str:
@@ -253,4 +261,5 @@ def _error(resp: httpx.Response) -> DhanApiError:
         body = {}
     code = body.get("errorCode") or body.get("errorType") or None
     message = str(body.get("errorMessage") or resp.reason_phrase or "error")
-    return DhanApiError(str(code) if code else None, message, resp.status_code)
+    cls = DhanRejected if code in REJECTED_CODES else DhanApiError
+    return cls(str(code) if code else None, message, resp.status_code)

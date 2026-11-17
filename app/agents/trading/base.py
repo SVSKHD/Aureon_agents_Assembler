@@ -56,6 +56,11 @@ class CredentialsExpired(BrokerError):
     pass
 
 
+class BrokerRejected(BrokerError):
+    """The broker refused the request itself (bad parameters, or no data for it): sending
+    the same request again cannot succeed, so it is never retried."""
+
+
 class BrokerAdapter(ABC):
     broker: ClassVar[str]
 
