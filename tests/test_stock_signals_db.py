@@ -43,11 +43,17 @@ def session(d: date) -> list[datetime]:
 
 @pytest.fixture(autouse=True)
 async def clean_runs(db_clean: str) -> AsyncIterator[None]:
+    """Before and after each test: no runs, and (after) no instruments, so later test modules
+    that expect an empty instrument master (test_trading_api) still find one."""
     engine = create_async_engine(db_clean)
     async with engine.begin() as conn:
         await conn.exec_driver_sql("DELETE FROM trading.stock_signal_runs")
-    await engine.dispose()
     yield
+    async with engine.begin() as conn:
+        await conn.exec_driver_sql("DELETE FROM trading.stock_signal_runs")
+        await conn.exec_driver_sql("DELETE FROM trading.candle_backfill_requests")
+        await conn.exec_driver_sql("DELETE FROM trading.instruments")
+    await engine.dispose()
 
 
 async def put(
