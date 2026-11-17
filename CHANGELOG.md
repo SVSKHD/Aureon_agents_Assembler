@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased: Stock Signals (EMA 8/32 + session VWAP)
+
+- Server-side signals for NSE/BSE equities ([docs/37-stock-signals.md](docs/37-stock-signals.md)):
+  EMA 8/32 crossovers confirmed by the session VWAP on closed candles only, with cross and
+  confirmation times kept apart; trend / mixed / unavailable states (stale counted in trading
+  time). Evaluated by a new research-worker lane `stock-signals` after each candle close, with
+  history fetched through the existing backfill queue.
+- Rankings from the latest run (no Dhan call per request): gainers / losers by real % change,
+  trending by a documented 0-100 score (not a probability), unusual volume, coverage and data
+  time; `python -m app.services.score_validation` checks the score against history.
+- Persisted in-app notifications (crossovers, VWAP confirmations, holding reversals and trend
+  changes, weekly candidates) with preferences, dedupe and an SSE stream with Last-Event-ID
+  replay. DevOps notifications and Discord alerts unchanged.
+- Portfolio signal map from Dhan holdings snapshots (new, written by `dhan-reconcile`) and a
+  deterministic, advisory rebalance preview with Dhan delivery charges. No orders.
+- `/api/trading/stock-signals/*` (13 routes), five read-only Claude tools, scheduler jobs
+  `stock-signals-scan`, `-premarket`, `-eod`, `-weekly`, settings `STOCK_SIGNALS_*`,
+  `PORTFOLIO_*`.
+- Migrations 0032-0034 (additive): `trading.stock_signal_runs`, `_states`, `_events`,
+  `_notifications`, `_prefs`, `trading.holding_snapshots`.
+- Fixed: Claude's `get_dhan_screener_results` never found a run (`succeeded` vs `done`).
+
 ## Unreleased: MT5 records API (bot 1.7.x)
 
 - New, additive API for the `aureon_mt5_2026` 1.7.x bot ([docs/36-mt5-records.md](docs/36-mt5-records.md)):

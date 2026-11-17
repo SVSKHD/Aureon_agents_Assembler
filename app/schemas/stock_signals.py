@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
@@ -160,3 +161,111 @@ class RebalancePreviewOut(BaseModel):
     charges_model: str
     freshness: PortfolioFreshnessOut
     generated_at: datetime
+
+
+# --- signals, states and rankings (docs/37 §2-3) ---------------------------------------------
+
+SignalState = Literal[
+    "BULLISH_CONFIRMED",
+    "BULLISH_PENDING",
+    "BEARISH_CONFIRMED",
+    "BEARISH_PENDING",
+    "BULLISH_TREND",
+    "BEARISH_TREND",
+    "MIXED",
+    "UNAVAILABLE",
+]
+
+
+class StockSignalEventOut(BaseModel):
+    id: int
+    instrument_id: int
+    symbol: str
+    name: str | None
+    exchange: str
+    timeframe: str
+    direction: Literal["bullish", "bearish"]
+    state: SignalState
+    crossed_at: datetime = Field(description="Close time of the candle where EMA 8 crossed EMA 32")
+    confirmed_at: datetime | None = Field(
+        description="Close time of the first candle that closed beyond the session VWAP"
+    )
+    ema_fast: Decimal | None
+    ema_slow: Decimal | None
+    vwap: Decimal | None
+    last_price: Decimal | None = Field(description="Close of the cross candle")
+    confirm_price: Decimal | None
+    confirm_vwap: Decimal | None
+    trend_score: Decimal | None = Field(description="0-100 ranking score; not a probability")
+    in_holdings: bool
+    data_source: str
+    data_as_of: datetime | None
+    metrics: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+class StockSignalStateOut(BaseModel):
+    instrument_id: int
+    symbol: str
+    name: str | None
+    exchange: str | None
+    segment: str | None
+    timeframe: str
+    state: SignalState
+    last_price: Decimal | None
+    change_pct: Decimal | None = Field(description="vs the previous session's last close")
+    trend_score: Decimal | None
+    rvol: Decimal | None
+    rsi: Decimal | None
+    adx: Decimal | None
+    ema_fast: Decimal | None
+    ema_slow: Decimal | None
+    vwap: Decimal | None
+    vwap_distance_pct: Decimal | None
+    ema_spread_pct: Decimal | None
+    relative_pct: Decimal | None = Field(description="change_pct minus Nifty 50's")
+    missing_features: list[str]
+    in_holdings: bool
+    event_id: int | None
+    candle_close_at: datetime | None
+    reason: str | None = None
+
+
+class StockSignalsPage(BaseModel):
+    items: list[StockSignalEventOut]
+    total: int
+    limit: int
+    offset: int
+
+
+class StockSignalStatesPage(BaseModel):
+    items: list[StockSignalStateOut]
+    total: int
+    limit: int
+    offset: int
+
+
+class StockSignalDetailOut(BaseModel):
+    event: StockSignalEventOut
+    current: StockSignalStateOut | None
+
+
+class RankingCoverageOut(BaseModel):
+    timeframe: str
+    run_id: uuid.UUID | None
+    boundary: datetime | None = None
+    data_as_of: datetime | None
+    universe_size: int
+    evaluated: int = 0
+    unavailable: int = 0
+    illiquid: int = 0
+    history_wait_timed_out: bool = False
+    finished_at: datetime | None = None
+
+
+class RankingOut(BaseModel):
+    kind: str
+    coverage: RankingCoverageOut
+    items: list[StockSignalStateOut]
+    note: str

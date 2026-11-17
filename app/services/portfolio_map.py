@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -27,7 +28,7 @@ from app.models.trading import BrokerAccount, Instrument
 from app.services import stock_rankings
 from app.services.stock_signal_notifications import deep_link, insert_many
 from app.services.stock_signals import RunResult
-from app.services.trading import visible_accounts
+from app.services.trading import is_admin
 
 BULL = {"BULLISH_CONFIRMED", "BULLISH_TREND"}
 BEAR = {"BEARISH_CONFIRMED", "BEARISH_TREND"}
@@ -62,9 +63,25 @@ async def _latest_holdings(
     return list(rows.all())
 
 
-async def _dhan_accounts(db: AsyncSession, current: CurrentSession | None) -> list[BrokerAccount]:
-    q = visible_accounts(current) if current is not None else select(BrokerAccount)
-    q = q.where(BrokerAccount.broker == "dhan", BrokerAccount.is_active.is_(True))
+@dataclass(frozen=True, slots=True)
+class Viewer:
+    """Who is asking: owners see their own Dhan accounts, admins see every one (the same
+    rule as services/trading.visible_accounts, for the API and Claude's tools alike)."""
+
+    user_id: uuid.UUID | None
+    is_admin: bool
+
+
+def viewer(current: CurrentSession) -> Viewer:
+    return Viewer(current.user.id, is_admin(current))
+
+
+async def _dhan_accounts(db: AsyncSession, who: Viewer | None) -> list[BrokerAccount]:
+    q = select(BrokerAccount).where(
+        BrokerAccount.broker == "dhan", BrokerAccount.is_active.is_(True)
+    )
+    if who is not None and not who.is_admin:
+        q = q.where(BrokerAccount.owner_user_id == who.user_id)
     return list((await db.scalars(q)).all())
 
 
@@ -117,10 +134,10 @@ def _s(d: Decimal | None) -> str | None:
 
 
 async def build(
-    db: AsyncSession, current: CurrentSession, settings: Settings, tf: str = "15m"
+    db: AsyncSession, who: Viewer, settings: Settings, tf: str = "15m"
 ) -> dict[str, Any]:
     """The portfolio signal map for the user's Dhan accounts (all of them for an admin)."""
-    accounts = await _dhan_accounts(db, current)
+    accounts = await _dhan_accounts(db, who)
     ids = [a.id for a in accounts]
     holdings = await _latest_holdings(db, ids)
     iids = [h.instrument_id for h in holdings if h.instrument_id is not None]
@@ -261,7 +278,7 @@ async def candidates(
 
 async def rebalance_preview(
     db: AsyncSession,
-    current: CurrentSession,
+    who: Viewer,
     settings: Settings,
     *,
     tf: str,
@@ -270,9 +287,9 @@ async def rebalance_preview(
     max_new: int,
     min_trade_value: Decimal,
 ) -> dict[str, Any]:
-    accounts = await _dhan_accounts(db, current)
+    accounts = await _dhan_accounts(db, who)
     ids = [a.id for a in accounts]
-    the_map = await build(db, current, settings, tf)
+    the_map = await build(db, who, settings, tf)
     holdings = await _latest_holdings(db, ids)
     positions = []
     for h, row in zip(holdings, the_map["holdings"], strict=True):

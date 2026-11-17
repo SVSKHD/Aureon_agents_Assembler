@@ -15,6 +15,7 @@ were left out and why.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
@@ -220,3 +221,119 @@ async def recent_crossovers(
         q = q.where(StockSignalEvent.direction == direction)
     q = q.order_by(StockSignalEvent.crossed_at.desc(), StockSignalEvent.id.desc()).limit(limit)
     return [event_row(ev, inst) for ev, inst in (await db.execute(q)).all()]
+
+
+# --- signal events and states (the list / detail endpoints) -----------------------------------
+
+EventSort = Literal["crossed_at", "-crossed_at", "trend_score", "-trend_score"]
+
+
+async def list_events(
+    db: AsyncSession,
+    *,
+    timeframe: str | None = None,
+    exchange: str | None = None,
+    symbol: str | None = None,
+    direction: Direction | None = None,
+    confirmation: Literal["confirmed", "pending"] | None = None,
+    in_holdings: bool | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    min_trend_score: Decimal | None = None,
+    fresh_only: bool = False,
+    sort: EventSort = "-crossed_at",
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[dict[str, Any]], int]:
+    """Crossover events with filters, sorted and paged on the server. `fresh_only` keeps
+    instruments whose current state has usable data (not UNAVAILABLE)."""
+    ev = StockSignalEvent
+    q = select(ev, Instrument).join(Instrument, Instrument.id == ev.instrument_id)
+    if timeframe:
+        q = q.where(ev.timeframe == timeframe)
+    if exchange:
+        q = q.where(Instrument.exchange == exchange.upper())
+    if symbol:
+        q = q.where(
+            func.upper(func.coalesce(Instrument.trading_symbol, Instrument.symbol)).startswith(
+                symbol.upper()
+            )
+        )
+    if direction:
+        q = q.where(ev.direction == direction)
+    if confirmation == "confirmed":
+        q = q.where(ev.confirmed_at.is_not(None))
+    elif confirmation == "pending":
+        q = q.where(ev.confirmed_at.is_(None))
+    if in_holdings is not None:
+        held = select(StockSignalState.instrument_id).where(StockSignalState.in_holdings.is_(True))
+        q = q.where(ev.instrument_id.in_(held) if in_holdings else ev.instrument_id.not_in(held))
+    if since:
+        q = q.where(ev.crossed_at >= since)
+    if until:
+        q = q.where(ev.crossed_at < until)
+    if min_trend_score is not None:
+        q = q.where(ev.trend_score >= min_trend_score)
+    if fresh_only:
+        usable = select(StockSignalState.instrument_id).where(
+            StockSignalState.timeframe == ev.timeframe,
+            StockSignalState.instrument_id == ev.instrument_id,
+            StockSignalState.state != "UNAVAILABLE",
+        )
+        q = q.where(usable.exists())
+    total = int(await db.scalar(select(func.count()).select_from(q.subquery())) or 0)
+    key = ev.trend_score if "trend_score" in sort else ev.crossed_at
+    order = key.desc().nulls_last() if sort.startswith("-") else key.asc().nulls_last()
+    q = q.order_by(order, ev.id.desc()).limit(limit).offset(offset)
+    return [event_row(e, i) for e, i in (await db.execute(q)).all()], total
+
+
+async def get_event(db: AsyncSession, event_id: int) -> dict[str, Any] | None:
+    got = (
+        await db.execute(
+            select(StockSignalEvent, Instrument)
+            .join(Instrument, Instrument.id == StockSignalEvent.instrument_id)
+            .where(StockSignalEvent.id == event_id)
+        )
+    ).first()
+    if got is None:
+        return None
+    ev, inst = got
+    st = await db.get(StockSignalState, (inst.id, ev.timeframe))
+    return {
+        "event": event_row(ev, inst),
+        "current": row(st, inst) | {"reason": st.reason} if st is not None else None,
+    }
+
+
+async def list_states(
+    db: AsyncSession,
+    tf: str,
+    *,
+    states: Sequence[str] = (),
+    exchange: str | None = None,
+    in_holdings: bool | None = None,
+    include_unavailable: bool = False,
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[dict[str, Any]], int]:
+    """The latest EMA/VWAP state of every evaluated instrument, best trend score first."""
+    s = StockSignalState
+    q = (
+        select(s, Instrument)
+        .join(Instrument, Instrument.id == s.instrument_id)
+        .where(s.timeframe == tf)
+    )
+    if states:
+        q = q.where(s.state.in_(states))
+    elif not include_unavailable:
+        q = q.where(s.state != "UNAVAILABLE")
+    if exchange:
+        q = q.where(Instrument.exchange == exchange.upper())
+    if in_holdings is not None:
+        q = q.where(s.in_holdings.is_(in_holdings))
+    total = int(await db.scalar(select(func.count()).select_from(q.subquery())) or 0)
+    q = q.order_by(s.trend_score.desc().nulls_last(), Instrument.id).limit(limit).offset(offset)
+    return [
+        row(st, inst) | {"reason": st.reason} for st, inst in (await db.execute(q)).all()
+    ], total
