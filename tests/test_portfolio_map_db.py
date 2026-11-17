@@ -90,7 +90,9 @@ async def test_map_values_classes_cash_and_visibility(make_env: EnvFactory) -> N
         # shares; WEAK (180) is under the cap, so it is flagged for review, not sold.
         url = "/api/trading/stock-signals/rebalance-preview"
         assert (await env.c["user"].post(url, json={})).status_code == 403
-        r = await env.send("user", "POST", url, json={"cash_buffer_pct": "0"})
+        r = await env.send(
+            "user", "POST", url, json={"cash_buffer_pct": "0", "min_trade_value": "100"}
+        )
         assert r.status_code == 200, r.text
         p = r.json()
         sells = [t for t in p["trades"] if t["side"] == "SELL"]
