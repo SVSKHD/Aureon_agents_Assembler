@@ -43,7 +43,14 @@ from app.core.config import Settings
 from app.core.logging import configure_logging, get_logger
 from app.db.session import build_engine, build_sessionmaker
 from app.models.trading import Instrument
-from app.services import app_settings, market_data, research, screener, stock_signals
+from app.services import (
+    app_settings,
+    market_data,
+    research,
+    screener,
+    stock_signal_notifications,
+    stock_signals,
+)
 
 log = get_logger("worker.research")
 
@@ -227,6 +234,12 @@ class ResearchWorker:
         )
         if out.status == "done":
             lane.extra["last_counts"] = out.counts
+            # In-app notifications for the new crossovers and VWAP confirmations; a retry
+            # never notifies twice (unique per user and dedup key).
+            sent = await stock_signal_notifications.notify_events(
+                self.maker, out.new_events, out.confirmed_events
+            )
+            lane.extra["notifications"] = int(lane.extra.get("notifications", 0)) + sent
 
     async def do_ai(self, req: dict[str, Any]) -> None:
         why = ai.unavailable_reason(self.settings)
@@ -337,6 +350,9 @@ class ResearchWorker:
                 last_purge = time.monotonic()
                 with contextlib.suppress(Exception):
                     lane.extra["purged"] = await stock_signals.purge(self.maker, self.settings)
+                    lane.extra["purged_notifications"] = await stock_signal_notifications.purge(
+                        self.maker, self.settings
+                    )
             run_id = None
             try:
                 await stock_signals.queue_due_runs(self.maker, self.settings)
