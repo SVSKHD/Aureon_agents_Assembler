@@ -35,6 +35,7 @@ from app.models.brokers import (
     DhanInstrument,
     DhanInstrumentSyncRun,
 )
+from app.models.stock_signals import HoldingSnapshot
 from app.models.trading import (
     BrokerAccount,
     BrokerOrderRow,
@@ -230,6 +231,9 @@ async def test_reconcile_is_idempotent_and_records_changes(env: Env) -> None:
 
     first = await dhan_sync.reconcile_account(env.maker, env.adapter, env.account)
     assert (first["orders_new"], first["executions_new"], first["positions"]) == (2, 1, 2)
+    # Delivery holdings are snapshotted for the portfolio signal map (docs/37 §6).
+    assert first["holdings"] == 1 and "holdings_error" not in first
+    assert await env.count(HoldingSnapshot) == 1
     second = await dhan_sync.reconcile_account(env.maker, env.adapter, env.account)
     assert (
         second["orders_new"],
