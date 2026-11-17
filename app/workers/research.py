@@ -4,6 +4,7 @@
     backtest   (queued trading.backtest_runs)
     screener   (queued trading.screener_runs; stored candles only, never a Dhan call)
     candle-backfill (trading.candle_backfill_requests → Dhan history, shared rate limit)
+    stock-signals (trading.stock_signal_runs: EMA 8/32 + VWAP after each candle close)
     ai-research (Redis list research:ai:queue → Claude gateway → trading.ai_analyses)
 
 Each agent has its own bounded asyncio queue (RESEARCH_QUEUE_MAX). A full queue drops the
@@ -42,7 +43,7 @@ from app.core.config import Settings
 from app.core.logging import configure_logging, get_logger
 from app.db.session import build_engine, build_sessionmaker
 from app.models.trading import Instrument
-from app.services import app_settings, market_data, research, screener
+from app.services import app_settings, market_data, research, screener, stock_signals
 
 log = get_logger("worker.research")
 
@@ -54,7 +55,20 @@ BACKTEST = AgentSpec("backtest", "Research / backtesting agent", "trading")
 AI_RESEARCH = AgentSpec("ai-research", "AI research agent (Claude, explanations only)", "trading")
 SCREENER = AgentSpec("screener", "Screener agent (stored candles, no broker calls)", "trading")
 BACKFILL = AgentSpec("candle-backfill", "Candle history agent (Dhan, rate limited)", "trading")
-SPECS = (MARKET_DATA, TECHNICAL, SIGNAL, RISK, BACKTEST, AI_RESEARCH, SCREENER, BACKFILL)
+STOCK_SIGNALS = AgentSpec(
+    "stock-signals", "Stock signals agent (EMA 8/32 + session VWAP, after candle closes)", "trading"
+)
+SPECS = (
+    MARKET_DATA,
+    TECHNICAL,
+    SIGNAL,
+    RISK,
+    BACKTEST,
+    AI_RESEARCH,
+    SCREENER,
+    BACKFILL,
+    STOCK_SIGNALS,
+)
 SPECS_BY_ID = {s.id: s for s in SPECS}
 TICK_CHANNEL = "dhan:ticks"
 # Settings this worker re-execs on. Its Dhan and MT5 adapters are built once, at startup, from
@@ -203,6 +217,17 @@ class ResearchWorker:
         lane = self.lane(BACKFILL)
         lane.extra[status] = int(lane.extra.get(status, 0)) + 1
 
+    async def do_stock_signals(self, run_id: uuid.UUID) -> None:
+        out = await stock_signals.execute_run(self.maker, run_id, self.settings)
+        lane = self.lane(STOCK_SIGNALS)
+        lane.extra[out.status] = int(lane.extra.get(out.status, 0)) + 1
+        lane.extra["events_new"] = int(lane.extra.get("events_new", 0)) + len(out.new_events)
+        lane.extra["confirmations"] = int(lane.extra.get("confirmations", 0)) + len(
+            out.confirmed_events
+        )
+        if out.status == "done":
+            lane.extra["last_counts"] = out.counts
+
     async def do_ai(self, req: dict[str, Any]) -> None:
         why = ai.unavailable_reason(self.settings)
         if why is not None or self.gateway is None:
@@ -295,6 +320,36 @@ class ResearchWorker:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), 5)
 
+    async def stock_signals_loop(self, stop: asyncio.Event) -> None:
+        """The candle-close trigger (docs/37): a run per configured timeframe once its newest
+        bar has closed, then one run at a time. Signals need the Dhan history the backfill
+        lane fetches, so without Dhan this lane stays idle and says why."""
+        lane = self.lane(STOCK_SIGNALS)
+        if not self.settings.STOCK_SIGNALS_ENABLED:
+            lane.extra["disabled"] = "STOCK_SIGNALS_ENABLED is off"
+            return
+        if "dhan" not in self.adapters:
+            lane.extra["disabled"] = "Dhan is not configured: no candles to evaluate"
+            return
+        last_purge = 0.0
+        while not stop.is_set():
+            if time.monotonic() - last_purge > 3600:
+                last_purge = time.monotonic()
+                with contextlib.suppress(Exception):
+                    lane.extra["purged"] = await stock_signals.purge(self.maker, self.settings)
+            run_id = None
+            try:
+                await stock_signals.queue_due_runs(self.maker, self.settings)
+                if not lane.paused and lane.queue.empty() and not lane.busy:
+                    run_id = await stock_signals.claim_run(self.maker)
+            except Exception as exc:
+                log.warning("stock_signals_claim_failed", error=type(exc).__name__)
+            if run_id is not None:
+                lane.offer(run_id)
+                continue
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), 5)
+
     async def ai_loop(self, stop: asyncio.Event) -> None:
         lane = self.lane(AI_RESEARCH)
         assert self.redis is not None
@@ -379,6 +434,7 @@ class ResearchWorker:
             AI_RESEARCH.id: self.do_ai,
             SCREENER.id: self.do_screener,
             BACKFILL.id: self.do_backfill,
+            STOCK_SIGNALS.id: self.do_stock_signals,
         }
 
 
@@ -426,6 +482,7 @@ async def main() -> int:
         asyncio.create_task(worker.ai_loop(stop)),
         asyncio.create_task(worker.screener_loop(stop)),
         asyncio.create_task(worker.backfill_loop(stop)),
+        asyncio.create_task(worker.stock_signals_loop(stop)),
     ]
     if dhan is not None:
         tasks.append(asyncio.create_task(worker.tick_bars_loop(stop)))
