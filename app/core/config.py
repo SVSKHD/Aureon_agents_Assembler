@@ -236,6 +236,33 @@ class Settings(BaseSettings):
     DHAN_UNIVERSE_BACKFILL_TIMEFRAMES: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["1d"]
     )
+    # Stock Signals (docs/37): EMA fast/slow crossover + session VWAP on NSE/BSE equities,
+    # evaluated by the research worker's stock-signals lane after each candle closes.
+    STOCK_SIGNALS_ENABLED: bool = True
+    # Universes (market_data.universe_ids names) evaluated every close. F&O stocks are ~200
+    # instruments: one Dhan history call each per close, inside the shared 5/s data budget.
+    # nse_equities (2,000+) per 15 minutes would use that whole budget; opt in knowingly.
+    STOCK_SIGNALS_UNIVERSES: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["fno_stocks", "watchlists"]
+    )
+    STOCK_SIGNALS_TIMEFRAMES: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["15m"]
+    )
+    STOCK_SIGNALS_MAX_UNIVERSE: int = Field(default=500, ge=1, le=10_000)
+    STOCK_SIGNALS_EMA_FAST: int = Field(default=8, ge=2, le=100)
+    STOCK_SIGNALS_EMA_SLOW: int = Field(default=32, ge=3, le=400)
+    # A cross waits this many closed bars (its own included) for a close beyond VWAP.
+    STOCK_SIGNALS_CONFIRM_BARS: int = Field(default=4, ge=1, le=20)
+    STOCK_SIGNALS_STALE_BARS: float = Field(default=2.0, gt=0, le=50)
+    STOCK_SIGNALS_LOOKBACK_BARS: int = Field(default=200, ge=64, le=2000)
+    # A run starts this long after the candle closes (Dhan needs a moment to publish it),
+    # then waits up to FETCH_TIMEOUT for the history it queued before evaluating anyway.
+    STOCK_SIGNALS_RUN_DELAY_SECONDS: int = Field(default=20, ge=0, le=600)
+    STOCK_SIGNALS_FETCH_TIMEOUT_SECONDS: int = Field(default=300, ge=10, le=3600)
+    STOCK_SIGNALS_MAX_ATTEMPTS: int = Field(default=3, ge=1, le=10)
+    STOCK_SIGNALS_RETENTION_DAYS: int = Field(default=90, ge=7, le=3650)
+    # Safety net for the candle-close trigger (IST): the first 15m close of the day.
+    STOCK_SIGNALS_SCAN_CRON: str = "31 9 * * 1-5"
     WATCHLIST_MAX_PER_USER: int = Field(default=50, ge=1, le=1000)
     WATCHLIST_MAX_ITEMS: int = Field(default=500, ge=1, le=5000)
     # The static IP you whitelisted on Dhan (only scripts/dhan_preflight.py reads it).
@@ -985,6 +1012,26 @@ class Settings(BaseSettings):
             raise ValueError(f"DHAN_UNIVERSE_BACKFILL_TIMEFRAMES: Dhan has no {bad} candles")
         return list(dict.fromkeys(out))
 
+    @field_validator("STOCK_SIGNALS_UNIVERSES")
+    @classmethod
+    def _check_signal_universes(cls, v: list[str]) -> list[str]:
+        known = {"nse_equities", "bse_equities", "fno_stocks", "watchlists"}
+        out = [s.strip().lower() for s in v if s.strip()]
+        bad = [s for s in out if s not in known]
+        if bad:
+            raise ValueError(f"STOCK_SIGNALS_UNIVERSES: unknown universe(s) {bad}")
+        return list(dict.fromkeys(out))
+
+    @field_validator("STOCK_SIGNALS_TIMEFRAMES")
+    @classmethod
+    def _check_signal_timeframes(cls, v: list[str]) -> list[str]:
+        ok = {"5m", "15m", "1h", "1d"}
+        out = [s.strip().lower() for s in v if s.strip()]
+        bad = [s for s in out if s not in ok]
+        if bad:
+            raise ValueError(f"STOCK_SIGNALS_TIMEFRAMES: {bad} not supported (5m 15m 1h 1d)")
+        return list(dict.fromkeys(out))
+
     @field_validator("IMAGE_PAUSE_WINDOWS")
     @classmethod
     def _check_windows(cls, v: list[str]) -> list[str]:
@@ -1006,6 +1053,8 @@ class Settings(BaseSettings):
         "DHAN_UNIVERSE_BACKFILL",
         "DHAN_UNIVERSE_BACKFILL_TIMEFRAMES",
         "RESEARCH_EMA_PERIODS",
+        "STOCK_SIGNALS_UNIVERSES",
+        "STOCK_SIGNALS_TIMEFRAMES",
         "CODE_PROTECTED_BRANCHES",
         "CODE_PUSH_BRANCH_PREFIXES",
         "INCIDENT_RESTART_CONTAINERS",
@@ -1035,6 +1084,12 @@ class Settings(BaseSettings):
             raise ValueError(
                 "TRADING_LIVE_ENABLED=true requires PHASE_G_APPROVED=yes (Phase G sign-off)"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _signal_emas_ordered(self) -> Settings:
+        if self.STOCK_SIGNALS_EMA_FAST >= self.STOCK_SIGNALS_EMA_SLOW:
+            raise ValueError("STOCK_SIGNALS_EMA_FAST must be smaller than STOCK_SIGNALS_EMA_SLOW")
         return self
 
     @property

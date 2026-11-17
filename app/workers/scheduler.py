@@ -69,6 +69,7 @@ from app.services import (
     paper,
     repair_recovery,
     repairs,
+    stock_signals,
 )
 from app.services.approvals import ApprovalGate
 
@@ -253,6 +254,14 @@ async def dhan_universe_backfill(ctx: TaskContext) -> dict[str, Any]:
     enqueues: the research worker's candle-backfill lane does the rate-limited Dhan calls,
     and each request fetches only bars newer than the newest stored one."""
     return await market_data.enqueue_universes(ctx.maker, ctx.settings)
+
+
+async def stock_signals_scan(ctx: TaskContext) -> dict[str, Any]:
+    """Safety net for the research worker's candle-close trigger (docs/37): queue the run for
+    each configured timeframe's newest close. Idempotent (one run per timeframe and close);
+    the research worker's stock-signals lane does the work."""
+    queued = await stock_signals.queue_due_runs(ctx.maker, ctx.settings)
+    return {"queued": len(queued)}
 
 
 async def mt5_sync_status(ctx: TaskContext) -> dict[str, Any]:
@@ -516,6 +525,7 @@ TASKS: dict[str, TaskFn] = {
     "dhan_reconcile": dhan_reconcile,
     "dhan_backfill_candles": dhan_backfill_candles,
     "dhan_universe_backfill": dhan_universe_backfill,
+    "stock_signals_scan": stock_signals_scan,
     "dhan_session_check": dhan_session_check,
     "dhan_monitor": dhan_monitor_job,
     "mt5_sync_status": mt5_sync_status,
@@ -584,6 +594,10 @@ def default_jobs(settings: Settings) -> list[tuple[str, str, str]]:
                     "dhan_universe_backfill",
                     settings.DHAN_UNIVERSE_BACKFILL_CRON,
                 )
+            )
+        if settings.STOCK_SIGNALS_ENABLED and settings.STOCK_SIGNALS_SCAN_CRON:
+            jobs.append(
+                ("stock-signals-scan", "stock_signals_scan", settings.STOCK_SIGNALS_SCAN_CRON)
             )
         if settings.DHAN_BACKFILL_INSTRUMENTS:
             jobs.append(
