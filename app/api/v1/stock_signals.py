@@ -7,8 +7,9 @@ Nothing here places, changes or cancels an order.
 
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -19,17 +20,25 @@ from app.auth.deps import CsrfProtected, Current, DbSession, SettingsDep
 from app.schemas.stock_signals import (
     NotificationKind,
     PortfolioMapOut,
+    RankingCoverageOut,
+    RankingOut,
     RebalanceIn,
     RebalancePreviewOut,
+    SignalState,
     SignalTimeframe,
+    StockSignalDetailOut,
+    StockSignalEventOut,
     StockSignalNotificationOut,
     StockSignalNotificationsOut,
     StockSignalPrefsIn,
     StockSignalPrefsOut,
     StockSignalReadAllIn,
+    StockSignalsPage,
+    StockSignalStateOut,
+    StockSignalStatesPage,
     StockSignalUnreadOut,
 )
-from app.services import portfolio_map
+from app.services import portfolio_map, stock_rankings
 from app.services import stock_signal_notifications as notes
 
 UI_MODULE = ui_module(
@@ -45,6 +54,157 @@ def _prefs_out(p: notes.Prefs) -> StockSignalPrefsOut:
         timeframes=sorted(p.timeframes),
         all_market=p.all_market,
         confirmed_only=p.confirmed_only,
+    )
+
+
+# --- signals, states and rankings ---------------------------------------------------------------
+# Static paths come before /{signal_id} so they never parse as an id.
+
+Exchange = Annotated[str | None, Query(pattern="^(NSE|BSE|nse|bse)$")]
+RANK_NOTE = (
+    "From the latest finished Stock Signals run (no Dhan call per request). Gainers and losers "
+    "rank by % change from the previous session's last close; trending ranks by the 0-100 "
+    "trend score, which orders trend strength and is not a probability of profit."
+)
+
+
+def _coverage(c: dict[str, object]) -> RankingCoverageOut:
+    return RankingCoverageOut.model_validate(c)
+
+
+@router.get("", response_model=StockSignalsPage)
+async def list_signals(
+    request: Request,
+    db: DbSession,
+    current: Current,
+    settings: SettingsDep,
+    timeframe: SignalTimeframe | None = None,
+    exchange: Exchange = None,
+    symbol: Annotated[str | None, Query(min_length=1, max_length=40)] = None,
+    direction: Literal["bullish", "bearish"] | None = None,
+    confirmation: Literal["confirmed", "pending"] | None = None,
+    in_holdings: bool | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    min_trend_score: Annotated[Decimal | None, Query(ge=0, le=100)] = None,
+    fresh_only: Annotated[
+        bool, Query(description="Only instruments whose current data is usable")
+    ] = False,
+    sort: stock_rankings.EventSort = "-crossed_at",
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> StockSignalsPage:
+    """EMA 8/32 crossover events (one per crossover; a VWAP confirmation updates it)."""
+    for name, value in (("since", since), ("until", until)):
+        if value is not None and value.tzinfo is None:
+            raise HTTPException(422, f"{name} must include a timezone (e.g. Z)")
+    await _budget(request, current.user.id, settings)
+    rows, total = await stock_rankings.list_events(
+        db,
+        timeframe=timeframe,
+        exchange=exchange,
+        symbol=symbol,
+        direction=direction,
+        confirmation=confirmation,
+        in_holdings=in_holdings,
+        since=since,
+        until=until,
+        min_trend_score=min_trend_score,
+        fresh_only=fresh_only,
+        sort=sort,
+        limit=limit,
+        offset=offset,
+    )
+    return StockSignalsPage(
+        items=[StockSignalEventOut.model_validate(r) for r in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/states", response_model=StockSignalStatesPage)
+async def list_states(
+    request: Request,
+    db: DbSession,
+    current: Current,
+    settings: SettingsDep,
+    timeframe: SignalTimeframe = "15m",
+    state: Annotated[list[SignalState] | None, Query(max_length=8)] = None,
+    exchange: Exchange = None,
+    in_holdings: bool | None = None,
+    include_unavailable: bool = False,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> StockSignalStatesPage:
+    """The latest EMA 8/32 + VWAP state of every evaluated instrument (best score first)."""
+    await _budget(request, current.user.id, settings)
+    rows, total = await stock_rankings.list_states(
+        db,
+        timeframe,
+        states=state or [],
+        exchange=exchange,
+        in_holdings=in_holdings,
+        include_unavailable=include_unavailable,
+        limit=limit,
+        offset=offset,
+    )
+    return StockSignalStatesPage(
+        items=[StockSignalStateOut.model_validate(r) for r in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/market-movers", response_model=RankingOut)
+async def market_movers(
+    request: Request,
+    db: DbSession,
+    current: Current,
+    settings: SettingsDep,
+    kind: Literal["gainers", "losers", "unusual_volume"] = "gainers",
+    timeframe: SignalTimeframe = "15m",
+    exchange: Exchange = None,
+    limit: Annotated[int, Query(ge=1, le=50)] = 10,
+) -> RankingOut:
+    """Top gainers / losers by real % change, or unusual volume (relative volume at or above
+    STOCK_SIGNALS_UNUSUAL_RVOL), among liquid instruments with usable data."""
+    await _budget(request, current.user.id, settings)
+    if kind == "unusual_volume":
+        rows = await stock_rankings.unusual_volume(
+            db, timeframe, settings.STOCK_SIGNALS_UNUSUAL_RVOL, limit=limit, exchange=exchange
+        )
+    else:
+        rows = await stock_rankings.movers(db, timeframe, kind, limit=limit, exchange=exchange)
+    return RankingOut(
+        kind=kind,
+        coverage=_coverage(await stock_rankings.coverage(db, timeframe)),
+        items=[StockSignalStateOut.model_validate(r) for r in rows],
+        note=RANK_NOTE,
+    )
+
+
+@router.get("/trending", response_model=RankingOut)
+async def trending(
+    request: Request,
+    db: DbSession,
+    current: Current,
+    settings: SettingsDep,
+    direction: Literal["bullish", "bearish"] = "bullish",
+    timeframe: SignalTimeframe = "15m",
+    exchange: Exchange = None,
+    limit: Annotated[int, Query(ge=1, le=50)] = 10,
+) -> RankingOut:
+    """Top trending bullish (highest score) or bearish (lowest score) instruments whose EMAs
+    agree with the direction."""
+    await _budget(request, current.user.id, settings)
+    rows = await stock_rankings.trending(db, timeframe, direction, limit=limit, exchange=exchange)
+    return RankingOut(
+        kind=f"trending_{direction}",
+        coverage=_coverage(await stock_rankings.coverage(db, timeframe)),
+        items=[StockSignalStateOut.model_validate(r) for r in rows],
+        note=RANK_NOTE,
     )
 
 
@@ -166,7 +326,7 @@ async def portfolio_map_view(
     class (HOLD_CANDIDATE, MONITOR, REVIEW_RISK, POTENTIAL_ADD). Read-only; an admin sees
     every Dhan account. Classes come from deterministic rules, not from a model."""
     return PortfolioMapOut.model_validate(
-        await portfolio_map.build(db, current, settings, timeframe)
+        await portfolio_map.build(db, portfolio_map.viewer(current), settings, timeframe)
     )
 
 
@@ -184,7 +344,7 @@ async def rebalance_preview(
     await _budget(request, current.user.id, settings)
     out = await portfolio_map.rebalance_preview(
         db,
-        current,
+        portfolio_map.viewer(current),
         settings,
         tf=body.timeframe,
         max_weight_pct=body.max_weight_pct or Decimal(str(settings.PORTFOLIO_MAX_WEIGHT_PCT)),
@@ -201,3 +361,13 @@ async def rebalance_preview(
         ),
     )
     return RebalancePreviewOut.model_validate(out)
+
+
+# Last: /{signal_id} would otherwise swallow the static paths above.
+@router.get("/{signal_id}", response_model=StockSignalDetailOut)
+async def get_signal(signal_id: int, db: DbSession, current: Current) -> StockSignalDetailOut:
+    """One crossover event and the instrument's current state on that timeframe."""
+    got = await stock_rankings.get_event(db, signal_id)
+    if got is None:
+        raise HTTPException(404, {"code": "not_found", "message": "signal not found"})
+    return StockSignalDetailOut.model_validate(got)

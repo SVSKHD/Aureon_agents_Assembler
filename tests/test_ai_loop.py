@@ -227,6 +227,11 @@ def test_default_tools_match_the_plan(settings: Settings) -> None:
         "get_mt5_bot_status",
         "get_mt5_recent_signals",
         "mt5_records_summary",
+        "get_stock_signals",
+        "get_market_rankings",
+        "get_portfolio_signal_health",
+        "get_portfolio_candidates",
+        "get_rebalance_preview",
         "propose_trade",
         *suggest,
     }
