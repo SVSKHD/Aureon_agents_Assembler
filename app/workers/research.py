@@ -46,6 +46,7 @@ from app.models.trading import Instrument
 from app.services import (
     app_settings,
     market_data,
+    portfolio_map,
     research,
     screener,
     stock_signal_notifications,
@@ -236,9 +237,12 @@ class ResearchWorker:
             lane.extra["last_counts"] = out.counts
             # In-app notifications for the new crossovers and VWAP confirmations; a retry
             # never notifies twice (unique per user and dedup key).
+            async with self.maker() as db:
+                hold = await portfolio_map.holders(db)
             sent = await stock_signal_notifications.notify_events(
-                self.maker, out.new_events, out.confirmed_events
+                self.maker, out.new_events, out.confirmed_events, holders=hold
             )
+            sent += await portfolio_map.notify_holdings(self.maker, out, run_id)
             lane.extra["notifications"] = int(lane.extra.get("notifications", 0)) + sent
 
     async def do_ai(self, req: dict[str, Any]) -> None:

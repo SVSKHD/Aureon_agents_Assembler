@@ -67,6 +67,7 @@ from app.services import (
     mt5_sync,
     news,
     paper,
+    portfolio_map,
     repair_recovery,
     repairs,
     stock_signals,
@@ -262,6 +263,32 @@ async def stock_signals_scan(ctx: TaskContext) -> dict[str, Any]:
     the research worker's stock-signals lane does the work."""
     queued = await stock_signals.queue_due_runs(ctx.maker, ctx.settings)
     return {"queued": len(queued)}
+
+
+def _signals_tf(settings: Settings) -> str:
+    tfs = settings.STOCK_SIGNALS_TIMEFRAMES
+    return "15m" if "15m" in tfs else tfs[0]
+
+
+async def stock_signals_premarket(ctx: TaskContext) -> dict[str, Any]:
+    """08:45 IST: the previous session's signal states of every held instrument."""
+    return await portfolio_map.premarket_review(ctx.maker, ctx.settings, _signals_tf(ctx.settings))
+
+
+async def stock_signals_eod(ctx: TaskContext) -> dict[str, Any]:
+    """15:45 IST: the day's crossovers and confirmations; queues the daily run when 1d is on."""
+    out = await stock_signals.day_summary(ctx.maker, ctx.settings)
+    out["queued"] = len(await stock_signals.queue_due_runs(ctx.maker, ctx.settings))
+    return out
+
+
+async def stock_signals_weekly(ctx: TaskContext) -> dict[str, Any]:
+    """Friday after the close: replacement candidates for each holder (advisory, once a week)."""
+    week = datetime.now(UTC).astimezone(ZoneInfo("Asia/Kolkata")).strftime("%G-W%V")
+    sent = await portfolio_map.notify_candidates(
+        ctx.maker, ctx.settings, _signals_tf(ctx.settings), week
+    )
+    return {"week": week, "notifications": sent}
 
 
 async def mt5_sync_status(ctx: TaskContext) -> dict[str, Any]:
@@ -526,6 +553,9 @@ TASKS: dict[str, TaskFn] = {
     "dhan_backfill_candles": dhan_backfill_candles,
     "dhan_universe_backfill": dhan_universe_backfill,
     "stock_signals_scan": stock_signals_scan,
+    "stock_signals_premarket": stock_signals_premarket,
+    "stock_signals_eod": stock_signals_eod,
+    "stock_signals_weekly": stock_signals_weekly,
     "dhan_session_check": dhan_session_check,
     "dhan_monitor": dhan_monitor_job,
     "mt5_sync_status": mt5_sync_status,
@@ -599,6 +629,15 @@ def default_jobs(settings: Settings) -> list[tuple[str, str, str]]:
             jobs.append(
                 ("stock-signals-scan", "stock_signals_scan", settings.STOCK_SIGNALS_SCAN_CRON)
             )
+            for job_id, task, cron in (
+                ("stock-signals-premarket", "stock_signals_premarket",
+                 settings.STOCK_SIGNALS_PREMARKET_CRON),
+                ("stock-signals-eod", "stock_signals_eod", settings.STOCK_SIGNALS_EOD_CRON),
+                ("stock-signals-weekly", "stock_signals_weekly",
+                 settings.STOCK_SIGNALS_WEEKLY_CRON),
+            ):  # fmt: skip
+                if cron:
+                    jobs.append((job_id, task, cron))
         if settings.DHAN_BACKFILL_INSTRUMENTS:
             jobs.append(
                 ("dhan-backfill-candles", "dhan_backfill_candles", settings.DHAN_BACKFILL_CRON)

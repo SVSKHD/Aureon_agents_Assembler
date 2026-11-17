@@ -31,6 +31,7 @@ from sqlalchemy import and_, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.agents.trading.base import BrokerError
 from app.agents.trading.dhan import parse
 from app.agents.trading.dhan.adapter import DhanAdapter, MasterStats, iter_master
 from app.agents.trading.types import Timeframe, session_for
@@ -41,6 +42,7 @@ from app.models.brokers import (
     DhanInstrument,
     DhanInstrumentSyncRun,
 )
+from app.models.stock_signals import HoldingSnapshot
 from app.models.trading import (
     BrokerAccount,
     BrokerOrderRow,
@@ -350,6 +352,25 @@ async def _instrument_ids(db: AsyncSession, refs: set[str]) -> dict[str, int]:
     return {r: i for r, i in rows.tuples()}
 
 
+async def _equity_ids_by_isin(db: AsyncSession, isins: Sequence[str]) -> dict[str, int]:
+    """Holdings carry an ISIN, not a segment: map each to its NSE equity, else its BSE one."""
+    if not isins:
+        return {}
+    rows = await db.execute(
+        select(Instrument.isin, Instrument.id, Instrument.segment).where(
+            Instrument.broker == "dhan",
+            Instrument.isin.in_(set(isins)),
+            Instrument.segment.in_(("NSE_EQ", "BSE_EQ")),
+            Instrument.instrument_type == "EQUITY",
+        )
+    )
+    out: dict[str, int] = {}
+    for isin, iid, seg in rows:
+        if isin not in out or seg == "NSE_EQ":
+            out[isin] = int(iid)
+    return out
+
+
 async def reconcile_account(
     maker: async_sessionmaker[AsyncSession], adapter: DhanAdapter, account: BrokerAccount
 ) -> dict[str, Any]:
@@ -363,6 +384,13 @@ async def reconcile_account(
     positions = await adapter.positions(acct)
     funds = await adapter.funds(acct)
     profile = await adapter.client.profile()
+    # Delivery holdings for the portfolio signal map (docs/37 §6). A failure here never
+    # stops the reconcile: it is counted, and the map shows how old its snapshot is.
+    holdings_error = None
+    try:
+        holdings = await adapter.holdings(acct)
+    except BrokerError as exc:
+        holdings, holdings_error = [], type(exc).__name__
     counts = {
         "orders_new": 0,
         "orders_changed": 0,
@@ -370,7 +398,10 @@ async def reconcile_account(
         "executions_new": 0,
         "trades_unknown_instrument": 0,
         "positions": len(positions),
+        "holdings": len(holdings),
     }
+    if holdings_error:
+        counts["holdings_error"] = holdings_error  # type: ignore[assignment]
 
     async with maker() as db, db.begin():
         refs = {f"{o.raw.get('exchangeSegment')}:{o.raw.get('securityId')}" for o in orders}
@@ -509,6 +540,23 @@ async def reconcile_account(
                     as_of=now,
                 )
             )
+
+        if holdings_error is None:
+            by_isin = await _equity_ids_by_isin(db, [h.isin for h in holdings if h.isin])
+            for h in holdings:
+                db.add(
+                    HoldingSnapshot(
+                        broker_account_id=account.id,
+                        instrument_id=by_isin.get(h.isin or ""),
+                        symbol=h.symbol[:64],
+                        isin=(h.isin or None) and h.isin[:16],
+                        quantity=h.quantity,
+                        available_quantity=h.available_quantity,
+                        avg_cost=h.avg_cost,
+                        last_price=h.last_price,
+                        as_of=now,
+                    )
+                )
 
         r = funds.raw
         db.add(

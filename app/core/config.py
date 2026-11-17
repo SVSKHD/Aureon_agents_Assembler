@@ -243,7 +243,7 @@ class Settings(BaseSettings):
     # instruments: one Dhan history call each per close, inside the shared 5/s data budget.
     # nse_equities (2,000+) per 15 minutes would use that whole budget; opt in knowingly.
     STOCK_SIGNALS_UNIVERSES: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["fno_stocks", "watchlists"]
+        default_factory=lambda: ["fno_stocks", "watchlists", "holdings"]
     )
     STOCK_SIGNALS_TIMEFRAMES: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["15m"]
@@ -286,6 +286,17 @@ class Settings(BaseSettings):
     STOCK_SIGNALS_STREAM_POLL_SECONDS: float = Field(default=3.0, gt=0, le=60)
     STOCK_SIGNALS_STREAM_HEARTBEAT_SECONDS: float = Field(default=15.0, gt=0, le=300)
     STOCK_SIGNALS_STREAM_MAX_SECONDS: float = Field(default=3600.0, ge=10, le=24 * 3600)
+    # Scheduled reviews (IST): previous-session portfolio review, end-of-day summary (and the
+    # daily-timeframe run when 1d is configured), weekly portfolio review with candidates.
+    STOCK_SIGNALS_PREMARKET_CRON: str = "45 8 * * 1-5"
+    STOCK_SIGNALS_EOD_CRON: str = "45 15 * * 1-5"
+    STOCK_SIGNALS_WEEKLY_CRON: str = "15 16 * * 5"
+    # Portfolio signal map and rebalance preview (docs/37 §6), advisory only.
+    PORTFOLIO_MAX_WEIGHT_PCT: float = Field(default=20.0, gt=0, le=100)
+    PORTFOLIO_ADD_MIN_SCORE: float = Field(default=65.0, ge=50, le=100)
+    PORTFOLIO_CASH_BUFFER_PCT: float = Field(default=5.0, ge=0, le=100)
+    PORTFOLIO_MIN_TRADE_VALUE: float = Field(default=1000.0, ge=0)
+    PORTFOLIO_CANDIDATES: int = Field(default=5, ge=0, le=20)
     WATCHLIST_MAX_PER_USER: int = Field(default=50, ge=1, le=1000)
     WATCHLIST_MAX_ITEMS: int = Field(default=500, ge=1, le=5000)
     # The static IP you whitelisted on Dhan (only scripts/dhan_preflight.py reads it).
@@ -1038,7 +1049,7 @@ class Settings(BaseSettings):
     @field_validator("STOCK_SIGNALS_UNIVERSES")
     @classmethod
     def _check_signal_universes(cls, v: list[str]) -> list[str]:
-        known = {"nse_equities", "bse_equities", "fno_stocks", "watchlists"}
+        known = {"nse_equities", "bse_equities", "fno_stocks", "watchlists", "holdings"}
         out = [s.strip().lower() for s in v if s.strip()]
         bad = [s for s in out if s not in known]
         if bad:

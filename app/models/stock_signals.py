@@ -226,3 +226,36 @@ class StockSignalPrefs(Base):
     all_market: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
     confirmed_only: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
     updated_at: Mapped[datetime] = _created()
+
+
+# --- Dhan holdings snapshots (migration 0034) --------------------------------------------------
+
+
+class HoldingSnapshot(Base):
+    """Delivery holdings as Dhan reported them at `as_of` (one row per holding per reconcile).
+    The latest `as_of` per account is the current portfolio; older rows are purged after
+    STOCK_SIGNALS_RETENTION_DAYS. instrument_id is resolved by ISIN on NSE, then BSE."""
+
+    __tablename__ = "holding_snapshots"
+    __table_args__ = (
+        Index(
+            "ix_trading_holding_snapshots_account_as_of", "broker_account_id", text("as_of DESC")
+        ),
+        Index("ix_trading_holding_snapshots_instrument", "instrument_id"),
+        S,
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    broker_account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("trading.broker_accounts.id", ondelete="CASCADE")
+    )
+    instrument_id: Mapped[int | None] = mapped_column(
+        ForeignKey("trading.instruments.id", ondelete="SET NULL")
+    )
+    symbol: Mapped[str] = mapped_column(String(64))
+    isin: Mapped[str | None] = mapped_column(String(16))
+    quantity: Mapped[Decimal] = mapped_column(Numeric(24, 6))
+    available_quantity: Mapped[Decimal] = mapped_column(Numeric(24, 6))
+    avg_cost: Mapped[Decimal] = mapped_column(PRICE)
+    last_price: Mapped[Decimal | None] = mapped_column(PRICE)
+    as_of: Mapped[datetime] = mapped_column(TS)
