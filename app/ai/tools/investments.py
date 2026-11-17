@@ -112,7 +112,7 @@ async def get_positions(ctx: ToolContext, args: dict[str, Any]) -> str:
 async def get_dhan_screener_results(ctx: ToolContext, args: dict[str, Any]) -> str:
     limit = int(args.get("limit") or 15)
     async with ctx.maker() as db:
-        q = select(ScreenerRun).where(ScreenerRun.status == "succeeded")
+        q = select(ScreenerRun).where(ScreenerRun.status == "done")
         if not ctx.is_admin:
             q = q.where(ScreenerRun.owner_user_id == ctx.user_id)
         run = await db.scalar(q.order_by(ScreenerRun.created_at.desc()).limit(1))
@@ -135,7 +135,7 @@ async def get_dhan_screener_results(ctx: ToolContext, args: dict[str, Any]) -> s
     lines = []
     for tsym, sym, metrics in rows:
         m = metrics or {}
-        keys = [k for k in ("close", "change_pct", "volume") if k in m]
+        keys = [k for k in ("last", "change_pct", "signal") if m.get(k) is not None]
         extra = ", ".join(f"{k} {m[k]}" for k in keys)
         lines.append(f"- {tsym or sym}" + (f": {extra}" if extra else ""))
     return head + ("\n" + "\n".join(lines) if lines else "\nNo matches.")
