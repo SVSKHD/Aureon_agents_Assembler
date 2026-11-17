@@ -23,6 +23,8 @@ from app.agents.research import indicators as ind
 from app.agents.research import screener as eng
 from app.agents.trading.base import BrokerAdapter, BrokerError, NotSupported
 from app.agents.trading.types import AdapterHealth, Candle, Timeframe, utc_now
+from app.ai.tools import investments
+from app.ai.tools.registry import ToolContext
 from app.auth.bootstrap import bootstrap_admin
 from app.auth.security import hash_password
 from app.core.config import Settings
@@ -548,6 +550,13 @@ async def test_large_universe_is_queued_and_worked_in_chunks(make_env: EnvFactor
                 ).all()
             )
         assert stored == set(hits)
+        # Claude's screener tool reads this finished run (status "done", never "succeeded").
+        ctx = ToolContext(
+            settings=env.settings, maker=env.maker, user_id=None, is_admin=True, agent="investments"
+        )
+        said = await investments.get_dhan_screener_results(ctx, {"limit": 3})
+        assert ": 5 matches of 25 scanned" in said and said.count("\n- ") == 3
+        assert "last " in said and "No finished screener run" not in said
 
 
 async def test_run_without_candles_says_so(make_env: EnvFactory) -> None:
