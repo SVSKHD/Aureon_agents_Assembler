@@ -32,7 +32,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -161,4 +161,68 @@ class StockSignalEvent(Base):
         ForeignKey("trading.stock_signal_runs.id", ondelete="SET NULL")
     )
     created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _created()
+
+
+# --- notifications (migration 0033) ------------------------------------------------------------
+
+NOTIFICATION_KINDS = (
+    "('bullish_cross','bearish_cross','vwap_confirmed','holding_reversal',"
+    "'portfolio_trend_change','replacement_candidate')"
+)
+
+
+class StockSignalNotification(Base):
+    """One in-app notification for one user. The id is the stream cursor (Last-Event-ID);
+    (user_id, dedup_key) is unique, so a retried run never notifies twice."""
+
+    __tablename__ = "stock_signal_notifications"
+    __table_args__ = (
+        UniqueConstraint("user_id", "dedup_key", name="uq_stock_signal_notifications_dedup"),
+        CheckConstraint(f"kind IN {NOTIFICATION_KINDS}", name="kind"),
+        Index("ix_trading_stock_signal_notifications_user_id", "user_id", text("id DESC")),
+        Index(
+            "ix_trading_stock_signal_notifications_unread",
+            "user_id",
+            postgresql_where=text("read_at IS NULL"),
+        ),
+        Index("ix_trading_stock_signal_notifications_created", "created_at"),
+        S,
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("core.users.id", ondelete="CASCADE"))
+    kind: Mapped[str] = mapped_column(String(32))
+    event_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("trading.stock_signal_events.id", ondelete="SET NULL")
+    )
+    instrument_id: Mapped[int | None] = mapped_column(
+        ForeignKey("trading.instruments.id", ondelete="CASCADE")
+    )
+    timeframe: Mapped[str | None] = mapped_column(String(4))
+    title: Mapped[str] = mapped_column(String(200))
+    body: Mapped[str] = mapped_column(Text)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=JSON_EMPTY)
+    dedup_key: Mapped[str] = mapped_column(String(160))
+    created_at: Mapped[datetime] = _created()
+    read_at: Mapped[datetime | None] = mapped_column(TS)
+
+
+class StockSignalPrefs(Base):
+    """A user's Stock Signals notification settings. No row = the defaults: on, every kind,
+    every timeframe, only instruments on the user's watchlists or holdings."""
+
+    __tablename__ = "stock_signal_prefs"
+    __table_args__ = (S,)
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("core.users.id", ondelete="CASCADE"), primary_key=True
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
+    # Empty = every kind / every timeframe.
+    kinds: Mapped[list[str]] = mapped_column(ARRAY(String(32)), server_default=text("'{}'"))
+    timeframes: Mapped[list[str]] = mapped_column(ARRAY(String(4)), server_default=text("'{}'"))
+    # Also every crossover in the evaluated universe, not just watchlists and holdings.
+    all_market: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    confirmed_only: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
     updated_at: Mapped[datetime] = _created()

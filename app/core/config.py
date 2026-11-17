@@ -282,6 +282,10 @@ class Settings(BaseSettings):
     STOCK_SIGNALS_UNUSUAL_RVOL: float = Field(default=2.0, gt=1)
     # Relative strength benchmark (Dhan broker_instrument_id); empty = no relative feature.
     STOCK_SIGNALS_BENCHMARK: str = "IDX_I:13"
+    # The notification stream (GET /api/trading/stock-signals/stream).
+    STOCK_SIGNALS_STREAM_POLL_SECONDS: float = Field(default=3.0, gt=0, le=60)
+    STOCK_SIGNALS_STREAM_HEARTBEAT_SECONDS: float = Field(default=15.0, gt=0, le=300)
+    STOCK_SIGNALS_STREAM_MAX_SECONDS: float = Field(default=3600.0, ge=10, le=24 * 3600)
     WATCHLIST_MAX_PER_USER: int = Field(default=50, ge=1, le=1000)
     WATCHLIST_MAX_ITEMS: int = Field(default=500, ge=1, le=5000)
     # The static IP you whitelisted on Dhan (only scripts/dhan_preflight.py reads it).

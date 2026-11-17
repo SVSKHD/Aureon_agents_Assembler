@@ -29,6 +29,7 @@ from app.api.v1 import (
     public,
     repairs,
     reviews,
+    stock_signals,
     system,
     trading,
     ui_manifest,
@@ -44,6 +45,7 @@ api_router.include_router(images.router)
 api_router.include_router(agents.router)
 api_router.include_router(trading.router)
 api_router.include_router(market.router)  # /api/trading screener, watchlists (docs/35)
+api_router.include_router(stock_signals.router)  # /api/trading/stock-signals (docs/37)
 api_router.include_router(mt5_push.router)  # /api/trading/mt5/ingest (bearer) + dashboard reads
 api_router.include_router(mt5_records.router)  # records/bars (bearer), dataset (docs/36)
 api_router.include_router(paper.router)
