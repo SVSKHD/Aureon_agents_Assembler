@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -62,3 +63,100 @@ class StockSignalPrefsIn(BaseModel):
 
 class StockSignalPrefsOut(StockSignalPrefsIn):
     pass
+
+
+# --- portfolio signal map (docs/37 §6) ---------------------------------------------------------
+
+Classification = Literal["HOLD_CANDIDATE", "MONITOR", "REVIEW_RISK", "POTENTIAL_ADD"]
+
+
+class PortfolioHoldingOut(BaseModel):
+    instrument_id: int | None
+    symbol: str
+    isin: str | None
+    exchange: str | None
+    quantity: Decimal
+    avg_cost: Decimal
+    last_price: Decimal | None
+    price_source: Literal["dhan_holdings", "candle_close"] | None
+    price_as_of: datetime | None
+    invested: Decimal
+    current_value: Decimal | None
+    unrealized_pnl: Decimal | None
+    unrealized_pnl_pct: Decimal | None
+    allocation_pct: Decimal | None
+    signal_state: str | None
+    ema_state: Literal["above", "below", "equal"] | None
+    vwap_state: Literal["above", "below", "at"] | None
+    trend_score: Decimal | None
+    signal_as_of: datetime | None
+    classification: Classification
+    reasons: list[str]
+    deep_link: str
+
+
+class PortfolioTotalsOut(BaseModel):
+    invested: Decimal
+    current: Decimal
+    unrealized_pnl: Decimal
+    unpriced_holdings: Decimal
+
+
+class SectorExposureOut(BaseModel):
+    available: bool
+    reason: str | None = None
+
+
+class PortfolioFreshnessOut(BaseModel):
+    holdings_as_of: datetime | None
+    cash_as_of: datetime | None
+    signals_as_of: datetime | None
+
+
+class PortfolioMapOut(BaseModel):
+    timeframe: str
+    accounts: int
+    holdings: list[PortfolioHoldingOut]
+    totals: PortfolioTotalsOut
+    available_cash: Decimal | None
+    sector_exposure: SectorExposureOut
+    freshness: PortfolioFreshnessOut
+    classification_counts: dict[str, int]
+    disclaimer: str
+
+
+class RebalanceIn(BaseModel):
+    timeframe: SignalTimeframe = "15m"
+    max_weight_pct: Decimal | None = Field(default=None, gt=0, le=100)
+    cash_buffer_pct: Decimal | None = Field(default=None, ge=0, le=100)
+    max_new: int | None = Field(default=None, ge=0, le=20)
+    min_trade_value: Decimal | None = Field(default=None, ge=0)
+
+
+class RebalanceTradeOut(BaseModel):
+    side: Literal["BUY", "SELL"]
+    symbol: str
+    instrument_id: int | None
+    quantity: Decimal
+    price: Decimal
+    value: Decimal
+    charges: Decimal
+    reason: str
+
+
+class RebalancePreviewOut(BaseModel):
+    timeframe: str
+    trades: list[RebalanceTradeOut]
+    cash_before: Decimal
+    cash_after: Decimal
+    cash_required: Decimal
+    cash_known: bool
+    total_charges: Decimal
+    allocation_before: dict[str, Decimal]
+    allocation_after: dict[str, Decimal]
+    review: list[str]
+    notes: list[str]
+    inputs: dict[str, Any]
+    charges_model: str
+    freshness: PortfolioFreshnessOut
+    generated_at: datetime

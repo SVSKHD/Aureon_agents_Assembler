@@ -40,7 +40,12 @@ from app.agents.research import stock_signals as engine
 from app.agents.trading.types import Timeframe
 from app.core.config import Settings
 from app.core.logging import get_logger
-from app.models.stock_signals import StockSignalEvent, StockSignalRun, StockSignalState
+from app.models.stock_signals import (
+    HoldingSnapshot,
+    StockSignalEvent,
+    StockSignalRun,
+    StockSignalState,
+)
 from app.models.trading import CandleBackfillRequest, Instrument
 from app.services import market_data, market_session
 from app.services.screener import Bar, load_bars
@@ -94,7 +99,10 @@ async def universe(db: AsyncSession, settings: Settings) -> list[int]:
     """The configured universes, NSE/BSE equities only, deduplicated and capped."""
     ids: list[int] = []
     for name in settings.STOCK_SIGNALS_UNIVERSES:
-        ids += await market_data.universe_ids(db, name)
+        if name == "holdings":
+            ids += await held_instrument_ids(db)
+        else:
+            ids += await market_data.universe_ids(db, name)
     if not ids:
         return []
     keep = (
@@ -111,6 +119,26 @@ async def universe(db: AsyncSession, settings: Settings) -> list[int]:
         )
     ).all()
     return list(keep)[: settings.STOCK_SIGNALS_MAX_UNIVERSE]
+
+
+async def held_instrument_ids(db: AsyncSession) -> list[int]:
+    """Instruments in the latest Dhan holdings snapshot of each account."""
+    latest = (
+        select(HoldingSnapshot.broker_account_id, func.max(HoldingSnapshot.as_of).label("as_of"))
+        .group_by(HoldingSnapshot.broker_account_id)
+        .subquery()
+    )
+    rows = await db.scalars(
+        select(HoldingSnapshot.instrument_id)
+        .join(
+            latest,
+            (latest.c.broker_account_id == HoldingSnapshot.broker_account_id)
+            & (latest.c.as_of == HoldingSnapshot.as_of),
+        )
+        .where(HoldingSnapshot.instrument_id.is_not(None), HoldingSnapshot.quantity > 0)
+        .distinct()
+    )
+    return [int(i) for i in rows.all() if i is not None]
 
 
 async def benchmark_id(db: AsyncSession, settings: Settings) -> int | None:
@@ -532,4 +560,51 @@ async def purge(maker: async_sessionmaker[AsyncSession], settings: Settings) -> 
                 )
             )
         )
-    return {"events": ev.rowcount or 0, "runs": runs.rowcount or 0}  # type: ignore[attr-defined]
+        snaps = await db.execute(
+            delete(HoldingSnapshot).where(
+                HoldingSnapshot.as_of < now - timedelta(days=settings.STOCK_SIGNALS_RETENTION_DAYS)
+            )
+        )
+    return {
+        "events": ev.rowcount or 0,  # type: ignore[attr-defined]
+        "runs": runs.rowcount or 0,  # type: ignore[attr-defined]
+        "holding_snapshots": snaps.rowcount or 0,  # type: ignore[attr-defined]
+    }
+
+
+async def day_summary(
+    maker: async_sessionmaker[AsyncSession], settings: Settings, now: datetime | None = None
+) -> dict[str, Any]:
+    """Today's (IST) crossovers by timeframe and direction, and how many VWAP confirmed."""
+    now = now or datetime.now(UTC)
+    day = now.astimezone(market_session.IST).date()
+    start, _ = market_session.session_bounds(day)
+    start = start - timedelta(minutes=15)  # the day starts before the open
+    async with maker() as db:
+        rows = (
+            await db.execute(
+                select(
+                    StockSignalEvent.timeframe,
+                    StockSignalEvent.direction,
+                    func.count(),
+                    func.count(StockSignalEvent.confirmed_at),
+                )
+                .where(StockSignalEvent.crossed_at >= start)
+                .group_by(StockSignalEvent.timeframe, StockSignalEvent.direction)
+            )
+        ).all()
+        runs = int(
+            await db.scalar(
+                select(func.count())
+                .select_from(StockSignalRun)
+                .where(StockSignalRun.boundary >= start, StockSignalRun.status == "done")
+            )
+            or 0
+        )
+    return {
+        "day": day.isoformat(),
+        "runs_done": runs,
+        "crossovers": {
+            f"{tf}:{d}": {"total": int(n), "vwap_confirmed": int(c)} for tf, d, n, c in rows
+        },
+    }

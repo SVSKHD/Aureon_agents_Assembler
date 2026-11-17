@@ -7,15 +7,20 @@ Nothing here places, changes or cancels an order.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.api.ui import ui_meta, ui_module
+from app.api.v1.market import _budget
 from app.auth.deps import CsrfProtected, Current, DbSession, SettingsDep
 from app.schemas.stock_signals import (
     NotificationKind,
+    PortfolioMapOut,
+    RebalanceIn,
+    RebalancePreviewOut,
     SignalTimeframe,
     StockSignalNotificationOut,
     StockSignalNotificationsOut,
@@ -24,6 +29,7 @@ from app.schemas.stock_signals import (
     StockSignalReadAllIn,
     StockSignalUnreadOut,
 )
+from app.services import portfolio_map
 from app.services import stock_signal_notifications as notes
 
 UI_MODULE = ui_module(
@@ -144,3 +150,54 @@ async def stream(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# --- portfolio signal map -------------------------------------------------------------------------
+
+
+@router.get("/portfolio-map", response_model=PortfolioMapOut)
+async def portfolio_map_view(
+    db: DbSession,
+    current: Current,
+    settings: SettingsDep,
+    timeframe: SignalTimeframe = "15m",
+) -> PortfolioMapOut:
+    """Your Dhan holdings with value, P&L, allocation, cash, EMA/VWAP state and an advisory
+    class (HOLD_CANDIDATE, MONITOR, REVIEW_RISK, POTENTIAL_ADD). Read-only; an admin sees
+    every Dhan account. Classes come from deterministic rules, not from a model."""
+    return PortfolioMapOut.model_validate(
+        await portfolio_map.build(db, current, settings, timeframe)
+    )
+
+
+@router.post("/rebalance-preview", response_model=RebalancePreviewOut)
+async def rebalance_preview(
+    body: RebalanceIn,
+    request: Request,
+    db: DbSession,
+    current: CsrfProtected,
+    settings: SettingsDep,
+) -> RebalancePreviewOut:
+    """A deterministic preview: trims of overweight holdings, liquid bullish alternatives,
+    cash needed, Dhan delivery charges and the allocation after. Nothing is stored and no
+    order is placed or drafted."""
+    await _budget(request, current.user.id, settings)
+    out = await portfolio_map.rebalance_preview(
+        db,
+        current,
+        settings,
+        tf=body.timeframe,
+        max_weight_pct=body.max_weight_pct or Decimal(str(settings.PORTFOLIO_MAX_WEIGHT_PCT)),
+        cash_buffer_pct=(
+            body.cash_buffer_pct
+            if body.cash_buffer_pct is not None
+            else Decimal(str(settings.PORTFOLIO_CASH_BUFFER_PCT))
+        ),
+        max_new=body.max_new if body.max_new is not None else settings.PORTFOLIO_CANDIDATES,
+        min_trade_value=(
+            body.min_trade_value
+            if body.min_trade_value is not None
+            else Decimal(str(settings.PORTFOLIO_MIN_TRADE_VALUE))
+        ),
+    )
+    return RebalancePreviewOut.model_validate(out)
