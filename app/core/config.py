@@ -263,6 +263,25 @@ class Settings(BaseSettings):
     STOCK_SIGNALS_RETENTION_DAYS: int = Field(default=90, ge=7, le=3650)
     # Safety net for the candle-close trigger (IST): the first 15m close of the day.
     STOCK_SIGNALS_SCAN_CRON: str = "31 9 * * 1-5"
+    # Rankings (docs/37 §3). The trend score's feature weights (JSON object; any subset of
+    # ema, vwap, volume, rsi, adx, momentum, relative; renormalised over what is available).
+    STOCK_SIGNALS_SCORE_WEIGHTS: dict[str, float] = Field(
+        default_factory=lambda: {
+            "ema": 0.25,
+            "vwap": 0.20,
+            "volume": 0.10,
+            "rsi": 0.10,
+            "adx": 0.15,
+            "momentum": 0.10,
+            "relative": 0.10,
+        }
+    )
+    # Liquidity filter: average traded value per session (INR), spread over the bars.
+    STOCK_SIGNALS_MIN_DAILY_TURNOVER: float = Field(default=50_000_000.0, ge=0)
+    # Unusual volume: today's volume so far vs the same bars of earlier sessions.
+    STOCK_SIGNALS_UNUSUAL_RVOL: float = Field(default=2.0, gt=1)
+    # Relative strength benchmark (Dhan broker_instrument_id); empty = no relative feature.
+    STOCK_SIGNALS_BENCHMARK: str = "IDX_I:13"
     WATCHLIST_MAX_PER_USER: int = Field(default=50, ge=1, le=1000)
     WATCHLIST_MAX_ITEMS: int = Field(default=500, ge=1, le=5000)
     # The static IP you whitelisted on Dhan (only scripts/dhan_preflight.py reads it).
@@ -1021,6 +1040,17 @@ class Settings(BaseSettings):
         if bad:
             raise ValueError(f"STOCK_SIGNALS_UNIVERSES: unknown universe(s) {bad}")
         return list(dict.fromkeys(out))
+
+    @field_validator("STOCK_SIGNALS_SCORE_WEIGHTS")
+    @classmethod
+    def _check_score_weights(cls, v: dict[str, float]) -> dict[str, float]:
+        known = {"ema", "vwap", "volume", "rsi", "adx", "momentum", "relative"}
+        bad = sorted(set(v) - known)
+        if bad:
+            raise ValueError(f"STOCK_SIGNALS_SCORE_WEIGHTS: unknown feature(s) {bad}")
+        if any(w < 0 for w in v.values()) or not any(w > 0 for w in v.values()):
+            raise ValueError("STOCK_SIGNALS_SCORE_WEIGHTS: weights must be >= 0, one > 0")
+        return v
 
     @field_validator("STOCK_SIGNALS_TIMEFRAMES")
     @classmethod
