@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -22,6 +22,7 @@ from app.schemas.stock_signals import (
     PortfolioMapOut,
     RankingCoverageOut,
     RankingOut,
+    RankingScopeOut,
     RebalanceIn,
     RebalancePreviewOut,
     SignalState,
@@ -38,6 +39,7 @@ from app.schemas.stock_signals import (
     StockSignalStatesPage,
     StockSignalUnreadOut,
 )
+from app.services import market_live as ml
 from app.services import portfolio_map, stock_rankings
 from app.services import stock_signal_notifications as notes
 
@@ -61,6 +63,7 @@ def _prefs_out(p: notes.Prefs) -> StockSignalPrefsOut:
 # Static paths come before /{signal_id} so they never parse as an id.
 
 Exchange = Annotated[str | None, Query(pattern="^(NSE|BSE|nse|bse)$")]
+Basis = Literal["confirmed", "live"]
 RANK_NOTE = (
     "From the latest finished Stock Signals run (no Dhan call per request). Gainers and losers "
     "rank by % change from the previous session's last close; trending ranks by the 0-100 "
@@ -167,10 +170,35 @@ async def market_movers(
     timeframe: SignalTimeframe = "15m",
     exchange: Exchange = None,
     limit: Annotated[int, Query(ge=1, le=50)] = 10,
+    basis: Basis = "confirmed",
+    universe: Annotated[str | None, Query(max_length=40)] = None,
+    min_price: Annotated[float | None, Query(ge=0)] = None,
+    min_avg_turnover: Annotated[float | None, Query(ge=0)] = None,
+    include_stale: bool = False,
 ) -> RankingOut:
     """Top gainers / losers by real % change, or unusual volume (relative volume at or above
-    STOCK_SIGNALS_UNUSUAL_RVOL), among liquid instruments with usable data."""
+    STOCK_SIGNALS_UNUSUAL_RVOL), among liquid instruments with usable data.
+
+    `basis=confirmed` (default): from the latest finished Stock Signals run (closed candles).
+    `basis=live`: from live quotes of a MARKET_LIVE_UNIVERSES `universe`, change against the
+    previous session's close, relative volume adjusted for time of day; `min_price`,
+    `min_avg_turnover` and `include_stale` override the liquidity defaults. `scope` says what
+    the list covers and is never market-wide for a subset."""
     await _budget(request, current.user.id, settings)
+    if basis == "live":
+        return await _live_movers(
+            request,
+            db,
+            settings,
+            kind,
+            timeframe,
+            exchange,
+            limit,
+            universe,
+            min_price,
+            min_avg_turnover,
+            include_stale,
+        )
     if kind == "unusual_volume":
         rows = await stock_rankings.unusual_volume(
             db, timeframe, settings.STOCK_SIGNALS_UNUSUAL_RVOL, limit=limit, exchange=exchange
@@ -195,16 +223,174 @@ async def trending(
     timeframe: SignalTimeframe = "15m",
     exchange: Exchange = None,
     limit: Annotated[int, Query(ge=1, le=50)] = 10,
+    basis: Basis = "confirmed",
 ) -> RankingOut:
     """Top trending bullish (highest score) or bearish (lowest score) instruments whose EMAs
-    agree with the direction."""
+    agree with the direction. `basis=live` ranks the live EMA/VWAP state of the bar that is
+    still forming (MARKET_LIVE_SCREENER_TIMEFRAMES only): it can change until the bar closes,
+    and only the confirmed basis creates signals or notifications."""
     await _budget(request, current.user.id, settings)
+    if basis == "live":
+        return await _live_trending(request, db, settings, direction, timeframe, exchange, limit)
     rows = await stock_rankings.trending(db, timeframe, direction, limit=limit, exchange=exchange)
     return RankingOut(
         kind=f"trending_{direction}",
         coverage=_coverage(await stock_rankings.coverage(db, timeframe)),
         items=[StockSignalStateOut.model_validate(r) for r in rows],
         note=RANK_NOTE,
+    )
+
+
+# --- live rankings (docs/38) ---------------------------------------------------------------------
+
+LIVE_NOTE = (
+    "Live: ranked from live Dhan quotes of the named universe, change against the previous "
+    "trading session's close (prev_close_source says where it came from). Only instruments the "
+    "feed is subscribed to are ranked; `scope` says what the list covers. Confirmed signal "
+    "fields (state, trend_score, EMAs) are from the latest closed-candle run."
+)
+LIVE_TREND_NOTE = (
+    "Live: the EMA/VWAP state of the bar that is still forming, from stored candles plus today's "
+    "live bars. It can change until the bar closes; confirmed signals come from closed candles."
+)
+
+
+async def _live_snapshot(request: Request, key: str) -> dict[str, Any] | None:
+    try:
+        snap = await ml.read_json(request.app.state.redis, key)
+    except Exception as exc:
+        raise HTTPException(503, f"live data unavailable ({type(exc).__name__})") from exc
+    return snap if isinstance(snap, dict) else None
+
+
+async def _live_movers(
+    request: Request,
+    db: DbSession,
+    settings: SettingsDep,
+    kind: str,
+    timeframe: str,
+    exchange: str | None,
+    limit: int,
+    universe: str | None,
+    min_price: float | None,
+    min_avg_turnover: float | None,
+    include_stale: bool,
+) -> RankingOut:
+    universes = list(settings.MARKET_LIVE_UNIVERSES)
+    name = universe or (universes[0] if universes else "")
+    if name not in universes:
+        raise HTTPException(422, f"universe must be one of MARKET_LIVE_UNIVERSES {universes}")
+    snap = await _live_snapshot(request, ml.MOVERS_KEY.format(universe=name))
+    if snap is None:
+        raise HTTPException(
+            503, "no live rankings yet: the market-live worker has not published this universe"
+        )
+    summary = ml.movers_summary(
+        snap,
+        kinds=(kind,),  # type: ignore[arg-type]
+        limit=limit,
+        min_price=settings.MARKET_LIVE_MIN_PRICE if min_price is None else min_price,
+        min_avg_turnover=(
+            settings.MARKET_LIVE_MIN_AVG_TURNOVER if min_avg_turnover is None else min_avg_turnover
+        ),
+        min_rvol=settings.STOCK_SIGNALS_UNUSUAL_RVOL,
+        include_stale=include_stale,
+        exchange=exchange,
+    )
+    rows = summary["top"][kind]
+    confirmed = await ml.confirmed_states(
+        db, [int(r["instrument_id"]) for r in rows if r.get("instrument_id")], timeframe
+    )
+    cov = summary["coverage"]
+    return RankingOut(
+        kind=kind,
+        basis="live",
+        coverage=RankingCoverageOut(
+            timeframe=timeframe,
+            run_id=None,
+            data_as_of=summary.get("quotes_as_of"),
+            universe_size=cov["universe_size"],
+            evaluated=cov["evaluated"],
+            unavailable=cov["no_data"],
+            illiquid=cov["illiquid"],
+            universe=name,
+            with_quote=cov["with_quote"],
+            live=cov["live"],
+            stale=cov["stale"],
+            closed=cov["closed"],
+            no_data=cov["no_data"],
+            no_prev_close=cov["no_prev_close"],
+            liquidity_unknown=cov["liquidity_unknown"],
+            quotes_as_of=summary.get("quotes_as_of"),
+            computed_at=summary.get("computed_at"),
+        ),
+        scope=RankingScopeOut.model_validate(summary["scope"]),
+        market=summary.get("market"),
+        items=[
+            StockSignalStateOut.model_validate(
+                ml.live_mover_item(r, confirmed.get(int(r.get("instrument_id") or 0)), timeframe)
+            )
+            for r in rows
+        ],
+        note=LIVE_NOTE,
+    )
+
+
+async def _live_trending(
+    request: Request,
+    db: DbSession,
+    settings: SettingsDep,
+    direction: str,
+    timeframe: str,
+    exchange: str | None,
+    limit: int,
+) -> RankingOut:
+    if timeframe not in settings.MARKET_LIVE_SCREENER_TIMEFRAMES:
+        raise HTTPException(
+            422,
+            "the live state is computed for MARKET_LIVE_SCREENER_TIMEFRAMES "
+            f"{settings.MARKET_LIVE_SCREENER_TIMEFRAMES} only",
+        )
+    snap = await _live_snapshot(request, ml.SCREENER_KEY.format(tf=timeframe))
+    if snap is None:
+        raise HTTPException(503, "no live state yet: the market-live worker has not published it")
+    all_rows = list(snap.get("rows") or [])
+    rows = ml.live_trending(all_rows, direction, limit=limit, exchange=exchange)
+    confirmed = await ml.confirmed_states(
+        db, [int(r["instrument_id"]) for r in rows if r.get("instrument_id")], timeframe
+    )
+    unavailable = sum(1 for r in all_rows if r.get("state") == "UNAVAILABLE")
+    universes = ",".join(snap.get("universes") or [])
+    usable = len(all_rows) - unavailable
+    return RankingOut(
+        kind=f"trending_{direction}",
+        basis="live",
+        coverage=RankingCoverageOut(
+            timeframe=timeframe,
+            run_id=None,
+            data_as_of=snap.get("computed_at"),
+            universe_size=len(all_rows),
+            evaluated=usable,
+            unavailable=unavailable,
+            universe=universes or None,
+            computed_at=snap.get("computed_at"),
+        ),
+        scope=RankingScopeOut(
+            universe=universes or None,
+            market_wide=False,
+            capped=False,
+            universe_total=len(all_rows),
+            label=f"{universes} universe ({usable} of {len(all_rows)} instruments with a "
+            "usable live state)",
+        ),
+        market=snap.get("market"),
+        items=[
+            StockSignalStateOut.model_validate(
+                ml.live_state_item(r, confirmed.get(int(r.get("instrument_id") or 0)))
+            )
+            for r in rows
+        ],
+        note=LIVE_TREND_NOTE,
     )
 
 

@@ -337,6 +337,43 @@ class Settings(BaseSettings):
     DHAN_FEED_CRASH_LOOP_STARTS: int = Field(default=5, ge=2, le=100)
     # Minimum gap between two feed reconnects requested by an admin or by recovery.
     DHAN_FEED_RECONNECT_COOLDOWN_SECONDS: float = Field(default=60.0, ge=5)
+    # Managed subscriptions (docs/38 §2). Off: the feed subscribes DHAN_FEED_INSTRUMENTS only,
+    # exactly as before. On: it also subscribes what browsers are watching (Redis demand, kept
+    # alive by the API) and the market-live universes, on the same single connection.
+    DHAN_FEED_DYNAMIC: bool = False
+    DHAN_FEED_MAX_INSTRUMENTS: int = Field(default=5000, ge=1, le=5000)
+    DHAN_FEED_DEMAND_TTL_SECONDS: float = Field(default=90.0, ge=15, le=3600)
+    DHAN_FEED_RECONCILE_SECONDS: float = Field(default=5.0, gt=0, le=300)
+    # Live market worker (app/workers/market_live.py, docs/38): live candles, quotes with the
+    # previous-session change, movers and the live EMA/VWAP state. Universes as in
+    # DHAN_UNIVERSE_BACKFILL (nse_equities, bse_equities, fno_stocks, indices, watchlists).
+    MARKET_LIVE_ENABLED: bool = True
+    MARKET_LIVE_UNIVERSES: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["fno_stocks"]
+    )
+    MARKET_LIVE_MAX_UNIVERSE: int = Field(default=2500, ge=1, le=5000)
+    MARKET_LIVE_TIMEFRAMES: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["1m", "5m", "15m", "1h", "1d"]
+    )
+    MARKET_LIVE_SCREENER_TIMEFRAMES: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["15m"]
+    )
+    MARKET_LIVE_RANK_SECONDS: float = Field(default=5.0, ge=1, le=300)
+    MARKET_LIVE_SCREENER_SECONDS: float = Field(default=15.0, ge=2, le=600)
+    MARKET_LIVE_QUOTE_THROTTLE_MS: int = Field(default=250, ge=0, le=10_000)
+    MARKET_LIVE_CLOSE_GRACE_SECONDS: float = Field(default=2.0, ge=0, le=30)
+    MARKET_LIVE_REFERENCE_REFRESH_SECONDS: float = Field(default=900.0, ge=60, le=86_400)
+    MARKET_LIVE_MIN_PRICE: float = Field(default=10.0, ge=0)
+    # Average traded value per session (INR) over the last 20 stored daily candles.
+    MARKET_LIVE_MIN_AVG_TURNOVER: float = Field(default=50_000_000.0, ge=0)
+    # Browser WebSocket (GET /api/trading/live/ws).
+    MARKET_WS_MAX_TOPICS: int = Field(default=200, ge=1, le=5000)
+    MARKET_WS_MAX_CONNECTIONS_PER_USER: int = Field(default=8, ge=1, le=100)
+    MARKET_WS_OUTBOX_MAX: int = Field(default=1000, ge=10, le=100_000)
+    MARKET_WS_SEND_TIMEOUT_SECONDS: float = Field(default=10.0, gt=0, le=120)
+    MARKET_WS_HEARTBEAT_SECONDS: float = Field(default=15.0, gt=0, le=300)
+    MARKET_WS_SESSION_CHECK_SECONDS: float = Field(default=60.0, ge=1, le=3600)
+    MARKET_WS_MESSAGES_PER_MINUTE: int = Field(default=120, ge=1, le=10_000)
 
     def dhan_session_active(self, now: datetime | None = None) -> bool:
         """A login-flow token that has not expired yet."""
@@ -1067,6 +1104,36 @@ class Settings(BaseSettings):
             raise ValueError("STOCK_SIGNALS_SCORE_WEIGHTS: weights must be >= 0, one > 0")
         return v
 
+    @field_validator("MARKET_LIVE_UNIVERSES")
+    @classmethod
+    def _check_live_universes(cls, v: list[str]) -> list[str]:
+        known = {"nse_equities", "bse_equities", "fno_stocks", "indices", "watchlists"}
+        out = [s.strip().lower() for s in v if s.strip()]
+        bad = [s for s in out if s not in known]
+        if bad:
+            raise ValueError(f"MARKET_LIVE_UNIVERSES: unknown universe(s) {bad}")
+        return list(dict.fromkeys(out))
+
+    @field_validator("MARKET_LIVE_TIMEFRAMES")
+    @classmethod
+    def _check_live_timeframes(cls, v: list[str]) -> list[str]:
+        ok = {"1m", "5m", "15m", "1h", "1d"}
+        out = [s.strip().lower() for s in v if s.strip()]
+        bad = [s for s in out if s not in ok]
+        if bad:
+            raise ValueError(f"MARKET_LIVE_TIMEFRAMES: {bad} not supported (1m 5m 15m 1h 1d)")
+        return list(dict.fromkeys(out))
+
+    @field_validator("MARKET_LIVE_SCREENER_TIMEFRAMES")
+    @classmethod
+    def _check_live_screener_timeframes(cls, v: list[str]) -> list[str]:
+        ok = {"5m", "15m", "1h", "1d"}
+        out = [s.strip().lower() for s in v if s.strip()]
+        bad = [s for s in out if s not in ok]
+        if bad:
+            raise ValueError(f"MARKET_LIVE_SCREENER_TIMEFRAMES: {bad} not supported (5m 15m 1h 1d)")
+        return list(dict.fromkeys(out))
+
     @field_validator("STOCK_SIGNALS_TIMEFRAMES")
     @classmethod
     def _check_signal_timeframes(cls, v: list[str]) -> list[str]:
@@ -1100,6 +1167,9 @@ class Settings(BaseSettings):
         "RESEARCH_EMA_PERIODS",
         "STOCK_SIGNALS_UNIVERSES",
         "STOCK_SIGNALS_TIMEFRAMES",
+        "MARKET_LIVE_UNIVERSES",
+        "MARKET_LIVE_TIMEFRAMES",
+        "MARKET_LIVE_SCREENER_TIMEFRAMES",
         "CODE_PROTECTED_BRANCHES",
         "CODE_PUSH_BRANCH_PREFIXES",
         "INCIDENT_RESTART_CONTAINERS",

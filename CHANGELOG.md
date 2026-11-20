@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased: Live market (quotes, live candles, movers, WebSocket)
+
+- Real-time NSE/BSE data on the existing single Dhan feed ([docs/38-live-market.md](docs/38-live-market.md)).
+  Deterministic and read-only; no AI, no orders.
+- Feed worker: managed subscriptions (`DHAN_FEED_DYNAMIC`, off by default): static + browser
+  demand + live universes on one socket, diffs only, full resubscribe on reconnect, capped,
+  with subscription metrics. Prev-close receipt time recorded.
+- New `market-live` worker (compose profile `dhan`): live quotes with the previous trading
+  session's close, session-aligned 1m/5m/15m/1h/1d live bars (partial flags, late/duplicate/
+  out-of-order handling), live gainers/losers/unusual volume per universe with coverage and
+  scope, live EMA 8/32 + VWAP state of the forming bar. Redis only: tick bars are never stored
+  as candles, so confirmed analysis is unchanged.
+- API: `GET /api/trading/live/quotes`, `/live/status`, `/live/protocol`, `GET /api/trading/chart`
+  (EMA 8/32, session VWAP, crossover markers, sessions), WebSocket `/api/trading/live/ws`
+  (cookie session + Origin check, snapshots, coalescing, slow-consumer disconnect, Redis
+  resync). `basis=live` on `/stock-signals/market-movers` and `/trending` (default unchanged).
+- Screener: `change_pct` filter; `candle: live` now includes today's live bars and the forming bar.
+- Existing SSE streams unchanged. `tests/test_route_auth.py` now pins the one WebSocket path.
+
 ## Unreleased: Stock Signals (EMA 8/32 + session VWAP)
 
 - Server-side signals for NSE/BSE equities ([docs/37-stock-signals.md](docs/37-stock-signals.md)):

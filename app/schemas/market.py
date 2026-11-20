@@ -93,6 +93,15 @@ class VwapPositionFilter(_Strict):
     relation: Relation
 
 
+class ChangePctFilter(_Strict):
+    """% change of the evaluated bar's close against the previous trading session's last close
+    (the previous bar for 1d), e.g. {"type": "change_pct", "op": ">", "value": 2}."""
+
+    type: Literal["change_pct"]
+    op: Op
+    value: Annotated[float, Field(ge=-100, le=1000)]
+
+
 ScreenerFilter = Annotated[
     EmaCrossFilter
     | EmaPositionFilter
@@ -101,7 +110,8 @@ ScreenerFilter = Annotated[
     | MacdCrossFilter
     | VolumeFilter
     | AdxFilter
-    | VwapPositionFilter,
+    | VwapPositionFilter
+    | ChangePctFilter,
     Field(discriminator="type"),
 ]
 

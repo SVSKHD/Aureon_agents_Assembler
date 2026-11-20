@@ -214,7 +214,7 @@ class ResearchWorker:
         await research.run_backtest(self.maker, run_id, self.settings)
 
     async def do_screener(self, run_id: uuid.UUID) -> None:
-        status = await screener.execute_run(self.maker, run_id, self.settings)
+        status = await screener.execute_run(self.maker, run_id, self.settings, redis=self.redis)
         lane = self.lane(SCREENER)
         lane.extra[status] = int(lane.extra.get(status, 0)) + 1
 

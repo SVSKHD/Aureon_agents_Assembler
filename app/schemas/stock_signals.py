@@ -230,6 +230,22 @@ class StockSignalStateOut(BaseModel):
     event_id: int | None
     candle_close_at: datetime | None
     reason: str | None = None
+    # Additive (docs/38): set on `basis=live` rankings. `state`, `trend_score` and the EMAs are
+    # then the confirmed (closed-candle) state of the instrument, or the live state for
+    # `/trending?basis=live`; the price, change and volume fields are live.
+    basis: Literal["confirmed", "live"] = "confirmed"
+    prev_close: Decimal | None = None
+    prev_close_source: Literal["feed", "daily_candle"] | None = None
+    volume: Decimal | None = None
+    turnover: Decimal | None = None
+    avg_turnover: Decimal | None = None
+    quote_status: Literal["live", "stale", "closed", "no_data"] | None = None
+    quote_age_seconds: float | None = None
+    last_trade_at: datetime | None = None
+    candle_closed: bool | None = Field(
+        default=None, description="live state: false while its bar is still forming"
+    )
+    partial_bars: int | None = None
 
 
 class StockSignalsPage(BaseModel):
@@ -262,6 +278,27 @@ class RankingCoverageOut(BaseModel):
     illiquid: int = 0
     history_wait_timed_out: bool = False
     finished_at: datetime | None = None
+    # Additive (docs/38), `basis=live` only: what the live ranking covers.
+    universe: str | None = None
+    with_quote: int | None = None
+    live: int | None = None
+    stale: int | None = None
+    closed: int | None = None
+    no_data: int | None = None
+    no_prev_close: int | None = None
+    liquidity_unknown: int | None = None
+    quotes_as_of: datetime | None = None
+    computed_at: datetime | None = None
+
+
+class RankingScopeOut(BaseModel):
+    universe: str | None
+    market_wide: bool = Field(
+        description="true only for every NSE equity, uncapped, all with a live quote"
+    )
+    capped: bool
+    universe_total: int | None
+    label: str
 
 
 class RankingOut(BaseModel):
@@ -269,3 +306,7 @@ class RankingOut(BaseModel):
     coverage: RankingCoverageOut
     items: list[StockSignalStateOut]
     note: str
+    # Additive (docs/38).
+    basis: Literal["confirmed", "live"] = "confirmed"
+    scope: RankingScopeOut | None = None
+    market: dict[str, Any] | None = None

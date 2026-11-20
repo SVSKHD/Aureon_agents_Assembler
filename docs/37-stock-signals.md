@@ -306,6 +306,7 @@ No new secrets: everything uses the existing Dhan credentials and database.
 
 - **Rankings refresh once per candle close** (15 minutes by default), not tick by tick; every
   response says its data time. Gainers and losers use the last closed candle, not the live LTP.
+  For live rankings use `basis=live` (docs/38-live-market.md).
 - **The trend score weights are defaults, not yet validated** on this market's history (§4).
 - **No sector exposure** until a reliable sector source exists.
 - **Holdings are as fresh as the reconcile job:** every 5 minutes in market hours, and only while

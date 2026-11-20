@@ -301,12 +301,18 @@ def test_admin_routes_are_pinned(settings: Settings) -> None:
     assert admin == ADMIN, {"unexpected": admin - ADMIN, "missing": ADMIN - admin}
 
 
-def test_no_websocket_or_mounted_apps(settings: Settings) -> None:
+# WebSocket routes are invisible to the dependency audit above (they authenticate inside the
+# handler), so each one is pinned here and has its own sign-in / Origin tests:
+# /api/trading/live/ws -> tests/test_live_api.py (docs/38 §5).
+WEBSOCKETS = {"/api/trading/live/ws"}
+
+
+def test_no_websocket_or_mounted_apps_beyond_the_pinned_ones(settings: Settings) -> None:
     app = create_app(settings)
     extra = [
         p for p in other_paths(app) if not p.startswith(("/api/docs", "/api/openapi", "/docs"))
     ]
-    assert extra == []
+    assert sorted(extra) == sorted(WEBSOCKETS)
 
 
 def test_prod_app_has_no_docs_or_openapi(data_root: Path) -> None:
@@ -317,7 +323,7 @@ def test_prod_app_has_no_docs_or_openapi(data_root: Path) -> None:
         DATA_ROOT=data_root,
     )
     app = create_app(prod)
-    assert other_paths(app) == []
+    assert set(other_paths(app)) == WEBSOCKETS  # no docs, no openapi, no mounts
     assert app.openapi_url is None and app.docs_url is None
 
 

@@ -244,6 +244,10 @@ class FeedStats:
     token_fp: str | None = None
     failed_token_fp: str | None = None
     reconnects_requested: int = 0
+    # Managed subscriptions: changes applied on the open socket, and the messages they took.
+    subscription_changes: int = 0
+    subscribe_messages: int = 0
+    unsubscribe_messages: int = 0
 
 
 Connector = Callable[[str], Awaitable[Any]]
@@ -284,6 +288,44 @@ class DhanFeed:
         self.stats = FeedStats()
         self._connector = connector
         self._reconnect = asyncio.Event()
+        # The socket in use and what is subscribed on it. Sends are serialised so a change of
+        # subscriptions never interleaves with the initial subscribe of a new connection.
+        self._ws: Any = None
+        self._active: set[tuple[str, str]] = set()
+        self._send_lock = asyncio.Lock()
+
+    async def set_instruments(self, wanted: list[tuple[str, str]]) -> tuple[int, int]:
+        """Change the subscription set. On an open socket only the difference is sent
+        (unsubscribe first, then subscribe, at most 100 per message); a later reconnect
+        subscribes the whole new set. Returns (added, removed) on the socket."""
+        wanted = list(dict.fromkeys(wanted))[:MAX_PER_CONNECTION]
+        self.instruments = wanted
+        async with self._send_lock:
+            ws = self._ws
+            if ws is None:
+                return 0, 0
+            keep = set(wanted)
+            add = [i for i in wanted if i not in self._active]
+            remove = sorted(self._active - keep)
+            if not add and not remove:
+                return 0, 0
+            try:
+                for msg in subscribe_messages(remove, self.mode, unsubscribe=True):
+                    await ws.send(msg)
+                    self.stats.unsubscribe_messages += 1
+                self._active -= set(remove)
+                for msg in subscribe_messages(add, self.mode):
+                    await ws.send(msg)
+                    self.stats.subscribe_messages += 1
+                self._active |= set(add)
+            except Exception as exc:  # broken socket: the run loop reconnects with the new set
+                self.stats.last_error = type(exc).__name__
+                log.warning("dhan_feed_subscribe_failed", error=type(exc).__name__)
+                return 0, 0
+            self.stats.subscription_changes += 1
+            self.stats.subscribed = len(self._active)
+            log.info("dhan_feed_subscriptions_changed", added=len(add), removed=len(remove))
+            return len(add), len(remove)
 
     def _current_token(self) -> str | None:
         return self._token() if callable(self._token) else self._token
@@ -348,11 +390,16 @@ class DhanFeed:
                 self.stats.connected = True
                 self.stats.connects += 1
                 self.stats.last_connected_at = time.time()
-                for msg in subscribe_messages(self.instruments, self.mode):
-                    await ws.send(msg)
-                # One subscription set per connection: a reconnect is a new socket, so
-                # re-subscribing can never double-subscribe.
-                self.stats.subscribed = len(self.instruments)
+                async with self._send_lock:
+                    current = list(self.instruments)
+                    for msg in subscribe_messages(current, self.mode):
+                        await ws.send(msg)
+                        self.stats.subscribe_messages += 1
+                    # One subscription set per connection: a reconnect is a new socket, so
+                    # re-subscribing can never double-subscribe.
+                    self._active = set(current)
+                    self._ws = ws
+                self.stats.subscribed = len(current)
                 log.info("dhan_feed_connected", instruments=len(self.instruments), mode=self.mode)
                 while not stopping.is_set():
                     recv = asyncio.ensure_future(ws.recv())
@@ -394,6 +441,8 @@ class DhanFeed:
             finally:
                 self.stats.connected = False
                 self.stats.subscribed = 0
+                self._ws = None
+                self._active = set()
                 if ws is not None:
                     with contextlib.suppress(Exception):
                         if stopping.is_set() or requested:

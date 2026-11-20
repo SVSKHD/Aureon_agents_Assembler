@@ -179,6 +179,73 @@ async def load_bars(
     return out
 
 
+async def overlay_live(
+    redis: Any,
+    refs: dict[int, str],
+    bars: dict[int, list[Bar]],
+    tf: Timeframe,
+    now: datetime,
+    holidays: Sequence[Any] = (),
+) -> int:
+    """`live` scans only (docs/38): append today's live bars after the newest stored *closed*
+    candle, then the forming bar, so a live scan sees the bar that is still forming on every
+    timeframe (stored candles alone have it only when Dhan served it). Skipped per instrument
+    when trading-time bars are missing between the two (no hole is ever bridged) or a live bar
+    has unknown volume, and entirely when Redis is unavailable. Returns how many instruments
+    got live bars. Confirmed scans never call this."""
+    import json as _json
+
+    from app.agents.research import live_market as lm
+    from app.services import market_live as ml
+    from app.services.market_session import candle_close, missed_bars
+
+    if redis is None or tf not in lm.LIVE_TIMEFRAMES or not refs:
+        return 0
+    items = list(refs.items())
+    try:
+        async with redis.pipeline(transaction=False) as pipe:
+            for _, ref in items:
+                pipe.lrange(ml.BARS_KEY.format(tf=tf.value, ref=ref), -50, -1)
+                pipe.get(ml.BAR_KEY.format(tf=tf.value, ref=ref))
+            got = await pipe.execute()
+    except Exception:
+        return 0
+    n = 0
+    for k, (iid, _ref) in enumerate(items):
+        raw_closed, raw_forming = got[2 * k], got[2 * k + 1]
+        live: list[lm.LiveBar] = []
+        for r in [*raw_closed, raw_forming]:
+            if r is None:
+                continue
+            try:
+                b = lm.LiveBar.from_json(_json.loads(r))
+            except ValueError:
+                b = None
+            if b is not None:
+                live.append(b)
+        rows = [b for b in bars.get(iid, []) if candle_close(b.ts, tf) <= now]
+        last = rows[-1].ts if rows else None
+        if last is not None:
+            live = [
+                b
+                for b in live
+                if (
+                    lm.session_day(b.ts) > lm.session_day(last)
+                    if tf is Timeframe.D1
+                    else b.ts > last
+                )
+            ]
+        live.sort(key=lambda b: (b.ts, b.closed))  # forming first, closed last
+        live = list({b.ts: b for b in live}.values())  # a closed bar wins over its forming copy
+        if not live or any(b.volume is None for b in live):
+            continue
+        if last is not None and missed_bars(candle_close(last, tf), live[0].ts, tf, holidays) > 0:
+            continue
+        bars[iid] = rows + [Bar(b.ts, b.open, b.high, b.low, b.close, b.volume) for b in live]
+        n += 1
+    return n
+
+
 async def universe_latest(
     db: AsyncSession, ids: Sequence[int], tf: Timeframe, cutoff: datetime
 ) -> datetime | None:
@@ -327,6 +394,7 @@ async def execute_run(
     settings: Settings,
     *,
     now: datetime | None = None,
+    redis: Any = None,
 ) -> str:
     """Evaluate a run that is already `running`. Returns the final status. Never raises for a
     data problem: failures are recorded on the run."""
@@ -368,6 +436,21 @@ async def execute_run(
                     await _finish(maker, run_id, "cancelled", counts)
                     return "cancelled"
                 bars = await load_bars(db, chunk, req.timeframe, lookback, cutoff)
+                if req.candle == "live" and redis is not None:
+                    refs = dict(
+                        (
+                            await db.execute(
+                                select(Instrument.id, Instrument.broker_instrument_id).where(
+                                    Instrument.id.in_(chunk), Instrument.broker == "dhan"
+                                )
+                            )
+                        )
+                        .tuples()
+                        .all()
+                    )
+                    await overlay_live(
+                        redis, refs, bars, req.timeframe, now, settings.DHAN_MARKET_HOLIDAYS
+                    )
             evals = await asyncio.to_thread(_evaluate_chunk, bars, req, now, stale_before)
             matches = []
             for iid, outcome, ev in evals:
