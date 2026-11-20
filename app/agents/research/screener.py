@@ -34,6 +34,7 @@ import pandas as pd
 from app.agents.research import indicators as ind
 from app.schemas.market import (
     AdxFilter,
+    ChangePctFilter,
     EmaCrossFilter,
     EmaPositionFilter,
     MacdCrossFilter,
@@ -53,6 +54,7 @@ Filter = (
     | VolumeFilter
     | AdxFilter
     | VwapPositionFilter
+    | ChangePctFilter
 )
 
 
@@ -100,6 +102,8 @@ def bars_needed(f: Filter) -> int:
         return f.avg_period + 1
     if isinstance(f, AdxFilter):
         return 2 * f.period
+    if isinstance(f, ChangePctFilter):
+        return 2
     return 1
 
 
@@ -280,6 +284,11 @@ def evaluate(
                 undefined.append(f.type)
             else:
                 ok = _cmp(a[-1], f.op, f.value)
+        elif isinstance(f, ChangePctFilter):
+            if base.change_pct is None:
+                undefined.append("change_pct (the window does not reach the previous session)")
+            else:
+                ok = _cmp(float(base.change_pct), f.op, f.value)
         else:  # VwapPositionFilter
             v = col("vwap")
             put("vwap", v[-1])

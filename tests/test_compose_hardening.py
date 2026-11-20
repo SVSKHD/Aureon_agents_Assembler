@@ -17,6 +17,7 @@ ONE_SHOTS = {"mount-check", "coding-mount-check", "migrate"}
 WORKERS = {
     "scheduler",
     "dhan-feed",
+    "market-live",
     "research-worker",
     "coding-worker",
     "imaging-worker",
@@ -37,6 +38,7 @@ def test_expected_services_and_profiles_kept(services: dict[str, dict[str, Any]]
     assert profiles["imaging-worker"] == ("imaging",)
     assert profiles["coding-worker"] == ("coding",)
     assert profiles["dhan-feed"] == ("dhan",)
+    assert profiles["market-live"] == ("dhan",)
     assert profiles["research-worker"] == ("research",)
     assert profiles["github-webhook-worker"] == ("github",)
     for core in ("api", "redis", "scheduler", "docker-proxy", "migrate", "mount-check"):

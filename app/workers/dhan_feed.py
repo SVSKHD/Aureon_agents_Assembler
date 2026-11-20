@@ -30,6 +30,12 @@ processes. Read-only: it only subscribes to market data (docs/28-dhan-operations
 - **Reconnect requests** on `dhan:feed:control` (admin button, bounded recovery) reconnect at
   most once per DHAN_FEED_RECONNECT_COOLDOWN_SECONDS.
 - **Registers** as agent `dhan-feed` (kind `trading`); pausing it closes the connection.
+- **Managed subscriptions** (DHAN_FEED_DYNAMIC, docs/38 §2): every DHAN_FEED_RECONCILE_SECONDS
+  the wanted set is rebuilt from DHAN_FEED_INSTRUMENTS, browser demand (`dhan:feed:demand`,
+  refreshed by the API while someone watches) and the market-live universes
+  (`dhan:feed:universe`), in that priority, capped at DHAN_FEED_MAX_INSTRUMENTS. Only the
+  difference is sent on the open socket; a reconnect re-subscribes the whole set. Browsers never
+  open their own Dhan connection: there is still exactly one upstream socket.
 """
 
 from __future__ import annotations
@@ -43,6 +49,7 @@ import secrets
 import signal
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
@@ -68,6 +75,53 @@ MAX_STARTUP_DELAY_S = 300.0
 
 def nse_open(now: datetime, holidays: Any = ()) -> bool:
     return fh.is_open(now, holidays)
+
+
+@dataclass
+class SubscriptionPlan:
+    wanted: list[tuple[str, str]]
+    static: int = 0
+    demand: int = 0
+    universe: int = 0
+    over_capacity: int = 0
+    invalid: int = 0
+
+
+def _refs(raw: Any) -> list[str]:
+    return [(r.decode() if isinstance(r, bytes) else str(r)) for r in raw or []]
+
+
+def plan_subscriptions(
+    static: list[tuple[str, str]], demand: list[str], universe: list[str], cap: int
+) -> SubscriptionPlan:
+    """What to subscribe: static first, then what browsers watch, then the live universes,
+    de-duplicated, at most `cap`. Malformed refs are skipped and counted."""
+    out: dict[tuple[str, str], str] = {}
+    plan = SubscriptionPlan(wanted=[])
+    sources: tuple[tuple[str, list[Any]], ...] = (
+        ("static", list(static)),
+        ("demand", demand),
+        ("universe", universe),
+    )
+    for src, refs in sources:
+        for ref in refs:
+            if isinstance(ref, tuple):
+                key = ref
+            else:
+                try:
+                    (key,) = parse_instruments([ref])
+                except ValueError:
+                    plan.invalid += 1
+                    continue
+            if key in out:
+                continue
+            if len(out) >= cap:
+                plan.over_capacity += 1
+                continue
+            out[key] = src
+            setattr(plan, src, getattr(plan, src) + 1)
+    plan.wanted = list(out)
+    return plan
 
 
 def validate(p: FeedPacket, subscribed: set[str], now: datetime) -> str | None:
@@ -120,12 +174,26 @@ class FeedSink:
         self._retry_at = 0.0
         self._retry_backoff = 0.5
 
+    def set_keys(self, keys: list[str]) -> None:
+        """The subscription set changed: validate against it and track freshness for it."""
+        self.keys = keys
+        self.subscribed = set(keys)
+        self.stale &= self.subscribed
+        for gone in [k for k in self.last_seen if k not in self.subscribed]:
+            self.last_seen.pop(gone, None)
+
     async def write(self, p: FeedPacket) -> None:
         data = p.as_json()
         fields: dict[Any, Any] = {
             k: (json.dumps(v) if isinstance(v, list | dict) else str(v)) for k, v in data.items()
         }
-        fields["received_at"] = datetime.now(UTC).isoformat()
+        now_iso = datetime.now(UTC).isoformat()
+        data["received_at"] = now_iso
+        fields["received_at"] = now_iso
+        if p.kind == "prev_close":
+            # When Dhan sent the previous close: it belongs to the session it was sent in
+            # (docs/38 §3), and the hash outlives a day.
+            fields["prev_close_received_at"] = now_iso
         fields["stale"] = "0"
         key = f"dhan:tick:{p.key}"
         async with self.redis.pipeline(transaction=False) as pipe:
@@ -259,8 +327,8 @@ def config_problem(settings: Settings) -> str | None:
         return "set DHAN_CLIENT_ID on /settings"
     if settings.dhan_access_token() is None:
         return "log in to Dhan on /settings (or set a valid DHAN_ACCESS_TOKEN)"
-    if not settings.DHAN_FEED_INSTRUMENTS:
-        return "set DHAN_FEED_INSTRUMENTS on /settings"
+    if not settings.DHAN_FEED_INSTRUMENTS and not settings.DHAN_FEED_DYNAMIC:
+        return "set DHAN_FEED_INSTRUMENTS on /settings (or turn on DHAN_FEED_DYNAMIC)"
     try:
         parse_instruments(settings.DHAN_FEED_INSTRUMENTS)
     except ValueError as exc:
@@ -298,6 +366,10 @@ class FeedRuntime:
         self.recent_starts = 0
         self.last_reconnect_at = 0.0
         self.reported_auth = False
+        self.static: list[tuple[str, str]] = []
+        self.plan = SubscriptionPlan(wanted=[])
+        self.reconciles = 0
+        self.reconcile_errors = 0
         self._run_stop: asyncio.Event | None = None
         self._tasks: list[asyncio.Task[Any]] = []
 
@@ -340,10 +412,63 @@ class FeedRuntime:
             "drain_errors": sink.drain_errors if sink else 0,
             "queue": feed.queue.qsize() if feed else 0,
             "mode": self.settings.DHAN_FEED_MODE,
+            "dynamic": self.settings.DHAN_FEED_DYNAMIC,
+            "desired": len(self.instruments),
+            "capacity": self.settings.DHAN_FEED_MAX_INSTRUMENTS,
+            "subscriptions": {
+                "static": len(self.static),
+                "demand": self.plan.demand,
+                "universe": self.plan.universe,
+                "over_capacity": self.plan.over_capacity,
+                "invalid": self.plan.invalid,
+                "changes": st.subscription_changes if st else 0,
+                "subscribe_messages": st.subscribe_messages if st else 0,
+                "unsubscribe_messages": st.unsubscribe_messages if st else 0,
+                "reconciles": self.reconciles,
+                "reconcile_errors": self.reconcile_errors,
+            },
+            "connects": st.connects if st else 0,
+            "last_connected_at": st.last_connected_at if st else None,
             "token_source": self.token_source(),
             "recent_starts": self.recent_starts,
             "updated_at": time.time(),
         }
+
+    async def reconcile(self, now: float | None = None) -> bool:
+        """Rebuild the wanted subscription set and apply the difference. Returns True when it
+        changed. A Redis error keeps the current set (counted); nothing is dropped."""
+        if not self.settings.DHAN_FEED_DYNAMIC:
+            return False
+        t = time.time() if now is None else now
+        try:
+            demand = _refs(await self.redis.zrangebyscore(fh.DEMAND_KEY, t, "+inf"))
+            universe = sorted(_refs(await self.redis.smembers(fh.UNIVERSE_KEY)))
+            if self.leader:
+                await self.redis.zremrangebyscore(fh.DEMAND_KEY, "-inf", t)
+        except Exception as exc:
+            self.reconcile_errors += 1
+            log.warning("dhan_feed_reconcile_failed", error=type(exc).__name__)
+            return False
+        self.reconciles += 1
+        plan = plan_subscriptions(
+            self.static, sorted(demand), universe, self.settings.DHAN_FEED_MAX_INSTRUMENTS
+        )
+        self.plan = plan
+        if plan.wanted == self.instruments:
+            return False
+        if plan.over_capacity:
+            log.warning("dhan_feed_over_capacity", dropped=plan.over_capacity)
+        self.instruments = plan.wanted
+        if self.sink is not None:
+            self.sink.set_keys([f"{s}:{i}" for s, i in plan.wanted])
+        if self.feed is not None:
+            if plan.wanted:
+                await self.feed.set_instruments(plan.wanted)
+            else:
+                self.feed.instruments = []
+                if self._run_stop is not None:
+                    self._run_stop.set()  # nothing to watch: close the socket
+        return True
 
     def heartbeat_state(self) -> tuple[str, dict[str, Any]]:
         details = self.status()
@@ -487,6 +612,7 @@ class FeedRuntime:
         while not self.shutdown.is_set():
             try:
                 if self.sink is not None:
+                    await self.reconcile()
                     await self.sink.mark_stale()
                     await self.sink.flush_pending()
                 if self.leader and not await self.renew_leader():
@@ -547,7 +673,8 @@ class FeedRuntime:
                 await self.publish_status()
                 await self._wait(STATUS_EVERY_S)
             return 0
-        self.instruments = parse_instruments(self.settings.DHAN_FEED_INSTRUMENTS)
+        self.static = parse_instruments(self.settings.DHAN_FEED_INSTRUMENTS)
+        self.instruments = list(self.static)
         self.recent_starts = await self.record_start()
         delay = startup_delay(self.recent_starts, self.settings.DHAN_FEED_CRASH_LOOP_STARTS)
         if delay:
@@ -567,6 +694,7 @@ class FeedRuntime:
             self.settings.DHAN_MARKET_HOLIDAYS,
         )
         self._ensure_drain()
+        await self.reconcile()
         self._tasks.append(asyncio.create_task(self.watch(), name="dhan-feed-watch"))
         self._tasks.append(asyncio.create_task(self.control_loop(), name="dhan-feed-control"))
         try:
@@ -580,6 +708,13 @@ class FeedRuntime:
                 if self.paused:
                     self.state_name = "paused"
                     await self._wait(STATUS_EVERY_S)
+                    continue
+                if not self.instruments:
+                    # Managed subscriptions with nothing wanted yet: no idle socket to Dhan.
+                    self.state_name = "waiting_demand"
+                    await self.reconcile()
+                    if not self.instruments:
+                        await self._wait(self.settings.DHAN_FEED_RECONCILE_SECONDS)
                     continue
                 if self.feed.stats.auth_failed:
                     if self.feed.token_changed():

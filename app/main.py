@@ -33,7 +33,7 @@ from app.core.prod_checks import assert_production_ready
 from app.db.session import build_engine, build_sessionmaker
 from app.integrations.claude_cli import ClaudeCLI
 from app.integrations.github import build_github_client
-from app.services import app_settings, app_settings_runtime, incidents
+from app.services import app_settings, app_settings_runtime, incidents, live_hub
 from app.services.claude_review import ReviewRunner
 from app.services.health import HealthService
 from app.services.mt5_ingest import DbIngestStore
@@ -146,6 +146,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 with contextlib.suppress(Exception, asyncio.CancelledError):
                     await asyncio.wait_for(docker_task, 5)
             await incidents.stop_exception_flusher(flusher)
+            await live_hub.stop_hub(app)  # closes live WebSockets (docs/38)
             await heartbeat.stop()
             await app.state.review_runner.aclose()
             # The current clients: a settings change may have replaced the startup ones.

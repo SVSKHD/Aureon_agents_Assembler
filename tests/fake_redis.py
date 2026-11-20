@@ -73,6 +73,8 @@ class FakeRedis:
         self.kv: dict[str, bytes] = {}
         self.hashes: dict[str, dict[bytes, bytes]] = {}
         self.lists: dict[str, list[bytes]] = {}
+        self.zsets: dict[str, dict[bytes, float]] = {}
+        self.sets: dict[str, set[bytes]] = {}
         self.expiry: dict[str, float] = {}
         self.published: list[tuple[str, bytes]] = []
         self._subs: list[FakePubSub] = []
@@ -87,7 +89,7 @@ class FakeRedis:
     def _alive(self, key: str) -> bool:
         exp = self.expiry.get(key)
         if exp is not None and exp <= time.time():
-            for d in (self.kv, self.hashes, self.lists):
+            for d in (self.kv, self.hashes, self.lists, self.zsets, self.sets):
                 d.pop(key, None)  # type: ignore[attr-defined]
             self.expiry.pop(key, None)
             return False
@@ -125,7 +127,7 @@ class FakeRedis:
         self._check()
         n = 0
         for k in keys:
-            for d in (self.kv, self.hashes, self.lists):
+            for d in (self.kv, self.hashes, self.lists, self.zsets, self.sets):
                 if k in d:
                     del d[k]  # type: ignore[attr-defined]
                     n += 1
@@ -190,6 +192,67 @@ class FakeRedis:
         self._check()
         lst = self.lists.get(key, [])
         return lst[start : (end + 1 if end != -1 else None)]
+
+    async def rpush(self, key: str, *values: Any) -> int:
+        self._check()
+        lst = self.lists.setdefault(key, [])
+        lst.extend(_b(v) for v in values)
+        return len(lst)
+
+    async def mget(self, keys: list[str]) -> list[bytes | None]:
+        self._check()
+        return [self.kv.get(k) if self._alive(k) else None for k in keys]
+
+    async def incr(self, key: str) -> int:
+        self._check()
+        n = int(self.kv.get(key, b"0")) + 1
+        self.kv[key] = _b(n)
+        return n
+
+    # sorted sets and sets (managed feed subscriptions, docs/38)
+
+    async def zadd(self, key: str, mapping: dict[Any, float]) -> int:
+        self._check()
+        z = self.zsets.setdefault(key, {})
+        new = sum(1 for m in mapping if _b(m) not in z)
+        for m, score in mapping.items():
+            z[_b(m)] = float(score)
+        return new
+
+    @staticmethod
+    def _bound(v: Any) -> float:
+        return {"-inf": float("-inf"), "+inf": float("inf")}.get(str(v), None) or float(v)
+
+    async def zrangebyscore(self, key: str, lo: Any, hi: Any) -> list[bytes]:
+        self._check()
+        a, b = self._bound(lo), self._bound(hi)
+        items = sorted(self.zsets.get(key, {}).items(), key=lambda kv: (kv[1], kv[0]))
+        return [m for m, s in items if a <= s <= b]
+
+    async def zremrangebyscore(self, key: str, lo: Any, hi: Any) -> int:
+        self._check()
+        a, b = self._bound(lo), self._bound(hi)
+        z = self.zsets.get(key, {})
+        gone = [m for m, s in z.items() if a <= s <= b]
+        for m in gone:
+            del z[m]
+        return len(gone)
+
+    async def zrem(self, key: str, *members: Any) -> int:
+        self._check()
+        z = self.zsets.get(key, {})
+        return sum(1 for m in members if z.pop(_b(m), None) is not None)
+
+    async def sadd(self, key: str, *members: Any) -> int:
+        self._check()
+        s = self.sets.setdefault(key, set())
+        before = len(s)
+        s.update(_b(m) for m in members)
+        return len(s) - before
+
+    async def smembers(self, key: str) -> set[bytes]:
+        self._check()
+        return set(self.sets.get(key, set())) if self._alive(key) else set()
 
     def pubsub(self) -> FakePubSub:
         return FakePubSub(self)

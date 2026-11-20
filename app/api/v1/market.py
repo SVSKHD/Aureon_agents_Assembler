@@ -148,7 +148,13 @@ async def run_screener(
     run_id = run.id
     await db.commit()
     if inline:
-        await svc.execute_run(request.app.state.sessionmaker, run_id, settings, now=now)
+        await svc.execute_run(
+            request.app.state.sessionmaker,
+            run_id,
+            settings,
+            now=now,
+            redis=getattr(request.app.state, "redis", None),
+        )
     db.expire_all()
     done = await db.get(ScreenerRun, run_id)
     assert done is not None

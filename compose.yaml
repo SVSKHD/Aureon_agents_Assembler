@@ -209,6 +209,28 @@ services:
     profiles: [dhan]
     restart: unless-stopped
 
+  # Live market worker (docs/38): reads the dhan-feed worker's ticks from Redis and publishes
+  # quotes, live candles, movers and the live EMA/VWAP state. No Dhan connection of its own,
+  # no writes to Postgres, no orders. One leader (Redis lock); a second copy stands by.
+  market-live:
+    image: aureon-agentic:${IMAGE_TAG:-dev}
+    container_name: aureon-market-live
+    env_file: .env
+    environment:
+      ENV: ${ENV:-prod}
+    command: ["python", "-m", "app.workers.market_live"]
+    networks: [aureon, private-ai]   # Redis + Postgres (reads candles); no outbound needed
+    # NO ports.
+    <<: *hardened
+    tmpfs: ["/tmp:size=32m"]
+    mem_limit: 768m
+    cpus: "1.0"
+    healthcheck: *worker-health
+    stop_grace_period: 15s
+    depends_on: *after-api
+    profiles: [dhan]
+    restart: unless-stopped
+
   # Research agents (Trading Phase D): market data, indicators, signals, risk, backtests and
   # Ollama explanations, in their own process. Opt-in: `docker compose --profile research up -d`.
   # Never places orders. One CPU-heavy backtest at a time; Ollama calls are serialized.

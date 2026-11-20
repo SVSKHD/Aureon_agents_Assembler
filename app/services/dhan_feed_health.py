@@ -15,7 +15,8 @@ still visible. `assess()` combines the two with the NSE calendar:
 |                 | silence is expected. Never reported as ok                             |
 | not_running     | no fresh status and no fresh heartbeat: the worker is not running     |
 | unknown         | the status could not be read (Redis down) and the heartbeat is stale  |
-| not_configured  | no DHAN_CLIENT_ID or no DHAN_FEED_INSTRUMENTS                         |
+| not_configured  | no DHAN_CLIENT_ID, or no DHAN_FEED_INSTRUMENTS with DHAN_FEED_DYNAMIC |
+|                 | off (with it on, demand and universes decide what is subscribed)      |
 
 `healthy` is true ONLY for `ok`: a feed is never reported healthy without fresh data.
 Every problem also has a stable code (`codes`): the monitor keys incidents and recovery on it.
@@ -40,6 +41,11 @@ STARTS_KEY = "dhan:feed:starts"
 LAST_CRASH_KEY = "dhan:feed:last_crash"
 RECONNECT_COOLDOWN_KEY = "dhan:feed:reconnect-cooldown"
 CRASH_WINDOW_S = 600
+# Managed subscriptions (DHAN_FEED_DYNAMIC, docs/38 §2). DEMAND_KEY is a sorted set
+# "SEG:ID" -> expiry epoch, refreshed by the API while a browser watches the instrument;
+# UNIVERSE_KEY is the set the market-live worker wants for its rankings.
+DEMAND_KEY = "dhan:feed:demand"
+UNIVERSE_KEY = "dhan:feed:universe"
 
 OPEN_AT = time(9, 15)
 CLOSE_AT = time(15, 30)
@@ -97,7 +103,12 @@ def assess(
     Redis could not be read at all."""
     now = now or datetime.now(UTC)
     market = market_state(now, settings.DHAN_MARKET_HOLIDAYS)
+    dynamic = settings.DHAN_FEED_DYNAMIC
     configured = len(settings.DHAN_FEED_INSTRUMENTS)
+    if dynamic and status and status.get("desired") is not None:
+        # Managed subscriptions: what the worker wants subscribed right now (static + browser
+        # demand + live universes); the static list alone may be empty.
+        configured = int(status.get("desired") or 0)
     out: dict[str, Any] = {
         "status": "ok",
         "healthy": False,
@@ -122,7 +133,7 @@ def assess(
         out["healthy"] = st == "ok"
         return out
 
-    if not settings.DHAN_CLIENT_ID or not configured:
+    if not settings.DHAN_CLIENT_ID or (not configured and not dynamic):
         return done("not_configured")
     agent_alive = bool(agent and agent.get("registered") and not agent.get("stale"))
     age = _age(status.get("updated_at"), now) if status else None
@@ -181,6 +192,12 @@ def assess(
     if state in ("waiting_config", "cooldown", "standby"):
         problem("worker_not_ready", f"feed worker is {state}")
         return done("down")
+    if state == "waiting_demand":
+        problem(
+            "no_subscriptions",
+            "nothing to subscribe: no browser is watching and no live universe is published",
+        )
+        return done("degraded" if market["open"] else "market_closed")
     if status.get("redis_ok") is False:
         problem("redis_writes_failing", "Redis writes are failing; newest ticks are held for retry")
     if not market["open"]:
