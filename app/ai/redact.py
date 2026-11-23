@@ -202,4 +202,10 @@ def redact(text: str, names: Iterable[str] = ()) -> str:
     return Redactor(names).text(text)
 
 
-__all__ = ["Redactor", "redact"]
+def strip_secrets(text: str) -> str:
+    """The credential rules alone (registered secret values and credential shapes): no
+    personal-data rule. For callers whose text holds no personal data (docs/39)."""
+    return _secrets(text) if text else text
+
+
+__all__ = ["Redactor", "redact", "strip_secrets"]

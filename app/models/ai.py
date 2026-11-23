@@ -154,7 +154,9 @@ class Usage(Base):
     __tablename__ = "usage"
     __table_args__ = (
         CheckConstraint("outcome IN ('reserved','ok','error','refused')", name="outcome"),
-        CheckConstraint("budget IN ('investments','business','chat','reserve')", name="budget"),
+        CheckConstraint(
+            "budget IN ('investments','business','chat','reserve','kratos')", name="budget"
+        ),
         Index("ix_ai_usage_at", "at"),
         Index("ix_ai_usage_budget_at", "budget", "at"),
         {"schema": "ai"},
@@ -162,7 +164,7 @@ class Usage(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
     at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    agent: Mapped[str] = mapped_column(String(16))
+    agent: Mapped[str] = mapped_column(String(64))  # "kratos:<role>" needs more than 16
     budget: Mapped[str] = mapped_column(String(16))
     model: Mapped[str] = mapped_column(String(64))
     conversation_id: Mapped[uuid.UUID | None] = mapped_column(

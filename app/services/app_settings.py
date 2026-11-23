@@ -108,6 +108,19 @@ REGISTRY: dict[str, Spec] = {
     for s in (
         # --- Claude, the only AI provider (docs/26-ai-providers.md) ---
         _s("ANTHROPIC_API_KEY", "ai", "secret", "Anthropic API key (console.anthropic.com)"),
+        _s(
+            "KRATOS_AI_TOKEN",
+            "ai",
+            "secret",
+            "Bearer token KRATOS presents to /api/v1/kratos/ai/complete (blank = route off)",
+        ),
+        _s("KRATOS_AI_MODEL", "ai", "str", "Claude model for KRATOS research (blank = refused)"),
+        _s(
+            "KRATOS_AI_BUDGET_POLICY",
+            "ai",
+            "str",
+            "KRATOS spend: capped (kratos + monthly caps apply) | metered (recorded, no ceiling)",
+        ),
         _s("AI_MODEL_MAIN", "ai", "str", "Main Claude model (e.g. claude-opus-5-5)"),
         _s(
             "AI_MODEL_ROUTER",

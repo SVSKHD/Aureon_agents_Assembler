@@ -269,20 +269,23 @@ class IntegrationsSummary:
 
     async def claude_api(self) -> Section:
         """The Claude API (docs/26) from settings and ai.usage only: no call, no tokens."""
-        from app.ai.budget import PgUsageStore
+        from app.ai.budget import PgUsageStore, shared_total
 
         s = self.settings
         if not s.anthropic_key:
             return {"configured": False, "status": "not_configured"}
         spend = await PgUsageStore(self.maker).spend()
         cap = s.AI_MONTHLY_BUDGET_USD
+        # A metered budget (docs/39) is recorded but does not count toward the monthly cap, so it
+        # must not make this card look exhausted. With no metered budget this is spend.total.
+        shared = shared_total(s, spend)
         return {
             "configured": True,
             "model_main": s.AI_MODEL_MAIN,
             "model_router": s.AI_MODEL_ROUTER or None,
-            "month_spent_usd": str(spend.total),
+            "month_spent_usd": str(shared),
             "monthly_budget_usd": str(cap),
-            "status": "degraded" if spend.total >= cap else "ok",
+            "status": "degraded" if shared >= cap else "ok",
         }
 
     async def discord(self) -> Section:

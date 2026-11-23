@@ -30,6 +30,9 @@ PUBLIC = {
     # MT5 records API writes (1.7.x bot): bearer MT5_RECORDS_TOKEN instead (docs/36).
     ("POST", "/api/trading/mt5/records"),
     ("POST", "/api/trading/mt5/bars"),
+    # KRATOS research AI route: machine-to-machine, bearer KRATOS_AI_TOKEN instead (docs/39).
+    ("POST", "/api/v1/kratos/ai/complete"),
+    ("GET", "/api/v1/kratos/ai/config"),
     # Dhan login callback: only redirects the browser to the SPA with the tokenId; the
     # exchange is POST /consume (admin + CSRF + a login started from that session).
     ("GET", "/api/v1/dhan/auth/callback"),
@@ -85,6 +88,7 @@ PUBLIC_UNSAFE = {
     "/api/trading/mt5/ingest",
     "/api/trading/mt5/records",
     "/api/trading/mt5/bars",
+    "/api/v1/kratos/ai/complete",
 }
 # Public routes that must carry the per-IP limiter dependency.
 PUBLIC_RATE_LIMITED = {p for m, p in PUBLIC if p.startswith("/api/public/")}

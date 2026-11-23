@@ -27,6 +27,7 @@ def test_defaults_match_the_plan(settings: Settings) -> None:
         "business": Decimal("30"),
         "chat": Decimal("20"),
         "reserve": Decimal("10"),
+        "kratos": Decimal("0"),  # KRATOS research route: refused until the owner sets a cap
     }
 
 

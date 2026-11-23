@@ -49,13 +49,28 @@ class Spend:
     by_budget: Mapping[str, Decimal]
 
 
+def shared_total(settings: Settings, spend: Spend) -> Decimal:
+    """Month-to-date spend that counts toward AI_MONTHLY_BUDGET_USD: everything except metered
+    budgets. With no metered budget (the default) this is simply spend.total."""
+    metered = settings.ai_metered_budgets
+    return spend.total - sum((spend.by_budget.get(b, ZERO) for b in metered), ZERO)
+
+
 def refusal(
     settings: Settings, spend: Spend, budget: str, estimate: Decimal
 ) -> tuple[str, Decimal, Decimal] | None:
-    """(which cap, its limit, already spent) when `estimate` more would cross a cap; else None."""
+    """(which cap, its limit, already spent) when `estimate` more would cross a cap; else None.
+
+    A metered budget (Settings.ai_metered_budgets; empty unless the owner opts in) is recorded
+    like any other but has no cap, and its spend is left out of the shared monthly total so it
+    can neither be stopped by the monthly cap nor use it up for everyone else."""
+    metered = settings.ai_metered_budgets
+    if budget in metered:
+        return None
     total_cap = settings.AI_MONTHLY_BUDGET_USD
-    if spend.total + estimate > total_cap:
-        return "monthly", total_cap, spend.total
+    shared = shared_total(settings, spend)
+    if shared + estimate > total_cap:
+        return "monthly", total_cap, shared
     agent_cap = settings.AI_AGENT_BUDGETS_USD.get(budget, ZERO)
     used = spend.by_budget.get(budget, ZERO)
     if used + estimate > agent_cap:

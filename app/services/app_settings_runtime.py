@@ -44,8 +44,9 @@ def apply(app: FastAPI, new: Settings) -> list[str]:
     if not changed:
         return changed
     retired: list[Any] = []
-    if any(k.startswith(("ANTHROPIC_", "AI_")) for k in changed):
-        # The gateway holds the key and reads its limits from the settings it was built with.
+    if any(k.startswith(("ANTHROPIC_", "AI_", "KRATOS_AI_")) for k in changed):
+        # The gateway holds the key and reads its limits from the settings it was built with:
+        # the budget caps, and which budgets are metered (KRATOS_AI_BUDGET_POLICY, docs/39).
         retired.append(getattr(state, "ai", None))
         state.ai = ClaudeGateway.build(new, state.sessionmaker)
     if "GITHUB_TOKEN" in changed:
