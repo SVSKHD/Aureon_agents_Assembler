@@ -10,7 +10,8 @@ Every call, in order:
    a call that could cross either is refused with BudgetExceeded and nothing is sent.
 4. The request: streaming; the tool definitions and the system prompt carry `cache_control`
    (they are fixed text, so they stay cached across turns), plus automatic caching of the
-   conversation so each tool-loop step re-reads the history from the cache. Effort is
+   conversation so each tool-loop step re-reads the history from the cache (a caller whose
+   requests are single messages that never repeat turns that part off). Effort is
    explicit (AI_EFFORT): Claude Opus 5.5 always thinks, and effort is the control.
    No sampling parameters (rejected by the API version the SDK sends).
 5. Retries: the SDK retries connection errors, 408/409/429 and 5xx with exponential backoff
@@ -240,7 +241,12 @@ class ClaudeGateway:
         on_text: OnText | None = None,
         conversation_id: object | None = None,
         redactor: Redactor | None = None,
+        cache_conversation: bool = True,
     ) -> CallResult:
+        """`cache_conversation=False` is for a caller whose every request is one self-contained
+        message that is never sent again: the automatic breakpoint would land after that unique
+        text, so each request would pay the cache-write premium on input no later request reads.
+        The system prompt keeps its own breakpoint either way."""
         if self._client is None:
             raise NotConfigured("Claude is not set up: ANTHROPIC_API_KEY is not set")
         s = self.settings
@@ -274,9 +280,10 @@ class ClaudeGateway:
             "max_tokens": max_tokens,
             "system": [{"type": "text", "text": system_text, "cache_control": CACHE}],
             "messages": sent,
-            "cache_control": CACHE,
             "output_config": {"effort": s.AI_EFFORT},
         }
+        if cache_conversation:
+            params["cache_control"] = CACHE
         if tool_defs:
             params["tools"] = tool_defs
         t0 = time.monotonic()

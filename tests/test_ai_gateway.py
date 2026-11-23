@@ -96,6 +96,25 @@ async def test_caching_effort_and_no_sampling_parameters(settings: Settings) -> 
     assert not {"temperature", "top_p", "top_k", "thinking"} & set(sent)
 
 
+async def test_one_shot_requests_can_skip_conversation_caching(settings: Settings) -> None:
+    fake = FakeClaude([text_reply("a"), text_reply("b")])
+    gw = _gw(_s(settings), fake)
+    await _call(gw)
+    await gw.call(
+        agent="chat",
+        budget="chat",
+        system="You are a test.",
+        messages=[{"role": "user", "content": "hello"}],
+        cache_conversation=False,
+    )
+    default, one_shot = fake.calls
+    assert default["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in one_shot  # no breakpoint after the unique message
+    assert one_shot["system"][0]["cache_control"] == {"type": "ephemeral"}  # the fixed part stays
+    same = ("model", "max_tokens", "output_config")
+    assert {k: default[k] for k in same} == {k: one_shot[k] for k in same}
+
+
 async def test_usage_is_settled_with_real_tokens_and_cost(settings: Settings) -> None:
     s = _s(settings)
     store = MemoryUsageStore()

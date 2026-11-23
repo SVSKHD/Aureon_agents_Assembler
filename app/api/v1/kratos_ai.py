@@ -228,6 +228,9 @@ async def complete(
                 model=model,
                 max_tokens=min(body.max_tokens, settings.KRATOS_AI_MAX_OUTPUT_TOKENS),
                 redactor=VerbatimRedactor(),
+                # One self-contained message per request, never re-sent: caching it is a write
+                # nobody reads. The specialist's system prompt is still cached (it repeats).
+                cache_conversation=False,
             )
         except GatewayError as exc:
             log.info("kratos_ai_refused", role=body.role, model=model, code=exc.code)
