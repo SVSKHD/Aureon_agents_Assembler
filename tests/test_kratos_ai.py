@@ -241,6 +241,22 @@ async def test_evidence_reaches_the_model_exactly_as_sent(settings: Settings) ->
     assert _system_text(fake.calls[0]) == system
 
 
+async def test_no_cache_write_for_the_one_shot_message(settings: Settings) -> None:
+    """Each KRATOS request is one self-contained message that is never sent again. A cache
+    breakpoint after it would be written at a premium and never read; only the specialist's
+    system prompt, which repeats across rounds, is marked."""
+    fake = FakeClaude([text_reply("ok"), text_reply("ok")])
+    app, _ = _app(settings, fake)
+    for user in ("evidence pack for round one", "evidence pack for round two"):
+        assert (await _post(app, {**BODY, "user": user})).status_code == 200
+    for call in fake.calls:
+        assert "cache_control" not in call  # no automatic breakpoint after the message
+        assert call["system"][0]["cache_control"] == {"type": "ephemeral"}
+        assert all(not isinstance(m["content"], list) for m in call["messages"])  # sent as written
+    assert fake.calls[0]["system"] == fake.calls[1]["system"]  # the cacheable part is identical
+    assert fake.calls[0]["model"] == fake.calls[1]["model"] == MODEL
+
+
 @pytest.mark.parametrize(
     "leak",
     [

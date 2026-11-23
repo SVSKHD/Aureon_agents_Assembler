@@ -32,6 +32,22 @@ Reports what a call would run with: the selected model, whether it is priced, wh
 Every call runs on `KRATOS_AI_MODEL`, a runtime setting only the owner changes. It has no default. Blank refuses every
 call. An unpriced model is refused before any call. Nothing falls back to `AI_MODEL_MAIN` or to any other model.
 
+## Prompt caching
+
+A KRATOS request is one self-contained message (the evidence pack and the round's instructions) and is never sent
+again, so the route calls the gateway with `cache_conversation=False`: no automatic breakpoint is placed after the
+message. Only the specialist's system prompt carries `cache_control`; it repeats in every round of a case and is read
+from the cache while the rounds are less than five minutes apart.
+
+Why: with the automatic breakpoint every request wrote its whole input to the cache at 1.25 times the input price and
+nothing read it back. On the second real case (9 requests) 201,873 input tokens were written and 7,470 read; about
+198,000 of the written tokens were unique messages, a surcharge of about 0.20 USD on a 1.70 USD case. The request sent
+to the model is otherwise byte-identical: same system prompt, same message, same model, same effort.
+
+Not done here: sharing the evidence pack between the three specialists of a round (it is identical for all three and
+could be read from the cache twice per round). That needs the pack to come before the specialist-specific text, which
+changes the prompt layout and has to be measured on a real case first.
+
 ## Controls
 
 - **Auth:** single-purpose bearer token, constant-time comparison. No session, cookie or CSRF. The route is off (503)
