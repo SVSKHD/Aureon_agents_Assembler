@@ -489,7 +489,9 @@ async def usage(
     ).all()
     spent = {b: Decimal(v) for b, v, _n in rows}
     calls = sum(int(n) for _b, _v, n in rows)
-    total = sum(spent.values(), Decimal(0))
+    # Spend that counts toward the monthly cap: a metered budget (docs/39) is listed below with
+    # what it spent but is left out of this total. With no metered budget this is every budget.
+    total = sum((v for b, v in spent.items() if b not in settings.ai_metered_budgets), Decimal(0))
     cap = settings.AI_MONTHLY_BUDGET_USD
     budgets = [
         BudgetOut(

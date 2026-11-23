@@ -76,6 +76,18 @@ from app.services.approvals import ApprovalGate
 
 log = get_logger("worker.scheduler")
 MAX_BACKOFF_SECONDS = 3600
+# Settings this worker re-execs on (docs/settings.md). Its Claude gateway reads the budget caps
+# from the settings it was built with, so KRATOS_AI_BUDGET_POLICY is here too: with a stale
+# policy this process would count metered KRATOS spend against the shared monthly cap (docs/39).
+RELOAD_PREFIXES = (
+    "DHAN_",
+    "GITHUB_",
+    "DISCORD_",
+    "MT5_",
+    "ANTHROPIC_",
+    "AI_",
+    "KRATOS_AI_BUDGET_POLICY",
+)
 
 
 @dataclass
@@ -898,13 +910,7 @@ async def main() -> int:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stopping.set)
     # A change to its keys from Spasta re-execs this worker (docs/settings.md).
-    app_settings.start_worker_watch(
-        settings,
-        maker,
-        stopping,
-        ("DHAN_", "GITHUB_", "DISCORD_", "MT5_", "ANTHROPIC_", "AI_"),
-        redis,
-    )
+    app_settings.start_worker_watch(settings, maker, stopping, RELOAD_PREFIXES, redis)
 
     def state() -> tuple[str, dict[str, Any]]:
         return (

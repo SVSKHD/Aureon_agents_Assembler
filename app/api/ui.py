@@ -56,6 +56,7 @@ SAFETY_RULES: tuple[tuple[str, str, Danger, str], ...] = (
     ("*", r"^/api/v1/github/webhooks$", "hidden", "machine endpoint (HMAC)"),
     ("*", r"^/api/trading/mt5/ingest$", "hidden", "machine endpoint (bearer)"),
     ("POST", r"^/api/trading/mt5/(records|bars)$", "hidden", "machine endpoint (bearer)"),
+    ("*", r"^/api/v1/kratos/ai/(complete|config)$", "hidden", "machine endpoint (bearer)"),
     (
         "*",
         r"^/api/v1/(ingest|admin/risk|admin/review|aureon|status$|signals|decisions|trades$|chart$|review|risk$)",

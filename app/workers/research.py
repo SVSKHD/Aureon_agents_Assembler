@@ -83,7 +83,9 @@ TICK_CHANNEL = "dhan:ticks"
 # the values then: without DHAN_ here a Dhan login made after the worker started (the session
 # token is a managed setting, renewed daily) never reaches it, and every chart-history request
 # stays queued ("Dhan is not configured") or runs on yesterday's expired token.
-RELOAD_PREFIXES = ("DHAN_", "MT5_", "ANTHROPIC_", "AI_")
+# KRATOS_AI_BUDGET_POLICY: the Claude gateway built here reads which budgets are metered from
+# its startup settings; stale, it would count KRATOS spend against the shared cap (docs/39).
+RELOAD_PREFIXES = ("DHAN_", "MT5_", "ANTHROPIC_", "AI_", "KRATOS_AI_BUDGET_POLICY")
 
 
 @dataclass

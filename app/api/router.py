@@ -22,6 +22,7 @@ from app.api.v1 import (
     github_webhooks,
     health,
     images,
+    kratos_ai,
     live,
     market,
     mt5_push,
@@ -42,6 +43,7 @@ api_router.include_router(health.router)
 api_router.include_router(auth.router)
 api_router.include_router(finance.router)
 api_router.include_router(ai.router)  # /api/ai: Claude chat, approvals, usage (docs/26)
+api_router.include_router(kratos_ai.router)  # /api/v1/kratos/ai/complete (bearer; docs/39)
 api_router.include_router(images.router)
 api_router.include_router(agents.router)
 api_router.include_router(trading.router)

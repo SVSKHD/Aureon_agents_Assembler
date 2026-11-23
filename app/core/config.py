@@ -54,6 +54,9 @@ AI_AGENT_BUDGET_DEFAULTS: dict[str, Decimal] = {
     "business": Decimal("30"),
     "chat": Decimal("20"),
     "reserve": Decimal("10"),
+    # KRATOS research specialists (docs/39-kratos-ai-gateway.md). 0 = every KRATOS call is refused
+    # until the owner sets a cap in AI_AGENT_BUDGETS_USD.
+    "kratos": Decimal("0"),
 }
 
 
@@ -455,6 +458,31 @@ class Settings(BaseSettings):
     @property
     def mt5_ingest_enabled(self) -> bool:
         return bool(self.MT5_INGEST_TOKEN and self.MT5_INGEST_TOKEN.get_secret_value())
+
+    # --- KRATOS research AI route (docs/39-kratos-ai-gateway.md) ---
+    # Bearer token KRATOS sends to POST /api/v1/kratos/ai/complete. Unset = the route is off (503).
+    # Single-purpose: it must not reuse any other credential and must be at least 32 characters.
+    KRATOS_AI_TOKEN: SecretStr | None = None
+    # The Claude model KRATOS calls run on, chosen by the owner. Blank = no model selected: every
+    # call is refused (503). There is no default and no fallback to AI_MODEL_MAIN.
+    KRATOS_AI_MODEL: str = ""
+    # "capped" (default): KRATOS spend counts toward AI_MONTHLY_BUDGET_USD and needs a "kratos" cap
+    # in AI_AGENT_BUDGETS_USD. "metered": KRATOS usage is recorded and reported exactly as before,
+    # but no dollar ceiling applies to it and it does not consume the shared monthly cap.
+    KRATOS_AI_BUDGET_POLICY: Literal["capped", "metered"] = "capped"
+    KRATOS_AI_MAX_REQUEST_CHARS: int = Field(default=200_000, ge=1_000, le=2_000_000)
+    KRATOS_AI_MAX_OUTPUT_TOKENS: int = Field(default=8_000, ge=256, le=64_000)
+    KRATOS_AI_RATE_PER_MINUTE: int = Field(default=20, ge=1, le=600)
+    KRATOS_AI_MAX_CONCURRENCY: int = Field(default=1, ge=1, le=8)
+
+    @property
+    def kratos_ai_enabled(self) -> bool:
+        return bool(self.KRATOS_AI_TOKEN and self.KRATOS_AI_TOKEN.get_secret_value())
+
+    @property
+    def ai_metered_budgets(self) -> frozenset[str]:
+        """Budgets whose usage is recorded but never capped (none unless the owner opts in)."""
+        return frozenset({"kratos"}) if self.KRATOS_AI_BUDGET_POLICY == "metered" else frozenset()
 
     # --- MT5 records API (aureon.mt5.records/v1 + aureon.mt5.bars/v1, docs/36-mt5-records.md) ---
     # Bearer token the bot (aureon_mt5_2026 1.7.x) sends to POST /api/trading/mt5/records and
